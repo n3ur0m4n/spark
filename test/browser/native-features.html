@@ -1,0 +1,62 @@
+<!doctype html><html><head><link rel="icon" href="data:,"><title>Native feature rejection and recovery</title></head><body><script type="module">
+import * as THREE from 'three';import {WebGPURenderer} from 'three/webgpu';import {SparkRenderer,SplatMesh} from '/src/index.ts';
+const errors=[],checks=[];window.addEventListener('error',e=>errors.push(e.message));window.addEventListener('unhandledrejection',e=>errors.push(String(e.reason)));
+const check=(name,ok,data={})=>{checks.push({name,ok,...data});if(!ok)throw Error(name);};
+const renderer=new WebGPURenderer({antialias:false});await renderer.init();renderer.setSize(100,100);document.body.append(renderer.domElement);
+renderer.backend.device.addEventListener('uncapturederror',e=>errors.push(e.error.message));
+const scene=new THREE.Scene(),camera=new THREE.PerspectiveCamera(60,1,.1,100);camera.position.z=4;
+const spark=new SparkRenderer({renderer,enableLod:false});scene.add(spark);
+const mesh=new SplatMesh({constructSplats:data=>data.pushSplat(new THREE.Vector3(),new THREE.Vector3(.2,.2,.2),new THREE.Quaternion(),1,new THREE.Color(1,0,0))});await mesh.initialized;scene.add(mesh);
+let generations=0;const generate=spark.webgpuBackend.generateNative.bind(spark.webgpuBackend);spark.webgpuBackend.generateNative=args=>{generations++;return generate(args);};
+const field=(object,key,value)=>()=>{const old=object[key];object[key]=value;return ()=>{object[key]=old;};};
+try{
+ await spark.renderAsync(scene,camera);
+ const cases=[
+  ['custom viewports',()=>{renderer.setViewport(10,10,50,50);return ()=>renderer.setViewport(0,0,100,100);}],
+  ['scissor test',()=>{renderer.setScissorTest(true);return ()=>renderer.setScissorTest(false);}],
+  ['manual clearing',field(renderer,'autoClear',false)],
+  ['manual clearing',field(renderer,'autoClearColor',false)],
+  ['manual clearing',field(renderer,'autoClearDepth',false)],
+  ['paging',field(mesh,'paged',{})],['modifiers',field(mesh,'objectModifiers',[{}])],
+  ['skinning',field(mesh,'skinning',{})],['editing',field(mesh,'edits',[{}])],
+  ['custom view-dependent generation',field(mesh,'enableViewToObject',true)],
+  ['covariance splats',field(mesh,'covSplats',true)],
+  ['custom splat generators',field(mesh,'generator',{})],
+  ['custom splat generators',field(mesh,'frameUpdate',()=>{})],
+  ['GPU-generated source textures',field(mesh.packedSplats,'target',{})],
+  ['nonuniform',()=>{mesh.scale.set(1,2,1);return ()=>mesh.scale.setScalar(1);}],
+  ['mirrored',()=>{mesh.scale.set(-1,1,1);return ()=>mesh.scale.setScalar(1);}],
+  ['scene override materials',field(scene,'overrideMaterial',new THREE.MeshBasicMaterial())],
+ ];
+ for(const [feature,mutate] of cases){
+  const restore=mutate(),before=generations;let rejection;
+  try{await spark.renderAsync(scene,camera);}catch(e){rejection=String(e);}finally{restore();}
+  check(`reject ${feature} before generation`,rejection?.includes(feature)&&rejection.includes('WebGLRenderer')&&generations===before,{rejection});
+  await spark.renderAsync(scene,camera);check(`recover after ${feature}`,spark.activeSplats===1);
+ }
+ renderer.setPixelRatio(2);await spark.renderAsync(scene,camera);await renderer.backend.device.queue.onSubmittedWorkDone();
+ check('full viewport works with high pixel ratio',renderer.domElement.width===200&&spark.activeSplats===1);renderer.setPixelRatio(1);
+ // Three r186 exposes samples through a getter. Exercise an actual MSAA
+ // host, rather than mutating a renderer property that is not configurable.
+ const msaaRenderer=new WebGPURenderer({antialias:true,samples:4});await msaaRenderer.init();
+ let msaaSpark;
+ try{
+  msaaSpark=new SparkRenderer({renderer:msaaRenderer,enableLod:false});const msaaScene=new THREE.Scene();msaaScene.add(msaaSpark);
+  let generated=false,rejection;const generate=msaaSpark.webgpuBackend.generateNative.bind(msaaSpark.webgpuBackend);
+  msaaSpark.webgpuBackend.generateNative=(...args)=>{generated=true;return generate(...args);};
+  try{await msaaSpark.renderAsync(msaaScene,camera);}catch(e){rejection=String(e);}
+  check('reject native MSAA before generation',msaaRenderer.samples===4&&rejection?.includes('native MSAA')&&rejection.includes('WebGLRenderer')&&!generated,{rejection});
+ }finally{msaaSpark?.dispose();msaaRenderer.dispose();}
+ await spark.renderAsync(scene,camera);check('non-MSAA host remains usable',spark.activeSplats===1);
+ const caps=spark.getCapabilities();check('unsupported features are declared before rendering',['paging','xr','modifiers','editing','skinning','specializedTargets','covarianceSplats','transparentMeshes','msaa','customViewport','scissorTest','manualClear','nonuniformSplatTransforms'].every(key=>caps.features[key]===false),{capabilities:caps});
+ const classic=new THREE.WebGLRenderer({antialias:false});const fallback=new SparkRenderer({renderer:classic,enableLod:false});
+ const fallbackScene=new THREE.Scene();fallbackScene.add(fallback);
+ const fallbackMesh=new SplatMesh({constructSplats:data=>data.pushSplat(new THREE.Vector3(),new THREE.Vector3(.2,.2,.2),new THREE.Quaternion(),1,new THREE.Color(1,0,0))});await fallbackMesh.initialized;fallbackScene.add(fallbackMesh);
+ const result=fallback.render(fallbackScene,camera);
+ await new Promise(r=>setTimeout(r,20));const deadline=performance.now()+5000;
+ while(fallback.sorting||fallback.sortDirty||fallback.updateTimeoutId!==undefined){if(performance.now()>deadline)throw Error('Classic WebGL did not settle');await new Promise(r=>setTimeout(r,1));}
+ check('classic WebGL constructor and synchronous render remain available',result===undefined&&fallback.getCapabilities().backend==='webgl'&&fallback.activeSplats===1&&['customViewport','scissorTest','manualClear'].every(key=>fallback.getCapabilities().features[key]===true));fallback.dispose();fallbackMesh.dispose();classic.dispose();
+ await renderer.backend.device.queue.onSubmittedWorkDone();check('no unhandled errors from rejected features',errors.length===0,{errors});
+ window.lifecycleResult={passed:true,checks,errors};
+}catch(error){window.lifecycleResult={passed:false,checks,errors,error:String(error)};}finally{mesh.dispose();spark.dispose();renderer.dispose();}
+</script></body></html>

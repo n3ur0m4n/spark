@@ -1,0 +1,36 @@
+<!doctype html><html><head><link rel="icon" href="data:,"><title>Native generation lifecycle</title></head><body><script type="module">
+import * as THREE from 'three';import {WebGPURenderer} from 'three/webgpu';
+import {SparkRenderer,SplatMesh,PackedSplats} from '/src/index.ts';
+const errors=[],checks=[];window.addEventListener('error',e=>errors.push(e.message));window.addEventListener('unhandledrejection',e=>errors.push(String(e.reason)));
+const check=(name,ok,data={})=>{checks.push({name,ok,...data});if(!ok)throw Error(name);};
+const renderer=new WebGPURenderer({antialias:false});await renderer.init();renderer.setSize(100,100);document.body.append(renderer.domElement);
+renderer.backend.device.addEventListener('uncapturederror',e=>errors.push(e.error.message));
+const camera=new THREE.PerspectiveCamera(60,1,.1,100);camera.position.z=4;const scene=new THREE.Scene();
+let spark;
+try{
+ spark=new SparkRenderer({renderer,enableLod:false});scene.add(spark);
+ await spark.renderAsync(scene,camera);check('empty scene submits',spark.activeSplats===0);
+ const mesh=new SplatMesh({constructSplats:data=>data.pushSplat(new THREE.Vector3(),new THREE.Vector3(.2,.2,.2),new THREE.Quaternion(),0,new THREE.Color(1,0,0))});await mesh.initialized;scene.add(mesh);
+ await spark.renderAsync(scene,camera);check('zero opacity retains upstream depth entry',spark.activeSplats===1);
+ const b=spark.webgpuBackend,calls=[],generate=b.generateNative.bind(b);b.generateNative=args=>{calls.push([...args.viewOrigin]);return generate(args);};
+ const pending=[];for(const z of [3,5,7]){camera.position.z=z;pending.push(spark.renderAsync(scene,camera));}await Promise.all(pending);
+ check('queued camera snapshots submitted in call order',JSON.stringify(calls.map(x=>x[2]))==='[3,5,7]',{origins:calls});
+ b.generateNative=generate;
+ const firstGeneration=b.getActiveSlotGeneration();const source=mesh.packedSplats;
+ source.setSplat(0,new THREE.Vector3(1,0,0),new THREE.Vector3(.2,.2,.2),new THREE.Quaternion(),1,new THREE.Color(0,1,0));source.needsUpdate=true;
+ await spark.renderAsync(scene,camera);check('source content revision causes a new generation',b.getActiveSlotGeneration()>firstGeneration);
+ const revision=b.getActiveSlotGeneration();source.packedArray=source.packedArray.slice();
+ await spark.renderAsync(scene,camera);check('source array identity causes a new generation',b.getActiveSlotGeneration()>revision);
+ mesh.visible=false;await spark.renderAsync(scene,camera);check('hidden mesh commits an empty draw',spark.activeSplats===0);mesh.visible=true;await spark.renderAsync(scene,camera);check('hidden mesh resumes',spark.activeSplats===1);
+ const saved=source.extra.sh1;source.extra.sh1=new Uint32Array(2);mesh.maxSh=1;source.numSplats=2;
+ let malformed;try{await spark.renderAsync(scene,camera);}catch(e){malformed=String(e);}check('incomplete SH rejected before dispatch',/incomplete native spherical/.test(malformed),{error:malformed});source.numSplats=1;source.extra.sh1=saved;mesh.maxSh=0;
+ await spark.renderAsync(scene,camera);
+ const read=b.readNativeDepths.bind(b);let release,entered;const reached=new Promise(r=>entered=r),gate=new Promise(r=>release=r);
+ b.readNativeDepths=async count=>{entered();await gate;return read(count);};camera.position.z=8;
+ const render=spark.renderAsync(scene,camera);const outcome=render.then(()=>null,e=>String(e));await reached;spark.dispose();release();const rejection=await outcome;
+ check('dispose during readback rejects',/disposed|destroyed|unavailable/.test(rejection),{rejection});scene.remove(spark);scene.remove(mesh);mesh.dispose();spark=null;
+ for(let i=0;i<3;i++){const s=new SparkRenderer({renderer,enableLod:false});scene.add(s);await s.renderAsync(scene,camera);s.dispose();s.dispose();scene.remove(s);}
+ renderer.render(new THREE.Scene(),camera);await renderer.backend.device.queue.onSubmittedWorkDone();check('repeated instances preserve the host device',errors.length===0,{errors});
+ window.lifecycleResult={passed:true,checks,errors};
+}catch(e){window.lifecycleResult={passed:false,checks,errors,error:String(e)};}finally{spark?.dispose();renderer.dispose();}
+</script></body></html>

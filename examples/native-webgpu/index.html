@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Spark • Native WebGPU</title>
+  <style>
+    body { margin: 0; background: #10141c; color: #edf1f6; font: 14px system-ui; }
+    aside { position: fixed; top: 20px; left: 20px; max-width: 380px; padding: 16px; background: #10141ce8; border-radius: 8px; }
+    h1 { font-size: 18px; margin: 0 0 10px; }
+    p { line-height: 1.5; }
+    a { color: #8dc9ff; margin-right: 12px; }
+    #status { margin-bottom: 0; }
+  </style>
+  <script type="importmap">
+    { "imports": {
+      "three": "../js/vendor/three/build/three.module.js",
+      "three/webgpu": "../js/vendor/three/build/three.webgpu.js",
+      "three/tsl": "../js/vendor/three/build/three.tsl.js",
+      "three/addons/": "../js/vendor/three/examples/jsm/",
+      "@sparkjsdev/spark": "../../dist/spark.module.js"
+    } }
+  </script>
+</head>
+<body>
+  <aside>
+    <h1>Native WebGPU with Three.js</h1>
+    <p>Drag to orbit. The opaque box shares depth with the generated splats.
+       This example uses an original synthetic scene and downloads no assets.</p>
+    <nav><a href="?backend=webgpu">Native WebGPU</a><a href="?backend=webgl">Classic WebGL</a></nav>
+    <p id="status" role="status">Initializing…</p>
+  </aside>
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+    import { SparkRenderer, SplatMesh, getSparkRendererCapabilities } from "@sparkjsdev/spark";
+
+    const status = document.querySelector("#status");
+    const native = new URLSearchParams(location.search).get("backend") !== "webgl";
+    try {
+      let renderer;
+      if (native) {
+        const { WebGPURenderer } = await import("three/webgpu");
+        renderer = new WebGPURenderer({ antialias: false });
+        await renderer.init();
+        if (getSparkRendererCapabilities(renderer).backend !== "webgpu") {
+          throw Error("Native WebGPU is unavailable. Choose Classic WebGL above.");
+        }
+      } else {
+        renderer = new THREE.WebGLRenderer({ antialias: false });
+      }
+      renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+      renderer.setSize(innerWidth, innerHeight);
+      renderer.toneMapping = THREE.NoToneMapping;
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+      document.body.append(renderer.domElement);
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x10141c);
+      const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.1, 100);
+      camera.position.set(3, 1.8, 7);
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      const spark = new SparkRenderer({ renderer, enableLod: false });
+      scene.add(spark);
+      const splats = new SplatMesh({ constructSplats: (data) => {
+        const count = 8192, position = new THREE.Vector3();
+        const scale = new THREE.Vector3(0.045, 0.045, 0.045);
+        const rotation = new THREE.Quaternion(), color = new THREE.Color();
+        for (let i = 0; i < count; i++) {
+          const side = i % 2, sample = Math.floor(i / 2), y = 1 - 2 * (sample + 0.5) / (count / 2);
+          const radius = Math.sqrt(1 - y * y), angle = sample * Math.PI * (3 - Math.sqrt(5));
+          position.set((side ? 1.4 : -1.4) + radius * Math.cos(angle), y, radius * Math.sin(angle));
+          color.setRGB(side ? 0.15 : 0.95, 0.25 + 0.5 * (y + 1) / 2, side ? 0.95 : 0.15);
+          data.pushSplat(position, scale, rotation, 0.8, color);
+        }
+      } });
+      scene.add(splats);
+      await splats.initialized;
+      const box = new THREE.Mesh(new THREE.BoxGeometry(1.8, 1.8, 0.4), new THREE.MeshBasicMaterial({ color: 0xd5dce7 }));
+      box.position.z = 0.8;
+      scene.add(box);
+      let rendering = false, resize = false, failed = false;
+      addEventListener("resize", () => { resize = true; });
+      renderer.setAnimationLoop(async () => {
+        // Camera and target size advance only after the preceding submission.
+        if (rendering || failed) return;
+        rendering = true;
+        try {
+          if (resize) {
+            camera.aspect = innerWidth / innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(innerWidth, innerHeight);
+            resize = false;
+          }
+          controls.update();
+          if (native) await spark.renderAsync(scene, camera);
+          else renderer.render(scene, camera);
+          status.textContent = `${native ? "Native WebGPU" : "Classic WebGL"} · 8,192 generated splats`;
+        } catch (error) {
+          failed = true;
+          renderer.setAnimationLoop(null);
+          status.textContent = String(error);
+        } finally {
+          rendering = false;
+        }
+      });
+    } catch (error) {
+      status.textContent = String(error);
+    }
+  </script>
+</body>
+</html>

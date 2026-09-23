@@ -1,0 +1,46 @@
+<!doctype html><html><head><link rel="icon" href="data:,"><title>Native disposal releases host device subscriptions</title></head><body><script type="module">
+import * as THREE from 'three';
+import {WebGPURenderer} from 'three/webgpu';
+import {SparkRenderer} from '/src/index.ts';
+const errors=[],checks=[];
+window.addEventListener('error',e=>errors.push(e.message));
+window.addEventListener('unhandledrejection',e=>errors.push(String(e.reason)));
+const check=(name,ok,data={})=>{checks.push({name,ok,...data});if(!ok)throw Error(name);};
+const renderer=new WebGPURenderer({antialias:false});await renderer.init();renderer.setSize(64,64);
+const device=renderer.backend.device;
+device.addEventListener('uncapturederror',e=>errors.push(e.error.message));
+function disposeBatch(){
+ const references=[];
+ for(let i=0;i<20;i++){
+  const spark=new SparkRenderer({renderer,enableLod:false});
+  references.push({owner:new WeakRef(spark),backend:new WeakRef(spark.webgpuBackend)});
+  spark.dispose();
+ }
+ return references;
+}
+const references=disposeBatch();
+await device.queue.onSubmittedWorkDone();
+// The runner crosses JS jobs and forces GC while the host GPUDevice stays alive.
+window.retentionDiagnostic={references};
+window.finishRetention=async()=>{
+ let first,second,removed;
+ try{
+  const liveOwners=references.filter(r=>r.owner.deref()).length;
+  const liveBackends=references.filter(r=>r.backend.deref()).length;
+  check('disposed Spark owners are collectable on a live host device',liveOwners===0,{created:references.length,liveOwners});
+  check('disposed native backends are collectable on a live host device',liveBackends===0,{created:references.length,liveBackends});
+  first=new SparkRenderer({renderer,enableLod:false});
+  second=new SparkRenderer({renderer,enableLod:false});
+  removed=new SparkRenderer({renderer,enableLod:false});removed.dispose();
+  device.destroy();await device.lost;
+  check('new subscribers receive actual loss after previous batch disposal',first.webgpuBackend.deviceLost&&second.webgpuBackend.deviceLost);
+  check('a removed subscriber is not called on subsequent device loss',!removed.webgpuBackend.deviceLost);
+  const scene=new THREE.Scene(),camera=new THREE.PerspectiveCamera();let rejection;
+  try{await first.renderAsync(scene,camera);}catch(error){rejection=String(error);}
+  check('notified renderer rejects drawing on a lost host device',/device.*lost/.test(rejection),{rejection});
+  check('no unhandled errors during disposal and resubscription',errors.length===0,{errors});
+  return {passed:true,checks,errors};
+ }catch(error){return {passed:false,checks,errors,error:String(error)};}
+ finally{first?.dispose();second?.dispose();removed?.dispose();renderer.dispose();}
+};
+</script></body></html>

@@ -3,6 +3,7 @@ export {
   type SparkRendererOptions,
   type SparkPickResult,
 } from "./SparkRenderer";
+export type { SparkRenderStats } from "./SparkRenderStats";
 export { SplatAccumulator, type GeneratorMapping } from "./SplatAccumulator";
 
 export * as dyno from "./dyno";
@@ -120,3 +121,9 @@ export {
   type PortalPair,
   DISK_PORTAL_FRAGMENT_SHADER,
 } from "./SparkPortals";
+
+export {
+  getSparkRendererCapabilities,
+  type SparkRendererCapabilities,
+} from "./RendererCapabilities";
+export type { SparkHostRenderer } from "./RendererAdapter";

@@ -59,3 +59,15 @@ jobs:
 
       - name: Rust tests
         run: npm run test:rust
+
+      - name: Install pinned WGSL validator
+        run: cargo install naga-cli --version 28.0.0 --locked
+
+      - name: Validate WGSL
+        run: npm run test:wgsl
+
+      - name: Build package
+        run: npm run build
+
+      - name: Packed package consumers
+        run: npm run test:package

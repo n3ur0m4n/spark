@@ -1,0 +1,95 @@
+<!doctype html><html><head><link rel="icon" href="data:,"><title>Native host modes and classic recovery</title></head><body><script type="module">
+import * as THREE from 'three';
+import {WebGPURenderer} from 'three/webgpu';
+import {SparkRenderer,SplatMesh} from '/src/index.ts';
+const errors=[],checks=[];
+window.addEventListener('error',e=>errors.push(e.message));
+window.addEventListener('unhandledrejection',e=>errors.push(String(e.reason)));
+const check=(name,ok,data={})=>{checks.push({name,ok,...data});if(!ok)throw Error(name);};
+async function fixture(renderer,sprite){
+ renderer.setSize(64,64);renderer.setClearColor(0,1);document.body.append(renderer.domElement);
+ const scene=new THREE.Scene(),camera=new THREE.PerspectiveCamera(60,1,.1,100);camera.position.z=4;
+ const spark=new SparkRenderer({renderer,enableLod:false});scene.add(spark);
+ const splats=new SplatMesh({constructSplats:data=>data.pushSplat(new THREE.Vector3(),new THREE.Vector3(.5,.5,.5),new THREE.Quaternion(),1,new THREE.Color(0,1,0))});await splats.initialized;scene.add(splats);
+ const host=sprite?new THREE.Sprite(new THREE.SpriteMaterial({color:0xff0000,opacity:.5,transparent:true,depthWrite:false})):new THREE.Mesh(new THREE.BoxGeometry(2,2,.1),new THREE.MeshBasicMaterial({color:0xff0000}));
+ host.position.z=sprite?1:-1;if(sprite)host.scale.setScalar(2);scene.add(host);
+ const draw=async()=>{
+  for(let i=0;i<20;i++){if(spark.isWebGPU)await spark.renderAsync(scene,camera);else renderer.render(scene,camera);await new Promise(requestAnimationFrame);}
+  if(spark.isWebGPU)await renderer.backend.device.queue.onSubmittedWorkDone();else renderer.getContext().finish();
+ };
+ const pixel=async()=>{
+  if(!spark.isWebGPU){const gl=renderer.getContext(),pixel=new Uint8Array(4);gl.readPixels(32,32,1,1,gl.RGBA,gl.UNSIGNED_BYTE,pixel);return [...pixel];}
+  const device=renderer.backend.device,texture=renderer.backend.get(spark.native.composite.target.texture).texture;
+  const buffer=device.createBuffer({size:256,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ}),encoder=device.createCommandEncoder();
+  encoder.copyTextureToBuffer({texture,origin:{x:32,y:32}},{buffer,bytesPerRow:256},{width:1,height:1});device.queue.submit([encoder.finish()]);
+  await buffer.mapAsync(GPUMapMode.READ);const values=[...new Uint16Array(buffer.getMappedRange()).slice(0,4)];buffer.unmap();buffer.destroy();
+  return values.map(v=>{const sign=(v&32768)?-1:1,e=(v>>10)&31,m=v&1023;return Math.round(255*sign*(e===0?m*2**-24:e===31?(m?NaN:Infinity):(1+m/1024)*2**(e-15)));});
+ };
+ return {scene,camera,spark,host,draw,pixel,dispose(){spark.dispose();splats.dispose();host.geometry?.dispose();host.material.dispose();renderer.dispose();renderer.domElement.remove();}};
+}
+function arrayCamera(camera){
+ const views=[0,1].map(index=>{const view=camera.clone();view.aspect=.5;view.position.x=index===0?-.5:.5;view.lookAt(0,0,0);view.updateProjectionMatrix();view.updateMatrixWorld();view.viewport=new THREE.Vector4(index*32,0,32,64);return view;});
+ return new THREE.ArrayCamera(views);
+}
+try{
+ for(const mode of ['sprite','logarithmic','reversed','array']){
+  const options={antialias:false,logarithmicDepthBuffer:mode==='logarithmic',reversedDepthBuffer:mode==='reversed'};
+  const nativeRenderer=new WebGPURenderer(options);await nativeRenderer.init();
+  nativeRenderer.backend.device.addEventListener('uncapturederror',e=>errors.push(e.error.message));
+  let native;
+  try{
+   native=await fixture(nativeRenderer,mode==='sprite');
+   const available=mode!=='reversed'||nativeRenderer.reversedDepthBuffer===true;
+   check(`${mode} host availability is explicit`,mode!=='reversed'||Number(THREE.REVISION)<186||available,{available,three:THREE.REVISION});
+   const feature={sprite:'transparentSprites',logarithmic:'logarithmicDepth',reversed:'reversedDepth',array:'arrayCameras'}[mode];
+   check(`${mode} native capability is false`,native.spark.getCapabilities().features[feature]===false);
+   if(available){
+    let generated=0,rejection;const generate=native.spark.webgpuBackend.generateNative.bind(native.spark.webgpuBackend);
+    native.spark.webgpuBackend.generateNative=(...args)=>{generated++;return generate(...args);};
+    const inputCamera=mode==='array'?arrayCamera(native.camera):native.camera;
+    let cloned=0;if(mode==='array'){const clone=inputCamera.clone.bind(inputCamera);inputCamera.clone=(...args)=>{cloned++;return clone(...args);};}
+    try{await native.spark.renderAsync(native.scene,inputCamera);}catch(e){rejection=String(e);}
+    const expected=mode==='sprite'?'transparent or transmissive':mode==='array'?'array cameras':`${mode} depth`;
+    check(`${mode} rejected before generation`,rejection?.includes(expected)&&rejection.includes('WebGLRenderer')&&generated===0,{rejection});
+    if(mode==='array'){
+     check('array camera rejected before cloning',cloned===0,{cloned});
+     let updateRejection;try{await native.spark.update({scene:native.scene,camera:inputCamera});}catch(e){updateRejection=String(e);}
+     check('array camera explicit update rejects before generation',updateRejection?.includes('array cameras')&&generated===0,{updateRejection,generated});
+    }
+    if(mode==='sprite')native.scene.remove(native.host);
+    else if(mode==='logarithmic')nativeRenderer.logarithmicDepthBuffer=false;
+    else if(mode==='reversed')nativeRenderer.reversedDepthBuffer=false;
+    await native.draw();const pixel=await native.pixel();
+    check(`${mode} supported native state recovers`,pixel[1]>245&&pixel[0]<10,{pixel});
+   }
+  }finally{native?.dispose();if(!native)nativeRenderer.dispose();}
+  const renderer=new THREE.WebGLRenderer({...options,preserveDrawingBuffer:true});let classic;
+  try{
+   classic=await fixture(renderer,mode==='sprite');
+   const available=mode!=='reversed'||renderer.capabilities.reversedDepthBuffer;
+   check(`${mode} classic availability is explicit`,true,{available});
+   if(available){
+    if(mode==='array'){
+     check('classic array camera capability is true',classic.spark.getCapabilities().features.arrayCameras===true);
+     const camera=arrayCamera(classic.camera);
+     for(let i=0;i<20;i++){renderer.render(classic.scene,camera);await new Promise(requestAnimationFrame);}
+     const gl=renderer.getContext();gl.finish();
+     const pixels=[16,48].map(x=>{const pixel=new Uint8Array(4);gl.readPixels(x,32,1,1,gl.RGBA,gl.UNSIGNED_BYTE,pixel);return [...pixel];});
+     check('classic array camera renders splats in both viewports',pixels.every(p=>p[1]>245&&p[0]<10),{pixels});
+    }
+    await classic.draw();const pixel=await classic.pixel();
+    check(`${mode} classic route renders correct overlap`,mode==='sprite'?pixel[0]>100&&pixel[0]<155&&pixel[1]>100&&pixel[1]<155:pixel[1]>245&&pixel[0]<10,{pixel});
+    if(mode==='reversed'){
+     const normal=new WebGPURenderer({antialias:false});await normal.init();const bridge=new SparkRenderer({renderer:normal,enableLod:false});
+     try{
+      let rejection;try{await bridge.renderAsync(classic.scene,classic.camera);}catch(e){rejection=String(e);}
+      check('reversed camera is rejected before a clone can lose its flag',classic.camera.reversedDepth&&rejection?.includes('reversed depth')&&rejection.includes('WebGLRenderer'),{rejection});
+     }finally{bridge.dispose();normal.dispose();}
+    }
+   }
+  }finally{classic?.dispose();if(!classic)renderer.dispose();}
+ }
+ check('no unhandled host-mode errors',errors.length===0,{errors});
+ window.lifecycleResult={passed:true,checks,errors};
+}catch(error){window.lifecycleResult={passed:false,checks,errors,error:String(error)};}
+</script></body></html>

@@ -1,0 +1,41 @@
+<!doctype html><html><head><meta charset="utf-8"><link rel="icon" href="data:,"><title>Spark renderer validation</title></head><body>
+<script type="module">
+import * as THREE from 'three';
+import {WebGPURenderer} from 'three/webgpu';
+import {SparkRenderer,SplatMesh,getSparkRendererCapabilities} from '/src/index.ts';
+const errors=[];window.addEventListener('error',e=>errors.push(e.message));
+window.addEventListener('unhandledrejection',e=>errors.push(String(e.reason)));
+try {
+ const params=new URLSearchParams(location.search);
+ const renderer=new WebGPURenderer({antialias:false,alpha:true,forceWebGL:params.has('forceWebGL')});await renderer.init();
+ renderer.setSize(320,240);renderer.setPixelRatio(1);document.body.append(renderer.domElement);
+ renderer.backend.device?.addEventListener('uncapturederror',e=>errors.push(e.error.message));
+ const scene=new THREE.Scene();scene.background=params.has('transparent')?null:new THREE.Color(0x000000);
+ renderer.setClearAlpha(params.has('transparent')?0:1);
+ if(params.has('toneMapping'))renderer.toneMapping=THREE.ACESFilmicToneMapping;
+ const camera=new THREE.PerspectiveCamera(60,320/240,0.1,100);camera.position.set(0,0,4);camera.lookAt(0,0,0);
+ if(params.has('forceWebGL')){
+   let rejected=null;try{new SparkRenderer({renderer});}catch(error){rejected=String(error);}
+   window.__sparkValidation={ready:!!rejected,rejected,capabilities:getSparkRendererCapabilities(renderer),errors};
+   throw new Error('forceWebGL-checked');
+ }
+ const spark=new SparkRenderer({renderer,enableLod:false});scene.add(spark);
+ const splats=new SplatMesh({constructSplats:(data)=>{
+  data.pushSplat(new THREE.Vector3(0,0,0),new THREE.Vector3(.5,.5,.5),new THREE.Quaternion(),params.has('transparent')?.5:1,params.has('midgray')?new THREE.Color(.5,.5,.5):new THREE.Color(0,1,0));
+ }});scene.add(splats);await splats.initialized;
+ const box=new THREE.Mesh(new THREE.BoxGeometry(1,1,.1),new THREE.MeshBasicMaterial({color:0xff0000}));
+ box.position.z=1;box.visible=!params.has('transparent');scene.add(box);
+ const linearPixel=async()=>{
+  const device=renderer.backend.device;
+  const texture=renderer.backend.get(spark.native.composite.target.texture).texture;
+  const buffer=device.createBuffer({size:256,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
+  const encoder=device.createCommandEncoder();encoder.copyTextureToBuffer({texture,origin:{x:Math.floor(texture.width/2),y:Math.floor(texture.height/2)}},{buffer,bytesPerRow:256},{width:1,height:1});device.queue.submit([encoder.finish()]);
+  await buffer.mapAsync(GPUMapMode.READ);const values=Array.from(new Uint16Array(buffer.getMappedRange()).slice(0,4));buffer.unmap();buffer.destroy();
+  return values.map(v=>{const sign=(v&32768)?-1:1;const e=(v>>10)&31;const m=v&1023;return sign*(e===0?m*2**-24:e===31?(m?NaN:Infinity):(1+m/1024)*2**(e-15));});
+ };
+ const draw=async()=>{for(let i=0;i<30;i++){await spark.renderAsync(scene,camera);await new Promise(requestAnimationFrame);}await renderer.backend.device.queue.onSubmittedWorkDone();};
+ await draw();
+ window.validation={THREE,renderer,spark,scene,camera,splats,box,draw,linearPixel,errors};
+ window.__sparkValidation={ready:true,active:spark.activeSplats,errors,sceneDepth:spark.webgpuBackend?.hasExternalDepth()};
+} catch(e){if(!window.__sparkValidation)window.__sparkValidation={ready:false,error:String(e),errors};}
+</script></body></html>

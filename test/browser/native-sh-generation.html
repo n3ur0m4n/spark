@@ -1,0 +1,17 @@
+<!doctype html><html><head><link rel="icon" href="data:,"><title>Signed SH generation parity</title></head><body><script type="module">
+const checks=[],errors=[];
+const check=(name,ok)=>{checks.push({name,ok});if(!ok)throw Error(name);};
+const fixture=document.createElement('iframe');fixture.src='./native-generation.html';document.body.append(fixture);
+try{
+ await new Promise((resolve,reject)=>{fixture.onload=resolve;fixture.onerror=()=>reject(Error('Generation fixture failed to load'));});
+ const started=performance.now();while(!fixture.contentWindow.__nativeGenerationReady){if(performance.now()-started>30000)throw Error('Generation fixture timeout');await new Promise(r=>setTimeout(r,10));}
+ for(const format of ['packed','ext','mixed'])for(const sh of [0,1,2,3])for(const lod of [false,true]){
+  const config={format,sh,lod,linear:true,outputExt:true,move:true,ortho:sh%2===1,radial:sh%2===0,inspectGenerated:true};
+  const results=[];for(const engine of ['webgl','webgpu-readback'])results.push(await fixture.contentWindow.runNativeCase({...config,engine}));
+  const [base]=results;
+  const same=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
+  check(`${format} SH${sh} LoD${lod}: generated attributes, depth, order and count`,results.every(r=>r.errors.length===0&&same(r.generated,base.generated)&&same(r.keys,base.keys)&&same(r.ordering,base.ordering)&&r.drawCount===base.drawCount));
+ }
+ window.lifecycleResult={passed:true,checks,errors};
+}catch(error){window.lifecycleResult={passed:false,checks,errors,error:String(error)};}finally{fixture.remove();}
+</script></body></html>

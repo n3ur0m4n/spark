@@ -1,0 +1,46 @@
+<!doctype html><html><head><link rel="icon" href="data:,"><title>Native generation counts and ownership</title></head><body><script type="module">
+import * as THREE from 'three';
+import {WebGPURenderer} from 'three/webgpu';
+import {SparkRenderer,SplatMesh,PackedSplats} from '/src/index.ts';
+const checks=[],errors=[];
+const check=(name,ok,data={})=>{checks.push({name,ok,...data});if(!ok)throw Error(name);};
+window.addEventListener('error',e=>errors.push(e.message));window.addEventListener('unhandledrejection',e=>errors.push(String(e.reason)));
+const renderer=new WebGPURenderer({antialias:false});await renderer.init();renderer.setSize(100,100);document.body.append(renderer.domElement);
+renderer.backend.device.addEventListener('uncapturederror',e=>errors.push(e.error.message));
+let sourceBytes=0;const createBuffer=renderer.backend.device.createBuffer.bind(renderer.backend.device);
+renderer.backend.device.createBuffer=descriptor=>{const buffer=createBuffer(descriptor);if(descriptor.label?.startsWith('spark-native-source')){sourceBytes+=buffer.size;const destroy=buffer.destroy.bind(buffer);let live=true;buffer.destroy=()=>{if(live){sourceBytes-=buffer.size;live=false;}destroy();};}return buffer;};
+const camera=new THREE.PerspectiveCamera(60,1,.1,100);camera.position.z=4;
+const push=(source,i)=>source.pushSplat(new THREE.Vector3((i%8-4)*.05,0,0),new THREE.Vector3().setScalar(i%7===0?0:.02),new THREE.Quaternion(),i%3===0?0:.7,new THREE.Color(1,0,0));
+const expected=n=>n-Math.ceil(n/7);
+const owned=new Set();let spark,mesh;
+try {
+ for(const mode of ['readback']){
+  const scene=new THREE.Scene();spark=new SparkRenderer({renderer,enableLod:false});scene.add(spark);
+  const source=new PackedSplats({construct:data=>push(data,0)});await source.initialized;owned.add(source);
+  mesh=new SplatMesh({packedSplats:source});await mesh.initialized;scene.add(mesh);
+  for(const count of [1,2047,2048,2049,17,0,2050]){
+   while(source.numSplats<count)push(source,source.numSplats);
+   source.numSplats=count;source.needsUpdate=true;
+   await spark.renderAsync(scene,camera);
+   if(count===0)check(`${mode}: empty generation releases source GPU allocations`,sourceBytes===0,{sourceBytes});
+   const before=spark.getRenderStats();
+   check(`${mode}: ${count} count availability`,before.drawnSplats===(expected(count)),{before});
+   const stats=await spark.readRenderStatsAsync();
+   check(`${mode}: ${count} actual GPU draw count`,stats.selectedSplats===count&&stats.drawnSplats===expected(count),{stats});
+   check(`${mode}: ${count} measured count cached`,spark.getRenderStats().drawnSplats===stats.drawnSplats);
+  }
+  const replacement=new PackedSplats({construct:data=>{for(let i=0;i<3;i++)push(data,i);}});await replacement.initialized;owned.add(replacement);
+  mesh.splats=replacement;
+  await spark.renderAsync(scene,camera);const stats=await spark.readRenderStatsAsync();
+  check(`${mode}: replacing source object changes generated population`,stats.selectedSplats===3&&stats.drawnSplats===2,{stats});
+  const backend=spark.webgpuBackend;backend.gpuTimingEnabled=true;camera.position.x=.05;await spark.renderAsync(scene,camera);
+  if(backend.gpuTimingAvailable){const deadline=performance.now()+5000;while(!backend.gpuTimingSequence){if(performance.now()>deadline)throw Error('GPU timestamp timeout');await new Promise(r=>setTimeout(r,1));}
+   check('render timing retains completed generation identity',Number.isFinite(backend.lastGpuPassMs.render)&&backend.gpuTimingGeneration===backend.getActiveSlotGeneration(),{passes:backend.lastGpuPassMs,generation:backend.gpuTimingGeneration});
+  }else check('GPU timing explicitly unavailable without host feature',true);
+  backend.gpuTimingEnabled=false;
+  spark.dispose();scene.remove(spark);spark=null;scene.remove(mesh);mesh.dispose();mesh=null;
+ }
+ await renderer.backend.device.queue.onSubmittedWorkDone();check('no uncaptured GPU or page errors',errors.length===0,{errors});
+ window.lifecycleResult={passed:true,checks,errors};
+}catch(error){window.lifecycleResult={passed:false,checks,errors,error:String(error)};}finally{spark?.dispose();mesh?.dispose();for(const source of owned)source.dispose();renderer.dispose();}
+</script></body></html>

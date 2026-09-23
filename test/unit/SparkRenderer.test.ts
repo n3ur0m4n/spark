@@ -8,6 +8,7 @@ import { Dyno, dynoBlock } from "../../src/dyno/base";
 import { Gsplat } from "../../src/dyno/splats";
 
 const stubRenderer = {
+  isWebGLRenderer: true,
   info: { render: { frame: 0 } },
   xr: { enabled: false, isPresenting: false },
   getContext: () => ({ getExtension: () => null }),

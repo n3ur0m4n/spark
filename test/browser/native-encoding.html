@@ -1,0 +1,64 @@
+<!doctype html><html><head><link rel="icon" href="data:,"><title>Native generated encoding parity</title></head><body><script type="module">
+import * as THREE from 'three';
+import {WebGPURenderer} from 'three/webgpu';
+import {SparkRenderer,SplatMesh,PackedSplats,ExtSplats} from '/src/index.ts';
+const checks=[],errors=[];
+const check=(name,ok,data={})=>{checks.push({name,ok,...data});if(!ok)throw Error(name);};
+window.addEventListener('error',e=>errors.push(e.message));
+window.addEventListener('unhandledrejection',e=>errors.push(String(e.reason)));
+const count=1536;
+async function readGenerated(spark,renderer){
+ const current=spark.current,buffers=[];
+ if(spark.isWebGPU){
+  const device=renderer.backend.device,backend=spark.webgpuBackend;
+  for(const source of [backend.generatedOutputBuffer,...(current.extSplats?[backend.generatedOutputBuffer2]:[])]){
+   const size=current.numSplats*16,map=device.createBuffer({size,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
+   try{const encoder=device.createCommandEncoder();encoder.copyBufferToBuffer(source,0,map,0,size);device.queue.submit([encoder.finish()]);await map.mapAsync(GPUMapMode.READ);buffers.push(new Uint32Array(map.getMappedRange().slice(0)));}finally{map.destroy();}
+  }
+ }else{
+  const gl=renderer.getContext(),saved=gl.getParameter(gl.FRAMEBUFFER_BINDING),fb=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,fb);
+  try{for(const texture of current.getTextures().slice(0,current.extSplats?2:1)){
+   const {width,height}=texture.image;check('fixture fits one generated layer',current.numSplats<=width*height);
+   gl.framebufferTextureLayer(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,renderer.properties.get(texture).__webglTexture,0,0);
+   check('generated framebuffer complete',gl.checkFramebufferStatus(gl.FRAMEBUFFER)===gl.FRAMEBUFFER_COMPLETE);
+   const rows=Math.ceil(current.numSplats/width),data=new Uint32Array(width*rows*4);gl.readPixels(0,0,width,rows,gl.RGBA_INTEGER,gl.UNSIGNED_INT,data);check('generated readback has no GL errors',gl.getError()===gl.NO_ERROR);buffers.push(data);
+  }}finally{gl.bindFramebuffer(gl.FRAMEBUFFER,saved);gl.deleteFramebuffer(fb);}
+ }
+ return buffers.map(data=>Uint32Array.from(current.mapping.flatMap(({base,count})=>Array.from(data.subarray(base*4,(base+count)*4)))));
+}
+async function run(native,extended,outputExt,rotated){
+ const renderer=native?new WebGPURenderer({antialias:false}):new THREE.WebGLRenderer({antialias:false});
+ let spark,mesh,source;const onGpuError=e=>errors.push(e.error.message);
+ try{
+  if(native){await renderer.init();renderer.backend.device.addEventListener('uncapturederror',onGpuError);}
+  renderer.setSize(64,64);
+  const scene=new THREE.Scene(),camera=new THREE.PerspectiveCamera(60,1,.1,100);camera.position.z=5;
+  spark=new SparkRenderer({renderer,autoUpdate:native,enableLod:false,accumExtSplats:outputExt});scene.add(spark);
+  const constructed=new (extended?ExtSplats:PackedSplats)({maxSplats:count,construct:data=>{for(let i=0;i<count;i++)data.pushSplat(new THREE.Vector3(),new THREE.Vector3(.25,.125,.5),new THREE.Quaternion(),i%3===0?253/255:1,new THREE.Color(253/255,249/255,245/255));}});
+  await constructed.initialized;
+  // Public enumerated inputs, including the pi rotation whose decoded w changes
+  // sign on this GPU. The octahedral fold then produces exact half-integer bytes.
+  const angles=extended?[0,1,2047,2048,4094,4095]:[0,1,127,128,254,255];
+  for(let i=0;i<count;i++){
+   const u=i&255,v=(i*73)&255,angle=angles[i>>8];
+   if(extended){const x=u*4,y=v*4;constructed.extArrays[1][i*4+3]=((angle<<20)|(y<<10)|x)>>>0;}
+   else{const a=constructed.packedArray;a[i*4+2]=(a[i*4+2]&65535)|(u<<16)|(v<<24);a[i*4+3]=(a[i*4+3]&0xffffff)|(angle<<24);}
+  }
+  source=new (extended?ExtSplats:PackedSplats)(extended?{extArrays:constructed.extArrays,numSplats:count}:{packedArray:constructed.packedArray,numSplats:count});await source.initialized;constructed.dispose();
+  mesh=new SplatMesh(extended?{extSplats:source}:{packedSplats:source});await mesh.initialized;if(rotated){mesh.rotation.set(.25,.5,.125);mesh.recolor.setScalar(.5);mesh.opacity=.5;}scene.add(mesh);
+  if(native)await spark.renderAsync(scene,camera);
+  else{renderer.getDrawingBufferSize(spark.renderSize);await spark.update({scene,camera});const deadline=performance.now()+10000;while(spark.sorting||spark.sortDirty){if(performance.now()>deadline)throw Error('Sort timeout');await new Promise(r=>setTimeout(r,1));}renderer.render(scene,camera);}
+  check('all encoding fixture splats selected',spark.current.mapping.reduce((n,m)=>n+m.count,0)===count);
+  return await readGenerated(spark,renderer);
+ }finally{spark?.dispose();mesh?.dispose();source?.dispose();if(native&&renderer.backend.device)renderer.backend.device.removeEventListener('uncapturederror',onGpuError);renderer.dispose();}
+}
+try{
+ for(const extended of [false,true])for(const outputExt of [false,true])for(const rotated of [false,true]){
+  const a=await run(false,extended,outputExt,rotated),b=await run(true,extended,outputExt,rotated);
+  const mismatches=[];let different=0;
+  for(let buffer=0;buffer<a.length;buffer++)for(let i=0;i<a[buffer].length;i++)if(a[buffer][i]!==b[buffer][i]){different++;if(mismatches.length<8)mismatches.push({buffer,splat:i>>2,component:i%4,webgl:a[buffer][i],webgpu:b[buffer][i]});}
+  check(`generated attributes: ${extended?'Ext':'Packed'} to ${outputExt?'Ext':'Packed'}, ${rotated?'rotated':'identity'}`,different===0,{count,different,mismatches});
+ }
+ check('no uncaptured errors',errors.length===0,{errors});window.lifecycleResult={passed:true,checks,errors};
+}catch(error){window.lifecycleResult={passed:false,checks,errors,error:String(error)};}
+</script></body></html>

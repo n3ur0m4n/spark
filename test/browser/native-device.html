@@ -1,0 +1,40 @@
+<!doctype html><html><head><link rel="icon" href="data:,"><title>Native device limits and loss</title></head><body><script type="module">
+import * as THREE from 'three';import {WebGPURenderer} from 'three/webgpu';import {SparkRenderer,SplatMesh,PackedSplats} from '/src/index.ts';
+const errors=[],checks=[];window.addEventListener('error',e=>errors.push(e.message));window.addEventListener('unhandledrejection',e=>errors.push(String(e.reason)));
+const check=(name,ok,data={})=>{checks.push({name,ok,...data});if(!ok)throw Error(name);};
+let renderer,spark,mesh,source;
+try{
+ renderer=new WebGPURenderer({antialias:false});await renderer.init();renderer.setSize(100,100);document.body.append(renderer.domElement);
+ let outputAllocations=0;const device=renderer.backend.device;const createTexture=device.createTexture.bind(device);device.createTexture=descriptor=>{if(descriptor.label?.startsWith('spark-splatData'))outputAllocations++;return createTexture(descriptor);};device.addEventListener('uncapturederror',e=>errors.push(e.error.message));
+ const scene=new THREE.Scene(),camera=new THREE.PerspectiveCamera(60,1,.1,100);camera.position.z=4;
+ spark=new SparkRenderer({renderer,enableLod:true,enableDriveLod:false});scene.add(spark);
+ const limit=device.limits.maxStorageBufferBindingSize,count=Math.floor(limit/16)+2048;
+ const array=new Uint32Array(count*4); // reserve the source but do not upload it
+ source=new PackedSplats({packedArray:array,numSplats:count});await source.initialized;source.lodSplats=source;
+ mesh=new SplatMesh({packedSplats:source});await mesh.initialized;scene.add(mesh);
+ const indices=new Uint32Array(16384);indices.fill(0xffffffff);indices[0]=0;
+ const texture=new THREE.DataTexture(indices,4096,1,THREE.RGBAIntegerFormat,THREE.UnsignedIntType);texture.internalFormat='RGBA32UI';texture.needsUpdate=true;
+ spark.lodInstances.set(mesh,{numSplats:1,indices,texture});
+ const before=spark.webgpuBackend.getActiveSlotGeneration();let failure;
+ try{await spark.renderAsync(scene,camera);await spark.renderAsync(scene,camera);}catch(e){failure=String(e);}
+ check('full source limit checked despite a one-splat selection',/native-source needs.*exceeding native device limits/.test(failure),{failure,limit,sourceBytes:array.byteLength,selected:1,stats:spark.getRenderStats(),sourceCount:source.numSplats,meshCount:mesh.numSplats,contextCount:mesh.context.splats.numSplats});
+ check('failed source upload cannot commit a generation',spark.webgpuBackend.getActiveSlotGeneration()===before);
+ const allocated=outputAllocations;spark.enableLod=false;let outputFailure;
+ try{await spark.renderAsync(scene,camera);}catch(e){outputFailure=String(e);}
+ check('oversized output rejected before texture allocation',/native generated splats needs/.test(outputFailure)&&outputAllocations===allocated,{outputFailure,allocationsBefore:allocated,allocationsAfter:outputAllocations});
+
+ const small=new PackedSplats({construct:data=>data.pushSplat(new THREE.Vector3(),new THREE.Vector3(.2,.2,.2),new THREE.Quaternion(),.7,new THREE.Color(1,0,0))});await small.initialized;
+ mesh.splats=small;source.lodSplats=undefined;spark.enableLod=false;
+ await spark.renderAsync(scene,camera);check('renderer recovers from rejected source allocation',spark.activeSplats===1);
+ scene.remove(mesh);mesh.dispose();mesh=null;source=null;small.dispose();
+ device.destroy();const lost=await device.lost;let rejected;
+ try{await spark.renderAsync(scene,camera);}catch(e){rejected=String(e);}
+ check('actual host device loss rejects future native submissions',/device.*lost/.test(rejected),{reason:lost.reason,rejected});
+ spark.dispose();spark=null;renderer.dispose();renderer=null;
+ renderer=new WebGPURenderer({antialias:false});await renderer.init();renderer.setSize(100,100);spark=new SparkRenderer({renderer,enableLod:false});
+ const fresh=new THREE.Scene();fresh.add(spark);await spark.renderAsync(fresh,camera);await renderer.backend.device.queue.onSubmittedWorkDone();
+ check('new host renderer works after device recreation',spark.getCapabilities().backend==='webgpu'&&spark.activeSplats===0);
+ check('no unhandled errors during limit rejection and device loss',errors.length===0,{errors});
+ window.lifecycleResult={passed:true,checks,errors};
+}catch(error){window.lifecycleResult={passed:false,checks,errors,error:String(error)};}finally{if(source)source.lodSplats=undefined;mesh?.dispose();spark?.dispose();renderer?.dispose();}
+</script></body></html>

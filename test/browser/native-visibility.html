@@ -1,0 +1,43 @@
+<!doctype html><html><head><link rel="icon" href="data:,"><title>Native visibility and layers</title></head><body><script type="module">
+import * as THREE from 'three';import {WebGPURenderer} from 'three/webgpu';import {SparkRenderer,SplatMesh} from '/src/index.ts';
+const errors=[],checks=[];window.addEventListener('error',e=>errors.push(e.message));window.addEventListener('unhandledrejection',e=>errors.push(String(e.reason)));
+const check=(name,ok,data={})=>{checks.push({name,ok,...data});if(!ok)throw Error(name);};
+const renderer=new WebGPURenderer({antialias:false});await renderer.init();renderer.setSize(64,64);renderer.setClearColor(0,1);document.body.append(renderer.domElement);
+renderer.backend.device.addEventListener('uncapturederror',e=>errors.push(e.error.message));
+const scene=new THREE.Scene(),parent=new THREE.Group(),camera=new THREE.PerspectiveCamera(60,1,.1,100);camera.position.z=4;scene.add(parent);
+const spark=new SparkRenderer({renderer,enableLod:false});parent.add(spark);
+// Exercise radix on the dependent branch and reference on the standalone branch.
+const sorter='webgpuSort' in spark?'radix':'readback';if(sorter==='radix')spark.webgpuSort='radix';
+const mesh=new SplatMesh({constructSplats:data=>data.pushSplat(new THREE.Vector3(),new THREE.Vector3(.5,.5,.5),new THREE.Quaternion(),1,new THREE.Color(0,1,0))});await mesh.initialized;spark.add(mesh);
+async function sample(){
+ const device=renderer.backend.device,texture=renderer.backend.get(spark.native.composite.target.texture).texture;
+ const buffer=device.createBuffer({size:256,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ}),encoder=device.createCommandEncoder();
+ encoder.copyTextureToBuffer({texture,origin:{x:32,y:32}},{buffer,bytesPerRow:256},{width:1,height:1});device.queue.submit([encoder.finish()]);await buffer.mapAsync(GPUMapMode.READ);
+ const bits=[...new Uint16Array(buffer.getMappedRange()).slice(0,4)];buffer.unmap();buffer.destroy();
+ return bits.map(v=>{const sign=(v&32768)?-1:1,e=(v>>10)&31,m=v&1023;return sign*(e===0?m*2**-24:e===31?(m?NaN:Infinity):(1+m/1024)*2**(e-15));});
+}
+async function draw(name,visible){
+ await spark.renderAsync(scene,camera);const pixel=await sample(),stats=await spark.readRenderStatsAsync();
+ check(name,visible?pixel[1]>.98&&pixel[0]<.02&&stats.drawnSplats===1:pixel[1]<.02&&pixel[0]<.02&&stats.drawnSplats===0,{pixel,stats});
+}
+try{
+ check('native placeholder preserves Object3D visibility',spark.visible===true&&spark.material.visible===false);
+ await draw('splat children render with default owner visibility',true);
+ check('requested native sorter is actually used',spark.getRenderStats().ordering===sorter,{sorter});
+ spark.visible=false;await draw('hidden owner draws zero splats',false);
+ spark.visible=true;await draw('owner visibility restores drawing',true);
+ spark.layers.set(1);await draw('camera excludes owner layer',false);
+ spark.layers.set(0);await draw('owner layer restores drawing',true);
+ parent.visible=false;await draw('hidden parent disables owner drawing',false);
+ parent.visible=true;await draw('parent visibility restores drawing',true);
+ mesh.visible=false;await draw('hidden source child clears selection',false);
+ mesh.visible=true;await draw('source child visibility restores selection',true);
+ let enter,release;const entered=new Promise(resolve=>enter=resolve),gate=new Promise(resolve=>release=resolve),before=spark.onBeforeRender.bind(spark);
+ spark.onBeforeRender=async(...args)=>{await before(...args);enter();await gate;};
+ const pending=spark.renderAsync(scene,camera);await entered;spark.visible=false;release();await pending;
+ const pixel=await sample(),stats=await spark.readRenderStatsAsync();check('visibility change during awaited update prevents stale draw',pixel[1]<.02&&stats.drawnSplats===0,{pixel,stats});
+ spark.onBeforeRender=before;spark.visible=true;await draw('visibility after pending update recovers',true);
+ check('visibility changes produce no GPU or page errors',errors.length===0,{errors});
+ window.lifecycleResult={passed:true,checks,errors};
+}catch(error){window.lifecycleResult={passed:false,checks,errors,error:String(error)};}finally{spark.dispose();mesh.dispose();renderer.dispose();}
+</script></body></html>

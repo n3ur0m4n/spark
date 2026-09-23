@@ -138,7 +138,15 @@ export class PackedSplats implements SplatSource {
   target: THREE.WebGLArrayRenderTarget | null = null;
   source: THREE.DataArrayTexture | null = null;
   // Set to true if source packedArray is updated to have it upload to GPU
-  needsUpdate = true;
+  dataVersion = 0;
+  private _needsUpdate = true;
+  get needsUpdate() {
+    return this._needsUpdate;
+  }
+  set needsUpdate(value: boolean) {
+    if (value) this.dataVersion++;
+    this._needsUpdate = value;
+  }
 
   // A PackedSplats can be used in a dyno graph using the below property dyno:
   // const gsplat = dyno.readPackedSplats(this.dyno, dynoIndex);

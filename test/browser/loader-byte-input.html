@@ -1,0 +1,44 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><link rel="icon" href="data:,"><title>Loader byte input regression</title></head>
+<body><script type="module">
+import { PackedSplats, ExtSplats } from "/src/index.ts";
+const checks = [];
+try {
+  const bytes = new Uint8Array(64);
+  const floats = new Float32Array(bytes.buffer);
+  for (let i = 0; i < 2; i++) {
+    floats.set([i + 1, i + 2, -i - 3, 0.1, 0.1, 0.1], i * 8);
+    bytes.set([255, 64, 32, 255, 255, 128, 128, 128], i * 32 + 24);
+  }
+  for (const Source of [PackedSplats, ExtSplats]) {
+    for (const kind of ["ArrayBuffer", "Uint8Array", "offset view", "stream"]) {
+      const padded = new Uint8Array(96);
+      padded.set(bytes, 16);
+      const input = kind === "ArrayBuffer" ? bytes.buffer.slice(0)
+        : kind === "offset view" ? padded.subarray(16, 80) : bytes.slice();
+      const original = new Uint8Array(input instanceof ArrayBuffer ? input : input.buffer).slice();
+      const options = { fileName: "fixture.splat" };
+      if (kind === "stream") {
+        options.stream = new ReadableStream({ start(controller) {
+          controller.enqueue(bytes.slice(0, 7));
+          controller.enqueue(bytes.slice(7, 41));
+          controller.enqueue(bytes.slice(41));
+          controller.close();
+        }});
+        options.streamLength = bytes.byteLength;
+      } else options.fileBytes = input;
+      const source = new Source(options);
+      await source.initialized;
+      const centers = [0, 1].map(i => source.getSplat(i).center.toArray());
+      const retained = new Uint8Array(input instanceof ArrayBuffer ? input : input.buffer);
+      checks.push({ source: Source.name, kind, count: source.numSplats, centers,
+        inputRetained: retained.length === original.length && retained.every((v, i) => v === original[i]),
+        pass: source.numSplats === 2 && JSON.stringify(centers) === "[[1,2,-3],[2,3,-4]]" });
+      source.dispose();
+    }
+  }
+  window.__loaderValidation = { ready: true, checks, pass: checks.every(c => c.pass && c.inputRetained) };
+} catch (error) {
+  window.__loaderValidation = { ready: false, checks, pass: false, error: String(error) };
+}
+</script></body></html>

@@ -90,13 +90,16 @@ export default defineConfig(({ mode }) => {
         name: "spark",
         formats: ["es", "cjs"],
         fileName: (format) => {
-          const base = format === "es" ? "spark.module" : `spark.${format}`;
-          return isMinify ? `${base}.min.js` : `${base}.js`;
+          if (format === "cjs") return isMinify ? "spark.min.cjs" : "spark.cjs";
+          return isMinify ? "spark.module.min.js" : "spark.module.js";
         },
       },
       sourcemap: true,
       rollupOptions: {
-        external: ["three", /^three\/addons/],
+        // Keep the host Three.js modules external, but bundle addon helpers
+        // such as Pass.js: requiring those ESM-only files breaks classic CJS
+        // consumers on Node versions without synchronous ESM loading.
+        external: ["three", "three/webgpu", "three/tsl"],
         output: {
           globals: {
             three: "THREE",

@@ -92,6 +92,16 @@ export type ExtSplatsOptions = {
 export class ExtSplats implements SplatSource {
   maxSplats = 0;
   numSplats = 0;
+  /** Set after directly editing extArrays; also mark the SplatMesh for update. */
+  dataVersion = 0;
+  private _needsUpdate = true;
+  get needsUpdate() {
+    return this._needsUpdate;
+  }
+  set needsUpdate(value: boolean) {
+    if (value) this.dataVersion++;
+    this._needsUpdate = value;
+  }
   extArrays: [Uint32Array, Uint32Array];
   extra: ExtSplatsExtra = {};
   maxSh = 3;
@@ -155,6 +165,7 @@ export class ExtSplats implements SplatSource {
   }
 
   initialize(options: ExtSplatsOptions) {
+    this.needsUpdate = true;
     this.extra = options.extra ?? {};
     this.lodSplats = options.lodSplats;
 
@@ -217,6 +228,8 @@ export class ExtSplats implements SplatSource {
         onProgress: options.onProgress,
         lodAbove,
       });
+    } else if (construct) {
+      this.initialize(options);
     }
 
     if (construct) {
@@ -479,6 +492,7 @@ export class ExtSplats implements SplatSource {
       }
       this.extArrays[0] = newArray0;
       this.extArrays[1] = newArray1;
+      this.needsUpdate = true;
     }
     return this.extArrays;
   }
@@ -530,6 +544,7 @@ export class ExtSplats implements SplatSource {
       color.b,
     );
     this.numSplats = Math.max(this.numSplats, index + 1);
+    this.needsUpdate = true;
   }
 
   // Effectively calls this.setSplat(this.numSplats++, center, ...), useful on
@@ -561,6 +576,7 @@ export class ExtSplats implements SplatSource {
       color.b,
     );
     ++this.numSplats;
+    this.needsUpdate = true;
   }
 
   // Iterate over Gsplats index 0..=(this.numSplats-1), unpack each Gsplat
@@ -592,7 +608,17 @@ export class ExtSplats implements SplatSource {
   }
 
   // Check if source texture needs to be created/updated
+  getTextures(): [THREE.DataArrayTexture, THREE.DataArrayTexture] {
+    if (this.needsUpdate) {
+      this.updateTextures();
+    }
+    return this.textures;
+  }
+
   private updateTextures() {
+    if (this.extArrays[0].length === 0) {
+      return;
+    }
     if (this.textures[0] !== ExtSplats.emptyTexture) {
       const { width, height, depth } = this.textures[0].image;
       if (this.maxSplats !== width * height * depth) {
@@ -624,15 +650,14 @@ export class ExtSplats implements SplatSource {
         THREE.UnsignedIntType,
         "RGBA32UI",
       );
-    } else if (
-      this.extArrays[0].buffer !== this.textures[0].image.data.buffer
-    ) {
-      this.textures[0].image.data = new Uint8Array(this.extArrays[0].buffer);
-      this.textures[1].image.data = new Uint8Array(this.extArrays[1].buffer);
-      // Indicate to Three.js that the source textures needs to be uploaded to the GPU
+    } else {
+      // Preserve each Uint32 view's offset. In-place edits also need an upload.
+      this.textures[0].image.data = this.extArrays[0];
+      this.textures[1].image.data = this.extArrays[1];
       this.textures[0].needsUpdate = true;
       this.textures[1].needsUpdate = true;
     }
+    this.needsUpdate = false;
   }
 
   extractSplats(indices: Uint32Array, pageColoring: boolean) {
@@ -780,10 +805,9 @@ export class DynoExtSplats extends DynoUniform<
         numSplats: 0,
       },
       update: (value) => {
-        value.textureArray1 =
-          this.extSplats?.textures[0] ?? ExtSplats.emptyTexture;
-        value.textureArray2 =
-          this.extSplats?.textures[1] ?? ExtSplats.emptyTexture;
+        const textures = this.extSplats?.getTextures();
+        value.textureArray1 = textures?.[0] ?? ExtSplats.emptyTexture;
+        value.textureArray2 = textures?.[1] ?? ExtSplats.emptyTexture;
         value.numSplats = this.extSplats?.numSplats ?? 0;
         return value;
       },

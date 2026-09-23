@@ -1,0 +1,146 @@
+<!doctype html><html><head><meta charset="utf-8"><link rel="icon" href="data:,"><title>Native generation oracle</title></head><body>
+<script type="module">
+import * as THREE from 'three';
+import {FullScreenQuad} from 'three/addons/postprocessing/Pass.js';
+import {WebGPURenderer} from 'three/webgpu';
+const library = new URLSearchParams(location.search).get('library') || '/src/index.ts';
+const {SparkRenderer,SplatMesh,PackedSplats,ExtSplats} = await import(/* @vite-ignore */ library);
+const errors=[];
+window.addEventListener('unhandledrejection', e => errors.push(String(e.reason)));
+window.addEventListener('error', e => errors.push(e.message));
+
+async function readBuffer(device, source, bytes) {
+ const destination = device.createBuffer({size: Math.max(4,bytes), usage: GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
+ try {
+  const encoder=device.createCommandEncoder();encoder.copyBufferToBuffer(source,0,destination,0,bytes);
+  device.queue.submit([encoder.finish()]);await destination.mapAsync(GPUMapMode.READ);
+  const result=new Uint32Array(destination.getMappedRange().slice(0,bytes));destination.unmap();return result;
+ } finally {destination.destroy();}
+}
+async function readOrdering(device, texture, count) {
+ const size = Math.max(256,Math.ceil(count/64)*256);
+ const output=device.createBuffer({size,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC});
+ const pipeline=device.createComputePipeline({layout:'auto',compute:{entryPoint:'main',module:device.createShaderModule({code:`
+  @group(0) @binding(0) var ordering:texture_2d<u32>;
+  @group(0) @binding(1) var<storage,read_write> output:array<u32>;
+  @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id:vec3u){
+   let i=id.x;if(i>=arrayLength(&output)){return;}
+   let texel=textureLoad(ordering,vec2i(i32((i/4u)%4096u),i32(i/16384u)),0);
+   output[i]=texel[i%4u];
+  }`})}});
+ try {
+  const encoder=device.createCommandEncoder(),pass=encoder.beginComputePass();pass.setPipeline(pipeline);
+  pass.setBindGroup(0,device.createBindGroup({layout:pipeline.getBindGroupLayout(0),entries:[
+   {binding:0,resource:texture.createView()},{binding:1,resource:{buffer:output}}]}));
+  pass.dispatchWorkgroups(size/256);pass.end();device.queue.submit([encoder.finish()]);
+  return await readBuffer(device,output,count*4);
+ } finally {output.destroy();}
+}
+
+window.runNativeCase = async function(config) {
+ let seed=(config.seed??1)>>>0;
+ const random=()=>{seed^=seed<<13;seed^=seed>>>17;seed^=seed<<5;return (seed>>>0)/4294967296;};
+ const native=config.engine!=='webgl';
+ const renderer=native?new WebGPURenderer({antialias:false,alpha:true}):new THREE.WebGLRenderer({antialias:false,alpha:true,preserveDrawingBuffer:true});
+ if(native)await renderer.init();
+ renderer.setPixelRatio(1);renderer.setSize(160,120);document.body.append(renderer.domElement);
+ if(native)renderer.backend.device.addEventListener('uncapturederror',e=>errors.push(e.error.message));
+ const scene=new THREE.Scene();scene.background=new THREE.Color(0,0,0);
+ const camera=config.ortho?new THREE.OrthographicCamera(-3,3,2.25,-2.25,.1,1000):new THREE.PerspectiveCamera(60,4/3,.1,1000);
+ camera.position.set(.2,.1,5);camera.lookAt(0,0,0);camera.updateMatrixWorld();
+ const spark=new SparkRenderer({renderer,autoUpdate:native,enableLod:!!config.lod,enableDriveLod:false,
+   accumExtSplats:!!config.outputExt,sortRadial:config.radial!==false,
+   maxStdDev:config.maxStdDev,minAlpha:config.minAlpha,minSortIntervalMs:0});scene.add(spark);
+ const sources=[],meshes=[];
+ const target=!native&&config.linear?new THREE.WebGLRenderTarget(160,120,{type:THREE.HalfFloatType}):null;
+ const quad=target?new FullScreenQuad(new THREE.ShaderMaterial({
+  uniforms:{source:{value:target.texture}},depthTest:false,depthWrite:false,blending:THREE.NoBlending,
+  vertexShader:'varying vec2 vUv; void main(){vUv=uv;gl_Position=vec4(position.xy,0.0,1.0);}',
+  fragmentShader:`uniform sampler2D source;varying vec2 vUv;
+   void main(){vec4 c=texture2D(source,vUv);vec3 s=c.rgb/max(c.a,1e-6);
+    s=mix(12.92*s,1.055*pow(s,vec3(1.0/2.4))-0.055,step(vec3(0.0031308),s));gl_FragColor=vec4(s*c.a,c.a);}`
+ })):null;
+ try {
+  for(let m=0;m<2;m++) {
+   const extended=config.format==='ext'||(config.format==='mixed'&&m===1);
+   const count=config.count??3,extra={};
+   const randomWords=(words,band)=>Uint32Array.from({length:words},(_,i)=>extended?0x34003800:((0x10204081*(i+1+band*19+m*3))>>>0));
+   if(config.sh>=1)extra.sh1=randomWords(count*(extended?4:2),1);
+   if(config.sh>=2)extra.sh2=randomWords(count*4,2);
+   if(config.sh>=3){if(extended){extra.sh3a=randomWords(count*4,3);extra.sh3b=randomWords(count*4,4);}else extra.sh3=randomWords(count*4,3);}
+   let source=new (extended?ExtSplats:PackedSplats)({maxSplats:count,extra,
+    construct:data=>{for(let i=0;i<count;i++){
+     if(config.seed!==undefined){
+      const center=new THREE.Vector3((random()-.5)*3,(random()-.5)*2,(random()-.5)*3);
+      const scales=new THREE.Vector3(.03+random()*.3,.03+random()*.3,.03+random()*.3);
+      const quaternion=new THREE.Quaternion().setFromEuler(new THREE.Euler(random()*6,random()*6,random()*6));
+      if(config.invalid&&i%7===0)scales.setScalar(0);
+      data.pushSplat(center,scales,quaternion,config.invalid&&i%11===0?0:.1+random()*.8,new THREE.Color(random(),random(),random()));
+      continue;
+     }
+     data.pushSplat(
+     new THREE.Vector3((i%3-.5)*.2,Math.floor(i/3)*.01,(i%2)*.15),
+     new THREE.Vector3(.25,.25,.25),new THREE.Quaternion(),.7,new THREE.Color(m?.1:.8,.2,m?.8:.1));}}});
+   await source.initialized;
+   const constructed=source;
+   // Both engines receive the same initialized asset arrays through the public
+   // array constructor. The separate construction/update regression is retained.
+   source=new (extended?ExtSplats:PackedSplats)(extended?
+    {extArrays:constructed.extArrays,numSplats:count,extra}:
+    {packedArray:constructed.packedArray,numSplats:count,extra});
+   await source.initialized;constructed.dispose();sources.push(source);
+   if(source.getNumSh()!==config.sh)throw new Error('SH fixture did not initialize requested bands');
+   const mesh=new SplatMesh(extended?{extSplats:source}:{packedSplats:source});await mesh.initialized;
+   mesh.position.set(m?.75:-.75,0,m?.1:0);mesh.scale.setScalar(m?1.5:.6);mesh.rotation.set(.1*m,.3*(m+1),.1);
+   mesh.maxSh=config.sh??0;mesh.opacity=m?.8:1;meshes.push(mesh);scene.add(mesh);
+   if(config.lod){source.lodSplats=source;const indices=new Uint32Array(16384);indices.fill(0xffffffff);indices.set([2,0]);
+    const texture=new THREE.DataTexture(indices,4096,1,THREE.RGBAIntegerFormat,THREE.UnsignedIntType);texture.internalFormat='RGBA32UI';texture.needsUpdate=true;
+    spark.lodInstances.set(mesh,{numSplats:2,indices,texture});}
+  }
+  const draw=async()=>{
+   if(native)await spark.renderAsync(scene,camera);
+   else {renderer.setRenderTarget(target);renderer.getDrawingBufferSize(spark.renderSize);await spark.update({scene,camera});const until=performance.now()+5000;while(spark.sorting||spark.sortDirty){if(performance.now()>until)throw Error('Sort did not settle');await new Promise(r=>setTimeout(r,1));}renderer.render(scene,camera);renderer.setRenderTarget(null);quad?.render(renderer);}
+  };
+  await draw();await draw();
+  if(config.move){meshes[1].position.x-=.9;meshes[0].scale.setScalar(.9);camera.position.x+=.7;camera.lookAt(0,0,0);await draw();await draw();}
+  if(config.hide){meshes[1].visible=false;await draw();await draw();}
+  const canvas=document.createElement('canvas');canvas.width=160;canvas.height=120;
+  const context=canvas.getContext('2d');context.drawImage(renderer.domElement,0,0);
+  const pixels=Array.from(context.getImageData(0,0,160,120).data);
+  const current=spark.current;
+  let depths,ordering,drawCount;
+  if(native){const backend=spark.webgpuBackend,slot=backend.renderSlots[backend.activeSlotIndex],device=renderer.backend.device;
+   depths=await backend.readNativeDepths(current.numSplats);
+   drawCount=spark.activeSplats;
+   ordering=await readOrdering(device,slot.orderingTexture,drawCount);
+  }else {
+   depths=new Uint32Array(Math.max(4096,Math.ceil(current.numSplats/4096)*4096));
+   await spark.readbackDepth({current,renderer,numSplats:current.numSplats,readback:depths});
+   const gl=renderer.getContext(),texture=spark.orderingTexture;
+   const framebuffer=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,framebuffer);
+   gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,renderer.properties.get(texture).__webglTexture,0);
+   const all=new Uint32Array(4096*texture.image.height*4);gl.readPixels(0,0,4096,texture.image.height,gl.RGBA_INTEGER,gl.UNSIGNED_INT,all);
+   gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.deleteFramebuffer(framebuffer);drawCount=spark.activeSplats;ordering=all.slice(0,drawCount);
+  }
+  const keys=[];for(let i=0;i<current.numSplats;i++)if(depths[i]<0x7f800000)keys.push([i,depths[i]]);
+  let generated;
+  if(config.inspectGenerated){
+   if(native){const b=spark.webgpuBackend,d=renderer.backend.device;generated=[await readBuffer(d,b.generatedOutputBuffer,current.numSplats*16),await readBuffer(d,b.generatedOutputBuffer2,current.numSplats*16)];}
+   else{const gl=renderer.getContext(),fb=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,fb);generated=[];
+    for(let attachment=0;attachment<2;attachment++){const tex=renderer.properties.get(current.target.textures[attachment]).__webglTexture;
+     gl.framebufferTextureLayer(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,tex,0,0);const data=new Uint32Array(2048*2*4);gl.readPixels(0,0,2048,2,gl.RGBA_INTEGER,gl.UNSIGNED_INT,data);generated.push(data);}
+    gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.deleteFramebuffer(fb);}
+   generated=generated.map(array=>current.mapping.flatMap(({base,count})=>Array.from({length:count},(_,i)=>Array.from(array.slice((base+i)*4,(base+i+1)*4)))));
+  }
+  const vertices=config.inspectVertices?await (await import("./vertex-probe.js")).probeVertices(spark,renderer,drawCount,config.inspectMath):undefined;
+  const image=canvas.toDataURL();
+  return {config,vertices,generated,outputExt:current.extSplats,displaySame:spark.current===spark.display,span:current.numSplats,mapping:current.mapping.map(m=>({base:m.base,count:m.count})),
+    drawCount,sourceBands:sources.map(s=>s.getNumSh()),ordering:Array.from(ordering),keys,pixels,image,errors:[...errors],
+    adapter:native?{vendor:renderer.backend.device.adapterInfo.vendor,architecture:renderer.backend.device.adapterInfo.architecture}:null};
+ } finally {
+  if(native)await renderer.backend.device.queue.onSubmittedWorkDone();
+  target?.dispose();quad?.material.dispose();quad?.dispose();spark.dispose();for(const source of sources)if(source.lodSplats===source)source.lodSplats=undefined;for(const mesh of meshes)mesh.dispose();renderer.dispose();renderer.domElement.remove();
+ }
+};
+window.__nativeGenerationReady=true;
+</script></body></html>

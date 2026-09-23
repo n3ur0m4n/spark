@@ -1,0 +1,42 @@
+<!doctype html><html><head><link rel="icon" href="data:,"></head><body><script type="module">
+import * as THREE from 'three';
+import {SparkRenderer} from '/src/index.ts';
+const checks=[],errors=[];
+window.addEventListener('unhandledrejection',e=>errors.push(String(e.reason)));
+const check=(name,ok)=>{checks.push({name,ok});if(!ok)throw Error(name);};
+const renderer=new THREE.WebGLRenderer({antialias:false});renderer.setSize(32,32);
+try{
+ const spark=new SparkRenderer({renderer,enableLod:false,minSortIntervalMs:0});
+ let textureDisposals=0,timerFired=false;
+ const texture=new THREE.DataTexture(new Uint32Array(4),1,1);
+ texture.addEventListener('dispose',()=>textureDisposals++);
+ spark.lodInstances.set({}, {texture,numSplats:0,indices:new Uint32Array()});
+ spark.updateTimeoutId=setTimeout(()=>{timerFired=true;},10);
+ spark.sortTimeoutId=setTimeout(()=>{timerFired=true;},10);
+ let entered,release;const started=new Promise(r=>entered=r),gate=new Promise(r=>release=r);
+ spark.readbackDepth=async()=>{entered();await gate;};
+ spark.sortDirty=true;
+ const pending=spark.driveSort();await started;spark.dispose();release();await pending;
+ await new Promise(r=>setTimeout(r,30));
+ check('LoD texture disposed exactly once',textureDisposals===1);
+ check('scheduled work cancelled',!timerFired&&spark.updateTimeoutId===undefined&&spark.sortTimeoutId===undefined);
+ check('late readback creates no sort worker or ordering texture',spark.sortWorker===null&&spark.orderingTexture===null);
+ check('sort state released after disposal',spark.sorting===false);
+ spark.dispose();check('repeated disposal is idempotent',textureDisposals===1);
+ const recovering=new SparkRenderer({renderer,enableLod:false,minSortIntervalMs:0});
+ recovering.sortDirty=true;recovering.readbackDepth=async()=>{throw Error('injected readback failure');};
+ let rejected=false;try{await recovering.driveSort();}catch(e){rejected=String(e).includes('injected');}
+ check('failed readback releases sort lock and remains retryable',rejected&&!recovering.sorting&&recovering.sortDirty);
+ recovering.readbackDepth=async()=>{};
+ await recovering.driveSort();
+ check('a subsequent explicit sort succeeds',!recovering.sorting&&!recovering.sortDirty&&recovering.orderingTexture!==null);
+ const cancelled=new SparkRenderer({renderer,enableLod:false,minSortIntervalMs:0});
+ let workerEntered,rejectWorker;const workerStarted=new Promise(r=>workerEntered=r);
+ cancelled.readbackDepth=async()=>{};
+ cancelled.sortWorker={call:()=>new Promise((_,reject)=>{rejectWorker=reject;workerEntered();}),dispose:()=>rejectWorker(Error('Worker terminate'))};
+ cancelled.sortDirty=true;const cancellation=cancelled.driveSort();await workerStarted;cancelled.dispose();await cancellation;
+ check('worker termination during disposal is handled',!cancelled.sorting&&cancelled.orderingTexture===null);
+ recovering.dispose();check('no unhandled late callbacks',errors.length===0);
+ window.disposalResult={passed:true,checks,errors};
+}catch(error){window.disposalResult={passed:false,checks,errors,error:String(error)};}finally{window.lifecycleResult=window.disposalResult;renderer.dispose();}
+</script></body></html>

@@ -17,7 +17,8 @@
     "types": [
       "vite/client",
       "vite-plugin-glsl/ext",
-      "vite-plugin-arraybuffer/types"
+      "vite-plugin-arraybuffer/types",
+      "@webgpu/types"
     ]
   },
   "include": ["src/**/*"],

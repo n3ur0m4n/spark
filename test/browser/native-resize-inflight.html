@@ -1,0 +1,28 @@
+<!doctype html><html><head><link rel="icon" href="data:,"><title>Native resize during pending update</title></head><body style="margin:0"><script type="module">
+import * as THREE from 'three';
+import {WebGPURenderer} from 'three/webgpu';
+import {SparkRenderer,SplatMesh} from '/src/index.ts';
+const checks=[],errors=[];const check=(name,ok,data={})=>{checks.push({name,ok,...data});if(!ok)throw Error(name);};window.addEventListener('error',e=>errors.push(e.message));window.addEventListener('unhandledrejection',e=>errors.push(String(e.reason)));
+const renderer=new WebGPURenderer({antialias:false});await renderer.init();renderer.setSize(64,64);document.body.append(renderer.domElement);
+renderer.backend.device.addEventListener('uncapturederror',e=>errors.push(e.error.message));
+const scene=new THREE.Scene(),camera=new THREE.PerspectiveCamera(60,1,.1,100);camera.position.z=4;
+const spark=new SparkRenderer({renderer,enableLod:false,webgpuSort:new URLSearchParams(location.search).get('engine')==='gpu-sort'?'radix':'readback'});scene.add(spark);
+const mesh=new SplatMesh({constructSplats:data=>{
+ data.pushSplat(new THREE.Vector3(-.2,.1,0),new THREE.Vector3(.1,.2,.1),new THREE.Quaternion(),.8,new THREE.Color(1,0,0));
+ data.pushSplat(new THREE.Vector3(.3,-.15,.1),new THREE.Vector3(.15,.1,.1),new THREE.Quaternion(),.7,new THREE.Color(0,1,0));
+}});await mesh.initialized;scene.add(mesh);
+try{
+ let enter,release;const entered=new Promise(r=>enter=r),gate=new Promise(r=>release=r),original=spark.onBeforeRender.bind(spark);
+ spark.onBeforeRender=async(...args)=>{await original(...args);enter();await gate;};
+ const pending=spark.renderAsync(scene,camera);await entered;
+ renderer.setSize(128,96);release();await pending;await renderer.backend.device.queue.onSubmittedWorkDone();
+ const pendingSize=spark.uniforms.renderSize.value.toArray(),pendingPng=renderer.domElement.toDataURL();
+ spark.onBeforeRender=original;
+ await spark.renderAsync(scene,camera);await renderer.backend.device.queue.onSubmittedWorkDone();
+ check('resize during pending update refreshes drawing dimensions',JSON.stringify(pendingSize)==='[128,96]',{pendingSize});
+ check('pending resize matches a settled draw at the same camera',pendingPng===renderer.domElement.toDataURL());
+ check('pending resize produces no unhandled errors',errors.length===0,{errors});
+ window.lifecycleResult={passed:true,checks,errors};
+}catch(error){window.lifecycleResult={passed:false,checks,errors,error:String(error)};}
+finally{spark.dispose();mesh.dispose();renderer.dispose();}
+</script></body></html>

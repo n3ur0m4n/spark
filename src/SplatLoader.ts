@@ -88,10 +88,9 @@ export class SplatLoader extends Loader {
     lodAbove?: number;
     lodBase?: number;
   }) {
-    if (fileBytes instanceof ArrayBuffer) {
-      fileBytes = new Uint8Array(fileBytes);
-    }
-    const resolvedURL = fileBytes
+    const inputBytes =
+      fileBytes instanceof ArrayBuffer ? new Uint8Array(fileBytes) : fileBytes;
+    const resolvedURL = inputBytes
       ? undefined
       : this.manager.resolveURL((this.path ?? "") + (url ?? ""));
 
@@ -151,7 +150,7 @@ export class SplatLoader extends Loader {
             url: basedUrl,
             requestHeader: this.requestHeader,
             withCredentials: this.withCredentials,
-            fileBytes: fileBytes?.slice(),
+            fileBytes: inputBytes?.slice(),
             fileType,
             pathName: resolvedURL || fileName,
             chunked: stream !== undefined,

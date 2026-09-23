@@ -9,6 +9,7 @@
     "ignoreUnknown": false,
     "ignore": [
       "dist/*",
+      "test-results/",
       "examples/assets/",
       "examples/showcase/hello-gsplat",
       "examples/js",

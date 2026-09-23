@@ -3,6 +3,15 @@ import { ExtSplats } from "./ExtSplats";
 import { PackedSplats } from "./PackedSplats";
 import { PagedSplats } from "./PagedSplats";
 import { Readback } from "./Readback";
+import {
+  type RendererAdapter,
+  type SparkHostRenderer,
+  createRendererAdapter,
+  isWebGLRenderer,
+} from "./RendererAdapter";
+import { getSparkRendererCapabilities } from "./RendererCapabilities";
+import { SparkNativeRenderer } from "./SparkNativeRenderer";
+import type { SparkRenderStats } from "./SparkRenderStats";
 import { SplatAccumulator } from "./SplatAccumulator";
 import type { SplatGenerator } from "./SplatGenerator";
 import { SplatGeometry } from "./SplatGeometry";
@@ -34,14 +43,16 @@ import type { rpcHandlers } from "./worker";
 // inertia tail (never exactly 0) without mistaking it for real movement.
 const STOCHASTIC_POSE_EPSILON = 1e-5;
 
-export interface SparkRendererOptions {
+export interface SparkRendererOptions<
+  R extends SparkHostRenderer = THREE.WebGLRenderer,
+> {
   /**
    * Pass in your THREE.WebGLRenderer instance so Spark can perform work
    * outside the usual render loop. Should be created with antialias: false
    * (default setting) as WebGL anti-aliasing doesn't improve Gaussian Splatting
    * rendering and significantly reduces performance.
    */
-  renderer: THREE.WebGLRenderer;
+  renderer: R;
   /**
    * Callback function to be called when SparkRenderer needs to re-render,
    * for example when splat sort order or LoD updates complete. May fire
@@ -407,14 +418,61 @@ export interface SparkPickResult {
   ms: number;
 }
 
-export class SparkRenderer extends THREE.Mesh {
-  readonly renderer: THREE.WebGLRenderer;
-  readonly material: THREE.ShaderMaterial;
+export class SparkRenderer<
+  R extends SparkHostRenderer = THREE.WebGLRenderer,
+> extends THREE.Mesh {
+  readonly renderer: R;
+  readonly material: R extends THREE.WebGLRenderer
+    ? THREE.ShaderMaterial
+    : THREE.Material;
+  private readonly adapter: RendererAdapter;
+  private readonly native: SparkNativeRenderer | null;
+
+  get isWebGPU() {
+    return this.adapter.kind === "webgpu";
+  }
+  get webgpuBackend() {
+    return this.native?.backend ?? null;
+  }
+  getCapabilities() {
+    return getSparkRendererCapabilities(this.renderer);
+  }
+
+  /** Counts for the committed generation, excluding inactive depth entries. */
+  getRenderStats(): SparkRenderStats {
+    return (
+      this.native?.getRenderStats() ?? {
+        generation: this.display.version,
+        selectedSplats: this.display.mapping.reduce(
+          (sum, mesh) => sum + mesh.count,
+          0,
+        ),
+        drawnSplats: this.activeSplats,
+        ordering: "readback",
+      }
+    );
+  }
+
+  /** Read counts for the generation committed when called; this may wait for the GPU. */
+  readRenderStatsAsync(): Promise<SparkRenderStats> {
+    if (this.isDisposed)
+      return Promise.reject(new Error("SparkRenderer is disposed"));
+    return (
+      this.native?.readRenderStatsAsync() ??
+      Promise.resolve(this.getRenderStats())
+    );
+  }
+
+  private requireWebGLRenderer(): THREE.WebGLRenderer {
+    if (this.adapter.kind !== "webgl")
+      throw new Error("Spark: this operation requires THREE.WebGLRenderer");
+    return this.adapter.renderer;
+  }
   readonly uniforms: ReturnType<typeof SparkRenderer.makeUniforms>;
 
   autoUpdate: boolean;
   preUpdate: boolean;
-  static sparkOverride?: SparkRenderer;
+  static sparkOverride?: SparkRenderer<SparkHostRenderer>;
 
   renderSize = new THREE.Vector2();
   maxStdDev: number;
@@ -468,6 +526,7 @@ export class SparkRenderer extends THREE.Mesh {
 
   orderingTexture: THREE.DataTexture | null = null;
   maxSplats = 0;
+  /** Sorted instance count for the committed generation. */
   activeSplats = 0;
 
   display: SplatAccumulator;
@@ -608,7 +667,7 @@ export class SparkRenderer extends THREE.Mesh {
   sortPause = 0;
   sortDelay = 0;
 
-  constructor(options: SparkRendererOptions) {
+  constructor(options: SparkRendererOptions<R>) {
     if (!options) {
       throw new Error("SparkRenderer options are required");
     }
@@ -616,6 +675,21 @@ export class SparkRenderer extends THREE.Mesh {
       throw new Error("renderer is required in SparkRenderer options");
     }
 
+    const adapter = createRendererAdapter(options.renderer);
+    if (
+      adapter.kind === "webgpu" &&
+      (options.target ||
+        options.vertexShader ||
+        options.fragmentShader ||
+        options.extraUniforms ||
+        options.depthWrite ||
+        options.depthTest === false ||
+        options.transparent === false)
+    ) {
+      throw new Error(
+        "Spark: custom targets, shaders and material overrides require THREE.WebGLRenderer.",
+      );
+    }
     const uniforms = SparkRenderer.makeUniforms();
     Object.assign(uniforms, options.extraUniforms ?? {});
 
@@ -636,7 +710,23 @@ export class SparkRenderer extends THREE.Mesh {
     });
 
     super(geometry, material);
-    this.material = material;
+    this.adapter = adapter;
+    if (adapter.kind === "webgpu") {
+      geometry.dispose();
+      material.dispose();
+      this.geometry = new THREE.BufferGeometry();
+      // Hide only the placeholder draw, preserving visibility of child splats.
+      this.material = new THREE.MeshBasicMaterial({
+        visible: false,
+        premultipliedAlpha,
+      }) as THREE.Material as SparkRenderer<R>["material"];
+    } else {
+      this.material = material as SparkRenderer<R>["material"];
+    }
+    this.native =
+      adapter.kind === "webgpu"
+        ? new SparkNativeRenderer(this, adapter.renderer, adapter.device)
+        : null;
     this.uniforms = uniforms;
     // Disable frustum culling because we want to always draw them all
     // and cull Gsplats individually in the shader
@@ -721,9 +811,10 @@ export class SparkRenderer extends THREE.Mesh {
     this.accumulators.push(new SplatAccumulator(accumulatorOptions));
 
     // Check if the provoking vertex convention should be changed
-    const provokingVertexExt = this.renderer
-      .getContext()
-      .getExtension("WEBGL_provoking_vertex");
+    const provokingVertexExt =
+      adapter.kind === "webgl"
+        ? adapter.renderer.getContext().getExtension("WEBGL_provoking_vertex")
+        : null;
     if (provokingVertexExt) {
       provokingVertexExt.provokingVertexWEBGL(
         provokingVertexExt.FIRST_VERTEX_CONVENTION_WEBGL,
@@ -836,7 +927,9 @@ export class SparkRenderer extends THREE.Mesh {
   }
 
   dispose() {
+    if (this.isDisposed) return;
     this.isDisposed = true;
+    this.native?.dispose();
 
     // @ts-ignore Object3D has a dispose method in Three.js >= r186
     super.dispose?.();
@@ -944,10 +1037,18 @@ export class SparkRenderer extends THREE.Mesh {
   }
 
   onBeforeRender(
-    renderer: THREE.WebGLRenderer,
+    renderer: SparkHostRenderer,
     scene: THREE.Scene,
     camera: THREE.Camera,
-  ) {
+  ): void | Promise<void> {
+    if (this.isDisposed) return;
+    if (this.native) {
+      if (this.autoUpdate)
+        return this.updateInternal({ scene, camera, autoUpdate: true });
+      return;
+    }
+    if (!isWebGLRenderer(renderer))
+      throw new Error("Spark: expected the configured WebGL renderer");
     const spark = SparkRenderer.sparkOverride ?? this;
 
     const frame = renderer.info.render.frame;
@@ -1218,10 +1319,16 @@ export class SparkRenderer extends THREE.Mesh {
     if (this.isDisposed) {
       return;
     }
-    const renderer = this.renderer;
     if (this.ownsTimer) {
       this.timer.update();
     }
+    if (this.native) {
+      const visibleGenerators = await this.native.update(scene, camera);
+      if (this.enableDriveLod && !this.isDisposed)
+        this.driveLod({ visibleGenerators, camera, scene });
+      return;
+    }
+    const renderer = this.requireWebGLRenderer();
 
     const center = camera.getWorldPosition(new THREE.Vector3());
     const dir = camera.getWorldDirection(new THREE.Vector3());
@@ -1392,7 +1499,7 @@ export class SparkRenderer extends THREE.Mesh {
 
     await this.readbackDepth({
       current,
-      renderer: this.renderer,
+      renderer: this.requireWebGLRenderer(),
       numSplats,
       readback,
     });
@@ -1484,7 +1591,7 @@ export class SparkRenderer extends THREE.Mesh {
       orderingTexture.needsUpdate = true;
       this.orderingTexture = orderingTexture;
     } else {
-      const renderer = this.renderer;
+      const renderer = this.requireWebGLRenderer();
       if (!renderer.properties.has(this.orderingTexture)) {
         this.orderingTexture.needsUpdate = true;
       } else {
@@ -1728,7 +1835,7 @@ export class SparkRenderer extends THREE.Mesh {
   ) {
     if (hasPaged && !this.pager) {
       this.pager = new SplatPager({
-        renderer: this.renderer,
+        renderer: this.requireWebGLRenderer(),
         extSplats: this.pagedExtSplats,
         maxSplats: this.maxPagedSplats,
         numFetchers: this.numLodFetchers,
@@ -2143,15 +2250,20 @@ export class SparkRenderer extends THREE.Mesh {
           instance.numSplats = numSplats;
           // instance.indices.set(indices.subarray(0, numSplats));
 
-          const renderer = this.renderer;
-          if (renderer.properties.has(instance.texture)) {
-            uploadU32DataTextureRows(
-              renderer,
-              instance.texture,
-              4096,
-              rows,
-              indices,
-            );
+          if (this.native) {
+            instance.indices = indices;
+            instance.texture.image.data = indices;
+          } else {
+            const renderer = this.requireWebGLRenderer();
+            if (renderer.properties.has(instance.texture)) {
+              uploadU32DataTextureRows(
+                renderer,
+                instance.texture,
+                4096,
+                rows,
+                indices,
+              );
+            }
           }
         }
       }
@@ -2266,7 +2378,21 @@ export class SparkRenderer extends THREE.Mesh {
     return texture;
   })();
 
-  render(scene: THREE.Scene, camera: THREE.Camera) {
+  /**
+   * Native WebGPU resolves after update and draw submission. Classic WebGL keeps
+   * its existing background updates. Neither route waits for GPU completion.
+   */
+  async renderAsync(scene: THREE.Scene, camera: THREE.Camera): Promise<void> {
+    if (this.native) return this.native.renderAsync(scene, camera);
+    this.render(scene, camera);
+  }
+
+  render(scene: THREE.Scene, camera: THREE.Camera): void {
+    if (this.isDisposed) throw new Error("SparkRenderer is disposed");
+    if (this.native)
+      throw new Error(
+        "Spark: use await renderAsync(scene, camera) for native WebGPU",
+      );
     try {
       SparkRenderer.sparkOverride = this;
       this.renderer.render(scene, camera);
@@ -2284,14 +2410,14 @@ export class SparkRenderer extends THREE.Mesh {
       throw new Error("No target");
     }
 
-    const previousTarget = this.renderer.getRenderTarget();
+    const previousTarget = this.requireWebGLRenderer().getRenderTarget();
     try {
-      this.renderer.setRenderTarget(target);
+      this.requireWebGLRenderer().setRenderTarget(target);
       SparkRenderer.sparkOverride = this;
       this.renderer.render(scene, camera);
     } finally {
       SparkRenderer.sparkOverride = undefined;
-      this.renderer.setRenderTarget(previousTarget);
+      this.requireWebGLRenderer().setRenderTarget(previousTarget);
     }
 
     if (target !== this.target) {
@@ -2316,7 +2442,7 @@ export class SparkRenderer extends THREE.Mesh {
     }
     const superPixels = this.superPixels;
 
-    await this.renderer.readRenderTargetPixelsAsync(
+    await this.requireWebGLRenderer().readRenderTargetPixelsAsync(
       this.target,
       0,
       0,
@@ -2450,7 +2576,7 @@ export class SparkRenderer extends THREE.Mesh {
     try {
       SparkRenderer.sparkOverride = this;
       // Update the CubeCamera, which performs 6 cube face renders
-      cubeCamera.update(this.renderer, scene);
+      cubeCamera.update(this.requireWebGLRenderer(), scene);
     } finally {
       SparkRenderer.sparkOverride = undefined;
     }
@@ -2477,7 +2603,7 @@ export class SparkRenderer extends THREE.Mesh {
       const byteSize = width * height * 4;
       const readback = new Uint8Array(byteSize);
       buffers.push(readback);
-      const promise = this.renderer.readRenderTargetPixelsAsync(
+      const promise = this.requireWebGLRenderer().readRenderTargetPixelsAsync(
         SparkRenderer.cubeRender.target,
         0,
         0,
@@ -2527,7 +2653,9 @@ export class SparkRenderer extends THREE.Mesh {
     });
     // Pre-filter the cube map using THREE.PMREMGenerator if requested
     if (!SparkRenderer.pmrem) {
-      SparkRenderer.pmrem = new THREE.PMREMGenerator(this.renderer);
+      SparkRenderer.pmrem = new THREE.PMREMGenerator(
+        this.requireWebGLRenderer(),
+      );
     }
 
     return SparkRenderer.pmrem?.fromCubemap(cubeTexture).texture;
@@ -2761,7 +2889,7 @@ export class SparkRenderer extends THREE.Mesh {
     solid?: boolean;
   }): Promise<SparkPickResult | null> {
     const t0 = performance.now();
-    const renderer = this.renderer;
+    const renderer = this.requireWebGLRenderer();
     const canvas = renderer.domElement;
     const fullW = canvas.clientWidth || canvas.width;
     const fullH = canvas.clientHeight || canvas.height;
@@ -2833,7 +2961,7 @@ export class SparkRenderer extends THREE.Mesh {
     alphaThreshold?: number;
   }): Promise<(SparkPickResult | null)[]> {
     const t0 = performance.now();
-    const renderer = this.renderer;
+    const renderer = this.requireWebGLRenderer();
     const canvas = renderer.domElement;
     const fullW = canvas.clientWidth || canvas.width;
     const fullH = canvas.clientHeight || canvas.height;
@@ -2952,7 +3080,7 @@ export class SparkRenderer extends THREE.Mesh {
     alphaThreshold: number;
     solid: boolean;
   }) {
-    const renderer = this.renderer;
+    const renderer = this.requireWebGLRenderer();
 
     // Lazily create the two pick materials. Both share the exact same
     // uniforms *objects* as the main material (spread of `this.uniforms`,
@@ -2972,7 +3100,10 @@ export class SparkRenderer extends THREE.Mesh {
         allowOverride: false,
         // Per-fragment max-density depth along the pixel ray instead of the
         // flat splat-center depth (see splatVertex.glsl/splatPickFragment.glsl).
-        defines: { ...this.material.defines, SPARK_PICK_DEPTH: "" },
+        defines: {
+          ...(this.material as THREE.ShaderMaterial).defines,
+          SPARK_PICK_DEPTH: "",
+        },
       };
       // Weighted-average pass: standard premultiplied "over" blending, the
       // same (ONE, ONE_MINUS_SRC_ALPHA) THREE uses for NormalBlending with
@@ -3085,7 +3216,7 @@ export class SparkRenderer extends THREE.Mesh {
     const prevClearColor = new THREE.Color();
     renderer.getClearColor(prevClearColor);
     const prevClearAlpha = renderer.getClearAlpha();
-    const prevMaterial = this.material;
+    const prevMaterial = this.material as THREE.ShaderMaterial;
     // `material` is declared readonly in the public API; this is an
     // internal, same-tick swap for the pick render only.
     const materialHolder = this as unknown as {

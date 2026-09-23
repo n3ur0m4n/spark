@@ -23,6 +23,7 @@ import {
   type CovSplatModifier,
   CovSplatTransformer,
   type FrameUpdateContext,
+  type GsplatGenerator,
   type GsplatModifier,
   SplatGenerator,
   SplatTransformer,
@@ -319,6 +320,16 @@ export class SplatMesh extends SplatGenerator {
 
   showLodPage?: number;
   showLodPageDyno = new DynoInt({ value: 0 });
+
+  private sourceFrameUpdate = this.frameUpdate;
+  private sourceGenerator?: GsplatGenerator;
+
+  hasNativeSourceGenerator(): boolean {
+    return (
+      this.frameUpdate === this.sourceFrameUpdate &&
+      this.generator === this.sourceGenerator
+    );
+  }
 
   constructor(options: SplatMeshOptions = {}) {
     super({
@@ -753,6 +764,7 @@ export class SplatMesh extends SplatGenerator {
       },
     );
     this.generator = generator;
+    this.sourceGenerator = generator;
     this.covGenerator = undefined;
   }
 
@@ -852,7 +864,6 @@ export class SplatMesh extends SplatGenerator {
   // call it. It updates parameters for the generated pipeline and calls
   // updateGenerator() if the pipeline needs to change.
   update({
-    renderer,
     time,
     deltaTime,
     viewToWorld,
@@ -860,7 +871,7 @@ export class SplatMesh extends SplatGenerator {
     renderSize,
     globalEdits,
     lodIndices,
-  }: FrameUpdateContext) {
+  }: FrameUpdateContext | Omit<FrameUpdateContext, "renderer">) {
     this.context.time.value = time;
     this.context.deltaTime.value = deltaTime;
     SplatMesh.dynoTime.value = time;

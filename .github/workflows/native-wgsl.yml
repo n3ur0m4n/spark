@@ -1,0 +1,30 @@
+name: Native WGSL validation
+
+on:
+  pull_request:
+    paths:
+      - 'src/shaders/*.wgsl'
+      - 'scripts/validate-wgsl.mjs'
+      - '.github/workflows/native-wgsl.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'src/shaders/*.wgsl'
+      - 'scripts/validate-wgsl.mjs'
+      - '.github/workflows/native-wgsl.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+      - name: Install pinned WGSL validator
+        run: cargo install naga-cli --version 28.0.0 --locked
+      - name: Validate every native shader
+        run: node scripts/validate-wgsl.mjs
