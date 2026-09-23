@@ -1,0 +1,39 @@
+<!doctype html><html><head><meta charset="utf-8"><link rel="icon" href="data:,"><title>Ordering ownership validation</title></head><body>
+<script type="module">
+import * as THREE from 'three';
+import {SparkRenderer,SplatMesh} from '/src/index.ts';
+const errors=[];
+window.addEventListener('error',e=>errors.push(e.message));
+window.addEventListener('unhandledrejection',e=>errors.push(String(e.reason)));
+try {
+ const renderer=new THREE.WebGLRenderer({antialias:false,preserveDrawingBuffer:true});renderer.setSize(320,240);document.body.append(renderer.domElement);
+ const scene=new THREE.Scene();scene.background=new THREE.Color(0x102030);
+ const camera=new THREE.PerspectiveCamera(60,4/3,.1,100);camera.position.set(0,0,4);camera.lookAt(0,0,0);
+ const spark=new SparkRenderer({renderer,enableLod:false,minSortIntervalMs:0});scene.add(spark);
+ const splats=new SplatMesh({constructSplats:data=>{
+  for(let i=0;i<1024;i++) {const a=i*2.399963229728653;const z=1-2*(i+.5)/1024;const r=Math.sqrt(1-z*z);data.pushSplat(new THREE.Vector3(r*Math.cos(a),r*Math.sin(a),z),new THREE.Vector3(.05,.05,.05),new THREE.Quaternion(),.5,new THREE.Color((i%3)/2,(i%5)/4,(i%7)/6));}
+ }});scene.add(splats);await splats.initialized;
+ let allocations=0,reuses=0;
+ if(spark.orderingBuffers){const pool=spark.orderingBuffers;const take=pool.take.bind(pool);pool.take=n=>{if(pool.spare?.length>=n)reuses++;else allocations++;return take(n);};}
+ const frame=async()=>{await new Promise(requestAnimationFrame);renderer.render(scene,camera);};
+ const draw=async(n=30)=>{for(let i=0;i<n;i++)await frame();};
+ await draw();
+ for(let i=0;i<20;i++){camera.position.x=Math.sin(i*.4);camera.lookAt(0,0,0);await draw(4);}
+ camera.position.set(.73,0,4);camera.lookAt(0,0,0);await draw();
+ const readOrdering=()=>{
+  const gl=renderer.getContext(),texture=spark.orderingTexture;
+  renderer.initTexture(texture);
+  const handle=renderer.properties.get(texture).__webglTexture;
+  const saved=gl.getParameter(gl.FRAMEBUFFER_BINDING),fb=gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER,fb);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,handle,0);
+  const pixels=new Uint32Array(16384);gl.readPixels(0,0,4096,1,gl.RGBA_INTEGER,gl.UNSIGNED_INT,pixels);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,saved);gl.deleteFramebuffer(fb);
+  const count=Math.min(spark.activeSplats,16384);
+  return {gpu:[...pixels.subarray(0,count)],cpu:[...texture.image.data.subarray(0,count)]};
+ };
+ const waitEvent=name=>new Promise(resolve=>renderer.domElement.addEventListener(name,resolve,{once:true}));
+ const restore=async()=>{const lost=waitEvent('webglcontextlost');renderer.forceContextLoss();await lost;await new Promise(resolve=>setTimeout(resolve,100));const restored=waitEvent('webglcontextrestored');renderer.forceContextRestore();await restored;await draw(40);};
+ window.validation={renderer,spark,scene,camera,splats,draw,restore,readOrdering,errors,stats:()=>({allocations,reuses,active:spark.activeSplats,cpuOrderingAttached:spark.orderingTexture?.image.data.byteLength>0})};
+ window.__sparkValidation={ready:true,...window.validation.stats(),errors};
+} catch(e){window.__sparkValidation={ready:false,error:String(e),errors};}
+</script></body></html>
