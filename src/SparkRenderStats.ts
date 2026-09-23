@@ -2,7 +2,7 @@
 export type SparkRenderStats = Readonly<{
   generation: number;
   selectedSplats: number;
-  /** Submitted instances after invalid depths are excluded. */
-  drawnSplats: number;
-  ordering: "readback";
+  /** Submitted instances after invalid depths are excluded; null until measured. */
+  drawnSplats: number | null;
+  ordering: "readback" | "radix";
 }>;

@@ -151,6 +151,20 @@ Hidden native submissions report zero drawn splats, and hiding during an awaited
 update prevents that generation from drawing. Camera reversal is checked before
 cloning because Three r180 does not copy that flag.
 
+GPU radix pipeline setup uses a validation error scope before encoding any sort
+commands. GPU validation errors return invalid pipeline objects rather than
+throwing into JavaScript catch blocks. Initialization awaits that scope, releases
+partial resources on failure and uses the generated-depth reference sorter.
+The fallback fixture forces real validation errors in each optional pipeline,
+a synchronous setup failure, repeated fallback frames, and disposal while setup
+is awaiting validation. It verifies balanced scopes, resource release, exact
+counts and continued use of the host device.
+
+
+The dependent radix example exposes `?backend=webgpu&sort=radix`; the default
+remains the native reference path. Its status reflects the sorter actually used,
+including reference fallback, rather than only the requested option.
+
 Array cameras are rejected before cloning or generation because their per-view
 rendering is not implemented by the native route. The host-mode fixture checks
 explicit update and render rejection, ordinary-camera recovery, and the classic

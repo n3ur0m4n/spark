@@ -16,7 +16,16 @@ const directory = mkdtempSync(join(tmpdir(), "spark-wgsl-"));
 const shader = (name) =>
   readFileSync(new URL(`../src/shaders/${name}.wgsl`, import.meta.url), "utf8");
 try {
-  for (const name of ["generateSplats", "splatVertex", "splatFragment"]) {
+  for (const name of [
+    "generateSplats",
+    "splatVertex",
+    "splatFragment",
+    "nativeSort",
+    "packOrdering",
+    "radixSort4bit",
+    "radixSortReorder",
+    "prefixSum",
+  ]) {
     const text =
       (["generateSplats", "splatVertex", "splatFragment"].includes(name)
         ? `${shader("splatDefines")}\n`

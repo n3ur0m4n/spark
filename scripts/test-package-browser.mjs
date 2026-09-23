@@ -128,6 +128,7 @@ try {
         "native-multiple-hosts",
         "native-encoding",
         "native-sh-generation",
+        "native-radix-fallback",
         "native-composite",
       ]) {
         const fixture = await readFile(
@@ -152,6 +153,7 @@ try {
         "native-multiple-hosts",
         "native-encoding",
         "native-sh-generation",
+        "native-radix-fallback",
       ]) {
         const page = await browser.newPage();
         const errors = [];

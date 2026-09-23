@@ -57,7 +57,17 @@ export class SparkNativeRenderer {
 
   async readRenderStatsAsync(): Promise<SparkRenderStats> {
     if (this.disposed) throw new Error("SparkRenderer is disposed");
-    return this.getRenderStats();
+    const snapshot = this.getRenderStats();
+    if (snapshot.drawnSplats !== null) return snapshot;
+    // The copy is submitted synchronously, before another generation can reuse
+    // this slot. A late result describes its original generation only.
+    const drawnSplats = await this.backend.readNativeDrawCount();
+    const measured = { ...snapshot, drawnSplats };
+    if (!this.disposed && this.stats.generation === snapshot.generation) {
+      this.stats = measured;
+      this.owner.activeSplats = drawnSplats;
+    }
+    return measured;
   }
 
   private identity(value?: object): number {
@@ -344,6 +354,7 @@ export class SparkNativeRenderer {
     camera.updateWorldMatrix(true, false);
     const owner = this.owner;
     const sortRadial = owner.sortRadial;
+    const sortMode = owner.webgpuSort;
     const next = new SplatAccumulator({
       extSplats: owner.accumExtSplats,
       covSplats: false,
@@ -474,6 +485,7 @@ export class SparkNativeRenderer {
       next.numSplats = Math.max(next.numSplats, base + count);
     }
     const signature = JSON.stringify([
+      sortMode,
       sortRadial,
       owner.accumExtSplats,
       next.viewToWorld.toArray(),
@@ -509,6 +521,8 @@ export class SparkNativeRenderer {
     this.backend.beginRenderSlotUpdate("native-generation");
     const generation = this.backend.getWorkingSlotGeneration();
     try {
+      let activeSplats: number;
+      let indirect = false;
       this.backend.generateNative({
         meshes,
         numSplats: next.numSplats,
@@ -518,26 +532,44 @@ export class SparkNativeRenderer {
         sortRadial,
       });
       const rows = Math.max(1, Math.ceil(next.numSplats / 16384));
-      const readback = await this.backend.readNativeDepths(next.numSplats);
-      if (this.disposed || sequence !== this.sequence)
-        throw new Error(
-          "SparkRenderer is disposed or native generation was superseded",
-        );
-      if (this.ordering.length < rows * 16384)
-        this.ordering = new Uint32Array(rows * 16384);
-      this.worker ??= new SplatWorker();
-      const result = await this.worker.call("sortSplats32", {
-        numSplats: next.numSplats,
-        readback,
-        ordering: this.ordering,
-      });
-      this.ordering = result.ordering;
-      if (this.disposed || sequence !== this.sequence)
-        throw new Error(
-          "SparkRenderer is disposed or native generation was superseded",
-        );
-      const activeSplats = result.activeSplats;
-      this.backend.uploadOrdering(result.ordering, 4096, rows, "working");
+      if (
+        sortMode === "radix" &&
+        next.numSplats > 0 &&
+        (await this.backend.gpuDepthSortAndPack({
+          numSplats: next.numSplats,
+          viewOrigin: next.viewOrigin,
+          viewDir: next.viewDirection,
+          sortRadial,
+          enableExtSplats: next.extSplats,
+          orderingRows: rows,
+          orderingTarget: "working",
+        }))
+      ) {
+        indirect = true;
+        activeSplats = meshes.reduce((sum, mesh) => sum + mesh.count, 0);
+      } else {
+        const readback = await this.backend.readNativeDepths(next.numSplats);
+        if (this.disposed || sequence !== this.sequence)
+          throw new Error(
+            "SparkRenderer is disposed or native generation was superseded",
+          );
+        if (this.ordering.length < rows * 16384)
+          this.ordering = new Uint32Array(rows * 16384);
+        this.worker ??= new SplatWorker();
+        const result = await this.worker.call("sortSplats32", {
+          numSplats: next.numSplats,
+          readback,
+          ordering: this.ordering,
+        });
+        this.ordering = result.ordering;
+        if (this.disposed || sequence !== this.sequence)
+          throw new Error(
+            "SparkRenderer is disposed or native generation was superseded",
+          );
+        activeSplats = result.activeSplats;
+        this.backend.uploadOrdering(result.ordering, 4096, rows, "working");
+        this.backend.useIndirectDraw = false;
+      }
       if (
         this.disposed ||
         sequence !== this.sequence ||
@@ -549,8 +581,8 @@ export class SparkNativeRenderer {
       this.stats = {
         generation: sequence,
         selectedSplats: meshes.reduce((sum, mesh) => sum + mesh.count, 0),
-        drawnSplats: activeSplats,
-        ordering: "readback",
+        drawnSplats: indirect ? null : activeSplats,
+        ordering: indirect ? "radix" : "readback",
       };
       const old = owner.display;
       owner.current = next;

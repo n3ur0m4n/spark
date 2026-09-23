@@ -1,0 +1,62 @@
+<!doctype html><html><head><link rel="icon" href="data:,"><title>GPU radix validation fallback</title></head><body><script type="module">
+import * as THREE from 'three';
+import {WebGPURenderer} from 'three/webgpu';
+import {SparkRenderer,SplatMesh} from '/src/index.ts';
+const checks=[],errors=[];
+const check=(name,ok,data={})=>{checks.push({name,ok,...data});if(!ok)throw Error(name);};
+window.addEventListener('error',e=>errors.push(e.message));window.addEventListener('unhandledrejection',e=>errors.push(String(e.reason)));
+const renderer=new WebGPURenderer({antialias:false});await renderer.init();renderer.setSize(100,100);document.body.append(renderer.domElement);
+const device=renderer.backend.device;device.addEventListener('uncapturederror',e=>errors.push(e.error.message));
+const create=device.createComputePipeline.bind(device),createBuffer=device.createBuffer.bind(device),push=device.pushErrorScope.bind(device),pop=device.popErrorScope.bind(device);
+let target=null,injected=0,scopeDepth=0,uniformBytes=0,delayPop=false,setupSeen=false,release=null;
+device.pushErrorScope=filter=>{scopeDepth++;return push(filter);};
+device.popErrorScope=()=>{scopeDepth--;const pending=pop();if(delayPop&&setupSeen){delayPop=false;return new Promise((resolve,reject)=>{release=()=>pending.then(resolve,reject);});}return pending;};
+device.createComputePipeline=descriptor=>{
+ if(descriptor.label==='spark-prefix-scan')setupSeen=true;
+ if(!injected&&(descriptor.label===target||target==='synchronous-error'&&descriptor.label==='spark-prefix-scan')){
+  injected++;
+  if(target==='synchronous-error')throw Error('Injected synchronous pipeline setup failure');
+  // A real GPU validation error returns an invalid pipeline; it does not throw.
+  return create({...descriptor,compute:{...descriptor.compute,entryPoint:'deliberately_missing_entry'}});
+ }
+ return create(descriptor);
+};
+device.createBuffer=descriptor=>{
+ const buffer=createBuffer(descriptor);
+ if(['spark-radix-uniform','spark-pack-ordering-uniform','spark-native-sort-uniform'].includes(descriptor.label)){
+  uniformBytes+=buffer.size;let live=true;const destroy=buffer.destroy.bind(buffer);
+  buffer.destroy=()=>{if(live){uniformBytes-=buffer.size;live=false;}destroy();};
+ }
+ return buffer;
+};
+const camera=new THREE.PerspectiveCamera(60,1,.1,100);camera.position.z=4;
+let spark,mesh;
+async function setup(){
+ const scene=new THREE.Scene();spark=new SparkRenderer({renderer,enableLod:false,webgpuSort:'radix'});scene.add(spark);
+ mesh=new SplatMesh({constructSplats:data=>{for(let i=0;i<3;i++)data.pushSplat(new THREE.Vector3(i*.1,0,0),new THREE.Vector3(.1,.1,.1),new THREE.Quaternion(),1,new THREE.Color(1,0,0));}});
+ await mesh.initialized;scene.add(mesh);return scene;
+}
+function cleanup(){spark?.dispose();mesh?.dispose();spark=null;mesh=null;}
+try{
+ for(const label of ['spark-prefix-scan','spark-prefix-add','spark-radix-hist-0','spark-radix-reorder-0','spark-pack-ordering-pipeline','spark-native-keys-pipeline','spark-native-count-pipeline','synchronous-error']){
+  target=label;injected=0;const scene=await setup();
+  await spark.renderAsync(scene,camera);await device.queue.onSubmittedWorkDone();const stats=await spark.readRenderStatsAsync();
+  check(`${label}: actual generated-depth reference fallback`,injected===1&&stats.ordering==='readback'&&stats.drawnSplats===3&&stats.selectedSplats===3,{stats});
+  camera.position.x+=.01;await spark.renderAsync(scene,camera);await device.queue.onSubmittedWorkDone();const repeated=await spark.readRenderStatsAsync();
+  check(`${label}: fallback remains available on following frames`,repeated.ordering==='readback'&&repeated.drawnSplats===3&&injected===1,{repeated});
+  check(`${label}: partial resources released and scope balanced`,uniformBytes===0&&scopeDepth===0&&errors.length===0,{uniformBytes,scopeDepth,errors:[...errors]});
+  cleanup();
+ }
+ target=null;injected=0;setupSeen=false;delayPop=true;const scene=await setup();
+ const pending=spark.renderAsync(scene,camera).then(()=>null,error=>String(error));
+ const deadline=performance.now()+5000;while(!release){if(performance.now()>deadline)throw Error('GPU setup did not reach the held scope');await new Promise(requestAnimationFrame);}
+ spark.dispose();release();const rejection=await pending;
+ check('dispose during pipeline validation rejects late submission',rejection?.includes('disposed'),{rejection});
+ check('dispose during pipeline validation releases partial resources',uniformBytes===0&&scopeDepth===0,{uniformBytes,scopeDepth});
+ cleanup();
+ const host=new THREE.Scene();host.background=new THREE.Color(0xff0000);renderer.render(host,camera);await device.queue.onSubmittedWorkDone();
+ check('host device remains usable without uncaptured errors',errors.length===0,{errors});
+ window.lifecycleResult={passed:true,checks,errors};
+}catch(error){window.lifecycleResult={passed:false,checks,errors,error:String(error)};}
+finally{cleanup();device.createComputePipeline=create;device.createBuffer=createBuffer;device.pushErrorScope=push;device.popErrorScope=pop;renderer.dispose();}
+</script></body></html>

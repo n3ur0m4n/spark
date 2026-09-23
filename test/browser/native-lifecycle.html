@@ -29,7 +29,7 @@ try{
  b.readNativeDepths=async count=>{entered();await gate;return read(count);};camera.position.z=8;
  const render=spark.renderAsync(scene,camera);const outcome=render.then(()=>null,e=>String(e));await reached;spark.dispose();release();const rejection=await outcome;
  check('dispose during readback rejects',/disposed|destroyed|unavailable/.test(rejection),{rejection});scene.remove(spark);scene.remove(mesh);mesh.dispose();spark=null;
- for(let i=0;i<3;i++){const s=new SparkRenderer({renderer,enableLod:false});scene.add(s);await s.renderAsync(scene,camera);s.dispose();s.dispose();scene.remove(s);}
+ for(let i=0;i<3;i++){const s=new SparkRenderer({renderer,enableLod:false,webgpuSort:i%2?'radix':'readback'});scene.add(s);await s.renderAsync(scene,camera);s.dispose();s.dispose();scene.remove(s);}
  renderer.render(new THREE.Scene(),camera);await renderer.backend.device.queue.onSubmittedWorkDone();check('repeated instances preserve the host device',errors.length===0,{errors});
  window.lifecycleResult={passed:true,checks,errors};
 }catch(e){window.lifecycleResult={passed:false,checks,errors,error:String(e)};}finally{spark?.dispose();renderer.dispose();}

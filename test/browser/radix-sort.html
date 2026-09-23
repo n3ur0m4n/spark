@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Spark • GPU radix self-test</title>
+  <style>
+    body { margin: 24px; background: #111; color: #eee; font: 14px/1.5 ui-monospace, monospace; }
+    #status { white-space: pre-wrap; }
+    .pass { color: #7d7; }
+    .fail { color: #f66; }
+  </style>
+</head>
+<body>
+  <h1>GPU radix self-test</h1>
+  <p>Compares <code>WebGPURadixSort</code> on a real GPUDevice to <code>cpuRadixSort4bit</code>. Pure Node cannot create GPUDevice.</p>
+  <p><strong>Dev-server only.</strong> The sorter is deliberately not part of the
+  package's public API, so this probe imports it straight from <code>/src/</code>,
+  which the Vite dev server transpiles on the fly. Run it via
+  <code>npm run dev</code>; it will not work from a static site build.</p>
+  <pre id="status">Requesting adapter…</pre>
+  <script type="module">
+    import {
+      WebGPURadixSort,
+      cpuRadixSort4bit,
+      cpuRadixSort4bitDescending,
+    } from "/src/WebGPURadixSort.ts";
+
+    const status = document.getElementById("status");
+    const lines = [];
+    function log(msg, cls) {
+      lines.push(msg);
+      status.textContent = lines.join("\n");
+      if (cls) status.className = cls;
+    }
+
+    function arraysEqual(a, b) {
+      if (a.length !== b.length) return false;
+      for (let i = 0; i < a.length; i++) {
+        if (a[i] !== b[i]) return false;
+      }
+      return true;
+    }
+
+    async function readSortedIndices(device, sorter, keysU32) {
+      const n = keysU32.length;
+      const keysBuffer = device.createBuffer({
+        label: "selftest-keys",
+        size: Math.max(256, n * 4),
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+      });
+      if (n > 0) device.queue.writeBuffer(keysBuffer, 0, keysU32);
+      const encoder = device.createCommandEncoder({ label: "selftest-sort" });
+      const sorted = sorter.encodeSort(encoder, keysBuffer, n, 32, true, true);
+      if (n === 0) {
+        if (sorted !== null) throw new Error("Empty sort must return null");
+        encoder.finish(); keysBuffer.destroy(); return new Uint32Array(0);
+      }
+      if (!sorted) {
+        encoder.finish(); keysBuffer.destroy();
+        throw new Error("encodeSort returned null");
+      }
+      const readback = device.createBuffer({
+        label: "selftest-readback",
+        size: n * 4,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      });
+      encoder.copyBufferToBuffer(sorted, 0, readback, 0, n * 4);
+      device.queue.submit([encoder.finish()]);
+      await readback.mapAsync(GPUMapMode.READ);
+      const out = new Uint32Array(readback.getMappedRange().slice(0));
+      readback.unmap();
+      keysBuffer.destroy();
+      readback.destroy();
+      return out;
+    }
+
+    try {
+      const adapter = navigator.gpu ? await navigator.gpu.requestAdapter() : null;
+      if (!adapter) {
+        log("FAIL: no WebGPU adapter", "fail");
+        window.__sparkRadixSelftest = { pass: false, reason: "no-adapter" };
+        throw new Error("no adapter");
+      }
+      const info = adapter.info ?? {};
+      log(`adapter: ${info.vendor || "?"} / ${info.architecture || "?"} / ${info.description || info.device || "?"}`);
+      const device = await adapter.requestDevice();
+      const sorter = new WebGPURadixSort(device);
+      if (!sorter.isAvailable() || !sorter.warmup(32, true)) {
+        log("FAIL: GPU radix pipelines unavailable", "fail");
+        window.__sparkRadixSelftest = { pass: false, reason: "compile" };
+        throw new Error("compile failed");
+      }
+
+      const errors = [];
+      device.addEventListener("uncapturederror", event => errors.push(event.error.message));
+      const cases = [];
+      for (const n of [0, 1, 2047, 2048, 2049, 4096, 65537, 1500000, 2500000, 2049]) {
+        for (const pattern of ["random", "ties"]) {
+          const keys = new Uint32Array(n);
+          for (let i = 0; i < n; i++) keys[i] = pattern === "ties" ? i % 7 : Math.imul(i + 1, 1664525) >>> 0;
+          if (n > 3) { keys[0] = 0; keys[1] = 0xffffffff; keys[2] = 0x7f800000; keys[3] = 0x3f800000; }
+          const cpuAsc = cpuRadixSort4bit(keys);
+          const gpuAsc = await readSortedIndices(device, sorter, keys);
+          const inverted = Uint32Array.from(keys, key => ~key);
+          const cpuDesc = cpuRadixSort4bitDescending(keys);
+          const gpuDesc = await readSortedIndices(device, sorter, inverted);
+          const pass = arraysEqual(cpuAsc, gpuAsc) && arraysEqual(cpuDesc, gpuDesc);
+          cases.push({n, pattern, pass});
+          log(`${pattern} N=${n}: ${pass ? "PASS" : "FAIL"}`);
+          if (!pass) {
+            const differences = [];
+            for (let i=0;i<n && differences.length<12;i++) {
+              if (cpuAsc[i]!==gpuAsc[i] || cpuDesc[i]!==gpuDesc[i]) differences.push({i,ca:cpuAsc[i],ga:gpuAsc[i],cd:cpuDesc[i],gd:gpuDesc[i]});
+            }
+            throw new Error(`Mismatch at ${pattern} N=${n}: ${JSON.stringify(differences)}`);
+          }
+        }
+      }
+      await device.queue.onSubmittedWorkDone();
+      const pass = cases.every(test => test.pass) && errors.length === 0;
+      window.__sparkRadixSelftest = {pass, cases, errors,
+        adapter: {vendor:info.vendor, architecture:info.architecture, device:info.device, description:info.description}};
+      log(pass ? "ALL PASS" : "FAILED", pass ? "pass" : "fail");
+      sorter.destroy();
+    } catch (error) {
+      log(`FAIL: ${error?.message || error}`, "fail");
+      window.__sparkRadixSelftest = {
+        pass: false,
+        reason: String(error?.message || error),
+      };
+    }
+  </script>
+</body>
+</html>

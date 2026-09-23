@@ -56,6 +56,8 @@ export interface SparkRendererOptions<
    * rendering and significantly reduces performance.
    */
   renderer: R;
+  /** Native sort implementation. The reference uses GPU-generated depths and WASM sorting. */
+  webgpuSort?: "readback" | "radix";
   /**
    * Callback function to be called when SparkRenderer needs to re-render,
    * for example when splat sort order or LoD updates complete. May fire
@@ -430,6 +432,7 @@ export class SparkRenderer<
     : THREE.Material;
   private readonly adapter: RendererAdapter;
   private readonly native: SparkNativeRenderer | null;
+  webgpuSort: "readback" | "radix";
 
   get isWebGPU() {
     return this.adapter.kind === "webgpu";
@@ -441,7 +444,7 @@ export class SparkRenderer<
     return getSparkRendererCapabilities(this.renderer);
   }
 
-  /** Counts for the committed generation, excluding inactive depth entries. */
+  /** Committed counts. GPU radix counts remain unavailable until explicitly read. */
   getRenderStats(): SparkRenderStats {
     return (
       this.native?.getRenderStats() ?? {
@@ -530,7 +533,10 @@ export class SparkRenderer<
   private readonly orderingBuffers = new OrderingBufferPool();
   orderingTexture: THREE.DataTexture | null = null;
   maxSplats = 0;
-  /** Sorted instance count for the committed generation. */
+  /**
+   * WebGL/reference draw count. With native radix this is an upper bound until
+   * readRenderStatsAsync() completes; use getRenderStats() for explicit validity.
+   */
   activeSplats = 0;
 
   display: SplatAccumulator;
@@ -714,6 +720,7 @@ export class SparkRenderer<
 
     super(geometry, material);
     this.adapter = adapter;
+    this.webgpuSort = options.webgpuSort ?? "readback";
     if (adapter.kind === "webgpu") {
       geometry.dispose();
       material.dispose();

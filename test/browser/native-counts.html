@@ -14,8 +14,8 @@ const push=(source,i)=>source.pushSplat(new THREE.Vector3((i%8-4)*.05,0,0),new T
 const expected=n=>n-Math.ceil(n/7);
 const owned=new Set();let spark,mesh;
 try {
- for(const mode of ['readback']){
-  const scene=new THREE.Scene();spark=new SparkRenderer({renderer,enableLod:false});scene.add(spark);
+ for(const mode of ['readback','radix']){
+  const scene=new THREE.Scene();spark=new SparkRenderer({renderer,enableLod:false,webgpuSort:mode});scene.add(spark);
   const source=new PackedSplats({construct:data=>push(data,0)});await source.initialized;owned.add(source);
   mesh=new SplatMesh({packedSplats:source});await mesh.initialized;scene.add(mesh);
   for(const count of [1,2047,2048,2049,17,0,2050]){
@@ -24,7 +24,7 @@ try {
    await spark.renderAsync(scene,camera);
    if(count===0)check(`${mode}: empty generation releases source GPU allocations`,sourceBytes===0,{sourceBytes});
    const before=spark.getRenderStats();
-   check(`${mode}: ${count} count availability`,before.drawnSplats===(expected(count)),{before});
+   check(`${mode}: ${count} count availability`,before.drawnSplats===(mode==='radix'&&count?null:expected(count)),{before});
    const stats=await spark.readRenderStatsAsync();
    check(`${mode}: ${count} actual GPU draw count`,stats.selectedSplats===count&&stats.drawnSplats===expected(count),{stats});
    check(`${mode}: ${count} measured count cached`,spark.getRenderStats().drawnSplats===stats.drawnSplats);
@@ -33,11 +33,30 @@ try {
   mesh.splats=replacement;
   await spark.renderAsync(scene,camera);const stats=await spark.readRenderStatsAsync();
   check(`${mode}: replacing source object changes generated population`,stats.selectedSplats===3&&stats.drawnSplats===2,{stats});
-  const backend=spark.webgpuBackend;backend.gpuTimingEnabled=true;camera.position.x=.05;await spark.renderAsync(scene,camera);
+  const backend=spark.webgpuBackend;backend.gpuTimingEnabled=true;camera.position.x+=.05;await spark.renderAsync(scene,camera);
   if(backend.gpuTimingAvailable){const deadline=performance.now()+5000;while(!backend.gpuTimingSequence){if(performance.now()>deadline)throw Error('GPU timestamp timeout');await new Promise(r=>setTimeout(r,1));}
    check('render timing retains completed generation identity',Number.isFinite(backend.lastGpuPassMs.render)&&backend.gpuTimingGeneration===backend.getActiveSlotGeneration(),{passes:backend.lastGpuPassMs,generation:backend.gpuTimingGeneration});
   }else check('GPU timing explicitly unavailable without host feature',true);
   backend.gpuTimingEnabled=false;
+  if(mode==='radix'){
+   const backend=spark.webgpuBackend,read=backend.readNativeDrawCount.bind(backend);
+   if(backend.device.features.has('timestamp-query'))check('radix timing covers GPU sort',Number.isFinite(backend.lastGpuPassMs.radix),{passes:backend.lastGpuPassMs});
+
+   let release,entered;const gate=new Promise(r=>release=r),reached=new Promise(r=>entered=r);
+   backend.readNativeDrawCount=async()=>{const count=await read();entered();await gate;return count;};
+   camera.position.x=.1;await spark.renderAsync(scene,camera);const generation=spark.getRenderStats().generation;
+   const pending=spark.readRenderStatsAsync();await reached;
+   replacement.numSplats=1;replacement.needsUpdate=true;await spark.renderAsync(scene,camera);
+   camera.position.x=.2;await spark.renderAsync(scene,camera);
+   release();const previous=await pending;
+   check('late count retains its original generation',previous.generation===generation&&previous.drawnSplats===2,{previous});
+   check('late count does not overwrite reused slot statistics',spark.getRenderStats().generation>generation&&spark.getRenderStats().drawnSplats===null,{current:spark.getRenderStats()});
+   backend.readNativeDrawCount=read;
+   const current=await spark.readRenderStatsAsync();check('new count comes from current indirect buffer',current.drawnSplats===0,{current});
+   camera.position.x=.3;await spark.renderAsync(scene,camera);
+   const abandoned=spark.readRenderStatsAsync().then(()=>null,error=>String(error));spark.dispose();
+   const rejected=await abandoned;check('disposal rejects outstanding count readback',!!rejected,{rejected});
+  }
   spark.dispose();scene.remove(spark);spark=null;scene.remove(mesh);mesh.dispose();mesh=null;
  }
  await renderer.backend.device.queue.onSubmittedWorkDone();check('no uncaptured GPU or page errors',errors.length===0,{errors});

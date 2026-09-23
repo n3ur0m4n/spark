@@ -3,12 +3,15 @@ import {
   type NativeMeshGeneration,
   WebGPUGeneration,
 } from "./WebGPUGeneration";
+import { WebGPURadixSort } from "./WebGPURadixSort";
 import { calcDispatchSize } from "./WebGPUUtils";
 import {
+  packOrderingWgsl,
   splatDefinesWgsl,
   splatFragmentWgsl,
   splatVertexWgsl,
 } from "./shaders-wgsl";
+import nativeSortWgsl from "./shaders/nativeSort.wgsl?raw";
 import { getTextureSize } from "./utils";
 
 type TextureExtent = { width: number; height: number; depth: number };
@@ -16,8 +19,10 @@ type TextureExtent = { width: number; height: number; depth: number };
 type WebGPURenderSlot = {
   generation: number;
   orderingGeneration: number;
+  indirect: boolean;
   generatedSpan: number | null;
   nativeDepths: GPUBuffer | null;
+  nativeDrawArgs: GPUBuffer | null;
   splatTexture: GPUTexture | null;
   splatTextureView: GPUTextureView | null;
   splatTexSize: TextureExtent | null;
@@ -37,8 +42,10 @@ function makeRenderSlot(): WebGPURenderSlot {
   return {
     generation: 0,
     orderingGeneration: 0,
+    indirect: false,
     generatedSpan: null,
     nativeDepths: null,
+    nativeDrawArgs: null,
     splatTexture: null,
     splatTextureView: null,
     splatTexSize: null,
@@ -94,6 +101,7 @@ export class WebGPUSplatBackend {
   orderingTexture: GPUTexture | null = null;
   orderingRows = 0;
   private syncDepthReadbackBuffer: GPUBuffer | null = null;
+  private readonly countReadbacks = new Set<GPUBuffer>();
 
   halvedAlpha = false;
   /**
@@ -142,11 +150,29 @@ export class WebGPUSplatBackend {
   depthWidth = 0;
   depthHeight = 0; // current write target (cycles 0 -> 1 -> 2 -> 0)
 
+  private gpuSorter: WebGPURadixSort | null = null;
+  /** Latches pipeline failures; capacity checks still apply to each generation. */
+  private gpuSortUnavailable = false;
+  private gpuSortValidated = false;
+  private gpuSortPreparation: Promise<boolean> | null = null;
+  private packOrderingPipeline: GPUComputePipeline | null = null;
+  private packOrderingLayout: GPUBindGroupLayout | null = null;
+  private packOrderingUniform: GPUBuffer | null = null;
+  /** The draw mode belongs to the same committed slot as its ordering/count. */
+  get useIndirectDraw() {
+    return this.activeRenderSlot().indirect;
+  }
+  set useIndirectDraw(value: boolean) {
+    this.writeRenderSlot().indirect = value;
+  }
   private generatedOutputBuffer: GPUBuffer | null = null;
   private generatedOutputBuffer2: GPUBuffer | null = null;
 
   private nativeGeneration: WebGPUGeneration | null = null;
   private nativeFillPipeline: GPUComputePipeline | null = null;
+  private nativeKeysPipeline: GPUComputePipeline | null = null;
+  private nativeCountPipeline: GPUComputePipeline | null = null;
+  private nativeSortUniform: GPUBuffer | null = null;
 
   // Reusable typed arrays for uniform writes
   private sparkUniformData = new ArrayBuffer(208);
@@ -270,6 +296,7 @@ export class WebGPUSplatBackend {
     const slot = this.renderSlots[this.workingSlotIndex];
     slot.generation = this.nextGeneration++;
     slot.orderingGeneration = 0;
+    slot.indirect = false;
     slot.generatedSpan = null;
     slot.bindGroupDirty = true;
     this.syncLegacyFields(slot);
@@ -1191,6 +1218,129 @@ export class WebGPUSplatBackend {
     }
   }
 
+  /** Explicit diagnostic readback; never inserted into the normal radix loop. */
+  async readNativeDrawCount(): Promise<number> {
+    if (this.disposed || this.deviceLost)
+      throw new Error(
+        "Spark: native backend is disposed or its device is lost",
+      );
+    const source = this.activeRenderSlot().nativeDrawArgs;
+    if (!source || !this.useIndirectDraw)
+      throw new Error("Spark: no committed indirect draw count");
+    const buffer = this.device.createBuffer({
+      label: "spark-native-count-readback",
+      size: 4,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+    this.countReadbacks.add(buffer);
+    try {
+      const encoder = this.device.createCommandEncoder();
+      encoder.copyBufferToBuffer(source, 4, buffer, 0, 4);
+      this.device.queue.submit([encoder.finish()]);
+      await buffer.mapAsync(GPUMapMode.READ);
+      if (this.disposed || this.deviceLost)
+        throw new Error(
+          "Spark: native backend is disposed or its device is lost",
+        );
+      return new Uint32Array(buffer.getMappedRange())[0];
+    } finally {
+      buffer.destroy();
+      this.countReadbacks.delete(buffer);
+    }
+  }
+
+  private ensureNativeSortPipelines(): void {
+    if (!this.nativeKeysPipeline) {
+      const module = this.device.createShaderModule({ code: nativeSortWgsl });
+      this.nativeKeysPipeline = this.device.createComputePipeline({
+        label: "spark-native-keys-pipeline",
+        layout: "auto",
+        compute: { module, entryPoint: "prepareKeys" },
+      });
+      this.nativeCountPipeline = this.device.createComputePipeline({
+        label: "spark-native-count-pipeline",
+        layout: "auto",
+        compute: { module, entryPoint: "countDraw" },
+      });
+      this.nativeSortUniform = this.device.createBuffer({
+        label: "spark-native-sort-uniform",
+        size: 16,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+    }
+  }
+
+  private prepareNativeKeys(
+    encoder: GPUCommandEncoder,
+    depths: GPUBuffer,
+    keys: GPUBuffer,
+    count: number,
+  ) {
+    this.ensureNativeSortPipelines();
+    const pipeline = this.nativeKeysPipeline;
+    const uniform = this.nativeSortUniform;
+    if (!pipeline || !uniform)
+      throw new Error("Spark: native sort pipeline is unavailable");
+    this.device.queue.writeBuffer(
+      uniform,
+      0,
+      new Uint32Array([count, 0, 0, 0]),
+    );
+    const pass = encoder.beginComputePass({ label: "spark-native-sort-keys" });
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(
+      0,
+      this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniform } },
+          { binding: 1, resource: { buffer: depths } },
+          { binding: 2, resource: { buffer: keys } },
+        ],
+      }),
+    );
+    pass.dispatchWorkgroups(
+      ...this.computeDispatchSize(Math.ceil(count / 256)),
+    );
+    pass.end();
+  }
+
+  private countNativeDraw(
+    encoder: GPUCommandEncoder,
+    slot: WebGPURenderSlot,
+    depths: GPUBuffer,
+    sorted: GPUBuffer,
+  ) {
+    const pipeline = this.nativeCountPipeline;
+    const uniform = this.nativeSortUniform;
+    if (!pipeline || !uniform)
+      throw new Error("Spark: native draw count pipeline is unavailable");
+    slot.nativeDrawArgs ??= this.device.createBuffer({
+      label: "spark-native-draw-count",
+      size: 32,
+      usage:
+        GPUBufferUsage.INDIRECT |
+        GPUBufferUsage.STORAGE |
+        GPUBufferUsage.COPY_SRC,
+    });
+    const pass = encoder.beginComputePass({ label: "spark-native-draw-count" });
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(
+      0,
+      this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: uniform } },
+          { binding: 1, resource: { buffer: depths } },
+          { binding: 3, resource: { buffer: sorted } },
+          { binding: 4, resource: { buffer: slot.nativeDrawArgs } },
+        ],
+      }),
+    );
+    pass.dispatchWorkgroups(1);
+    pass.end();
+  }
+
   /**
    * Execute a separate render pass that composites splats onto the
    * provided color texture, preserving existing content (loadOp: "load").
@@ -1274,7 +1424,11 @@ export class WebGPUSplatBackend {
     pass.setBindGroup(0, drawBindGroup);
     pass.setVertexBuffer(0, this.vertexBuffer);
     pass.setIndexBuffer(this.indexBuffer, "uint16");
-    pass.drawIndexed(6, numInstances);
+    if (slot.nativeDrawArgs && this.useIndirectDraw) {
+      pass.drawIndexedIndirect(slot.nativeDrawArgs, 0);
+    } else {
+      pass.drawIndexed(6, numInstances);
+    }
 
     pass.end();
     device.queue.submit([encoder.finish()]);
@@ -1381,18 +1535,243 @@ export class WebGPUSplatBackend {
     return { width, height, depth };
   }
 
+  ensureGpuSort(): Promise<boolean> {
+    if (this.disposed || this.gpuSortUnavailable) return Promise.resolve(false);
+    this.gpuSortPreparation ??= this.prepareGpuSort();
+    return this.gpuSortPreparation;
+  }
+
+  private async prepareGpuSort(): Promise<boolean> {
+    // createComputePipeline returns invalid objects for GPU validation errors;
+    // those errors do not throw into a synchronous JavaScript catch block.
+    // Pop the scope before awaiting so unrelated host work is not captured.
+    this.device.pushErrorScope("validation");
+    let failure: unknown = null;
+    try {
+      this.gpuSorter = new WebGPURadixSort(this.device);
+      if (!this.gpuSorter.isAvailable() || !this.gpuSorter.warmup(32, true)) {
+        throw new Error("GPU radix pipelines are unavailable");
+      }
+      this.ensurePackOrderingPipeline();
+      this.ensureNativeSortPipelines();
+    } catch (error) {
+      failure = error;
+    }
+    try {
+      const validation = await this.device.popErrorScope();
+      failure ??= validation;
+    } catch (error) {
+      failure ??= error;
+    }
+    if (this.disposed) return false;
+    if (failure) {
+      this.gpuSortUnavailable = true;
+      this.gpuSorter?.destroy();
+      this.gpuSorter = null;
+      this.packOrderingUniform?.destroy();
+      this.packOrderingUniform = null;
+      this.packOrderingPipeline = null;
+      this.packOrderingLayout = null;
+      this.nativeSortUniform?.destroy();
+      this.nativeSortUniform = null;
+      this.nativeKeysPipeline = null;
+      this.nativeCountPipeline = null;
+      console.warn("Spark: GPU sort unavailable; using readback.", failure);
+      return false;
+    }
+    this.gpuSortValidated = true;
+    return true;
+  }
+
+  private ensurePackOrderingPipeline(): void {
+    if (this.packOrderingPipeline) return;
+    const { device } = this;
+    this.packOrderingLayout = device.createBindGroupLayout({
+      label: "spark-pack-ordering-layout",
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: "read-only-storage" },
+        },
+        {
+          binding: 1,
+          visibility: GPUShaderStage.COMPUTE,
+          storageTexture: {
+            access: "write-only",
+            format: "rgba32uint",
+            viewDimension: "2d",
+          },
+        },
+        {
+          binding: 2,
+          visibility: GPUShaderStage.COMPUTE,
+          buffer: { type: "uniform" },
+        },
+      ],
+    });
+    const module = device.createShaderModule({
+      label: "spark-pack-ordering",
+      code: packOrderingWgsl,
+    });
+    this.packOrderingPipeline = device.createComputePipeline({
+      label: "spark-pack-ordering-pipeline",
+      layout: device.createPipelineLayout({
+        bindGroupLayouts: [this.packOrderingLayout],
+      }),
+      compute: { module, entryPoint: "main" },
+    });
+    this.packOrderingUniform = device.createBuffer({
+      label: "spark-pack-ordering-uniform",
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+  }
+
+  private ensureGpuOrderingTexture(
+    slot: WebGPURenderSlot,
+    width: number,
+    rows: number,
+  ): GPUTexture {
+    const usage =
+      GPUTextureUsage.TEXTURE_BINDING |
+      GPUTextureUsage.STORAGE_BINDING |
+      GPUTextureUsage.COPY_DST;
+    if (
+      slot.orderingTexture &&
+      slot.orderingRows >= rows &&
+      (slot.orderingTexture.usage & GPUTextureUsage.STORAGE_BINDING) !== 0
+    ) {
+      return slot.orderingTexture;
+    }
+    slot.orderingTexture?.destroy();
+    slot.orderingTexture = this.device.createTexture({
+      label: "spark-ordering-gpu-sort",
+      size: [width, rows],
+      format: "rgba32uint",
+      usage,
+    });
+    slot.orderingRows = rows;
+    slot.bindGroupDirty = true;
+    return slot.orderingTexture;
+  }
+
+  /**
+   * Depth keys + portable GPU radix + pack into the ordering texture.
+   * No mapAsync. Returns false if the GPU sort path cannot run.
+   */
+  private nativeKeysBuffer: GPUBuffer | null = null;
+
+  async gpuDepthSortAndPack(params: {
+    numSplats: number;
+    viewOrigin: { x: number; y: number; z: number };
+    viewDir: { x: number; y: number; z: number };
+    sortRadial: boolean;
+    enableExtSplats: boolean;
+    orderingRows: number;
+    orderingTarget?: WebGPUOrderingTarget;
+  }): Promise<boolean> {
+    if (!params.numSplats) return false;
+    if (!this.gpuSortValidated && !(await this.ensureGpuSort())) return false;
+    if (this.disposed)
+      throw new Error("Spark: native renderer disposed during GPU sort setup");
+    if (!this.gpuSorter) return false;
+    const slot = this.depthRenderSlot();
+    const depths = slot.nativeDepths;
+    if (!depths)
+      throw new Error("Spark: radix requires native generated depths");
+    const { device } = this;
+    const bytes = Math.ceil(params.numSplats / 256) * 256 * 4;
+    this.assertStorageBufferFits(bytes, "native sort keys");
+    if (!this.nativeKeysBuffer || this.nativeKeysBuffer.size < bytes) {
+      this.nativeKeysBuffer?.destroy();
+      this.nativeKeysBuffer = device.createBuffer({
+        label: "spark-native-sort-keys",
+        size: bytes,
+        usage:
+          GPUBufferUsage.STORAGE |
+          GPUBufferUsage.COPY_SRC |
+          GPUBufferUsage.COPY_DST,
+      });
+    }
+    const keysBuffer = this.nativeKeysBuffer;
+    if (
+      !this.packOrderingUniform ||
+      !this.packOrderingLayout ||
+      !this.packOrderingPipeline
+    )
+      return false;
+    const orderSlot = this.orderingRenderSlot(params.orderingTarget ?? "write");
+    const orderTex = this.ensureGpuOrderingTexture(
+      orderSlot,
+      4096,
+      params.orderingRows,
+    );
+    device.queue.writeBuffer(
+      this.packOrderingUniform,
+      0,
+      new Uint32Array([params.numSplats, 4096, 0, 0]),
+    );
+    const encoder = device.createCommandEncoder({
+      label: "spark-native-radix",
+    });
+    this.prepareNativeKeys(encoder, depths, keysBuffer, params.numSplats);
+    const sorted = this.gpuSorter.encodeSort(
+      encoder,
+      keysBuffer,
+      params.numSplats,
+      32,
+      true,
+      true,
+      this.timestampWritesFor("radix")?.timestampWrites,
+    );
+    if (!sorted) {
+      encoder.finish();
+      return false;
+    }
+    const packBg = device.createBindGroup({
+      layout: this.packOrderingLayout,
+      entries: [
+        { binding: 0, resource: { buffer: sorted } },
+        { binding: 1, resource: orderTex.createView() },
+        { binding: 2, resource: { buffer: this.packOrderingUniform } },
+      ],
+    });
+    {
+      const pass = encoder.beginComputePass({ label: "spark-pack-ordering" });
+      pass.setPipeline(this.packOrderingPipeline);
+      pass.setBindGroup(0, packBg);
+      pass.dispatchWorkgroups(
+        Math.ceil(4096 / 16),
+        Math.ceil(params.orderingRows / 16),
+      );
+      pass.end();
+    }
+
+    this.countNativeDraw(encoder, orderSlot, depths, sorted);
+    this.useIndirectDraw = true;
+    device.queue.submit([encoder.finish()]);
+    orderSlot.orderingGeneration = orderSlot.generation;
+    this.syncLegacyFields(orderSlot);
+    return true;
+  }
+
   dispose(): void {
     // Set first: in-flight mapAsync chains (timestamp readback, depth readback)
     // must not touch buffers this method is about to destroy.
     if (this.disposed) return;
     this.disposed = true;
     this.releaseDeviceLost();
+    for (const buffer of this.countReadbacks) buffer.destroy();
+    this.countReadbacks.clear();
     this.device.removeEventListener("uncapturederror", this.onUncapturedError);
     this.externalDepthTexture = null;
     this.externalDepthView = null;
     for (const slot of this.renderSlots) {
       slot.nativeDepths?.destroy();
       slot.nativeDepths = null;
+      slot.nativeDrawArgs?.destroy();
+      slot.nativeDrawArgs = null;
       slot.splatTexture?.destroy();
       slot.splatTexture = null;
       slot.splatTextureView = null;
@@ -1422,9 +1801,19 @@ export class WebGPUSplatBackend {
     this.timestampSlotLabels = [];
     this.timestampSlotsUsed = 0;
     this.timestampReadInFlight = false;
+    this.gpuSorter?.destroy();
+    this.gpuSorter = null;
+    this.gpuSortValidated = false;
+    this.gpuSortPreparation = null;
+    this.useIndirectDraw = false;
+    this.packOrderingUniform?.destroy();
+    this.packOrderingUniform = null;
+    this.packOrderingPipeline = null;
+    this.packOrderingLayout = null;
 
     this.nativeGeneration?.dispose();
     this.nativeGeneration = null;
+    this.nativeSortUniform?.destroy();
     this.generatedOutputBuffer?.destroy();
     this.generatedOutputBuffer = null;
     this.generatedOutputBuffer2?.destroy();
@@ -1439,5 +1828,7 @@ export class WebGPUSplatBackend {
     this.pipeline = null;
     this.bindGroupLayout = null;
     this.bindGroup = null;
+
+    this.nativeKeysBuffer?.destroy();
   }
 }

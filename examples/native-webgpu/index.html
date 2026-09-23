@@ -27,7 +27,7 @@
     <h1>Native WebGPU with Three.js</h1>
     <p>Drag to orbit. The opaque box shares depth with the generated splats.
        This example uses an original synthetic scene and downloads no assets.</p>
-    <nav><a href="?backend=webgpu">Native WebGPU</a><a href="?backend=webgl">Classic WebGL</a></nav>
+    <nav><a href="?backend=webgpu">Native reference</a><a href="?backend=webgpu&amp;sort=radix">Native GPU sort</a><a href="?backend=webgl">Classic WebGL</a></nav>
     <p id="status" role="status">Initializing…</p>
   </aside>
   <script type="module">
@@ -36,7 +36,9 @@
     import { SparkRenderer, SplatMesh, getSparkRendererCapabilities } from "@sparkjsdev/spark";
 
     const status = document.querySelector("#status");
-    const native = new URLSearchParams(location.search).get("backend") !== "webgl";
+    const params = new URLSearchParams(location.search);
+    const native = params.get("backend") !== "webgl";
+    const sort = params.get("sort") === "radix" ? "radix" : "readback";
     try {
       let renderer;
       if (native) {
@@ -60,7 +62,7 @@
       camera.position.set(3, 1.8, 7);
       const controls = new OrbitControls(camera, renderer.domElement);
       controls.enableDamping = true;
-      const spark = new SparkRenderer({ renderer, enableLod: false });
+      const spark = new SparkRenderer({ renderer, enableLod: false, webgpuSort: sort });
       scene.add(spark);
       const splats = new SplatMesh({ constructSplats: (data) => {
         const count = 8192, position = new THREE.Vector3();
@@ -95,7 +97,7 @@
           controls.update();
           if (native) await spark.renderAsync(scene, camera);
           else renderer.render(scene, camera);
-          status.textContent = `${native ? "Native WebGPU" : "Classic WebGL"} · 8,192 generated splats`;
+          status.textContent = `${native ? `Native WebGPU (${spark.getRenderStats().ordering === "radix" ? "GPU sort" : "reference"})` : "Classic WebGL"} · 8,192 generated splats`;
         } catch (error) {
           failed = true;
           renderer.setAnimationLoop(null);

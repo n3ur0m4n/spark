@@ -49,7 +49,7 @@ window.runNativeCase = async function(config) {
  const camera=config.ortho?new THREE.OrthographicCamera(-3,3,2.25,-2.25,.1,1000):new THREE.PerspectiveCamera(60,4/3,.1,1000);
  camera.position.set(.2,.1,5);camera.lookAt(0,0,0);camera.updateMatrixWorld();
  const spark=new SparkRenderer({renderer,autoUpdate:native,enableLod:!!config.lod,enableDriveLod:false,
-   accumExtSplats:!!config.outputExt,sortRadial:config.radial!==false,
+   accumExtSplats:!!config.outputExt,sortRadial:config.radial!==false,webgpuSort:config.engine==='gpu-sort'?'radix':'readback',
    maxStdDev:config.maxStdDev,minAlpha:config.minAlpha,minSortIntervalMs:0});scene.add(spark);
  const sources=[],meshes=[];
  const target=!native&&config.linear?new THREE.WebGLRenderTarget(160,120,{type:THREE.HalfFloatType}):null;
@@ -111,7 +111,7 @@ window.runNativeCase = async function(config) {
   let depths,ordering,drawCount;
   if(native){const backend=spark.webgpuBackend,slot=backend.renderSlots[backend.activeSlotIndex],device=renderer.backend.device;
    depths=await backend.readNativeDepths(current.numSplats);
-   drawCount=spark.activeSplats;
+   drawCount=config.engine==='gpu-sort'?(await readBuffer(device,slot.nativeDrawArgs,20))[1]:spark.activeSplats;
    ordering=await readOrdering(device,slot.orderingTexture,drawCount);
   }else {
    depths=new Uint32Array(Math.max(4096,Math.ceil(current.numSplats/4096)*4096));
