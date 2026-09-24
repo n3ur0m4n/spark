@@ -7,6 +7,8 @@ const check=(name,ok,data={})=>{checks.push({name,ok,...data});if(!ok)throw Erro
 window.addEventListener('error',e=>errors.push(e.message));window.addEventListener('unhandledrejection',e=>errors.push(String(e.reason)));
 const renderer=new WebGPURenderer({antialias:false});await renderer.init();renderer.setSize(100,100);document.body.append(renderer.domElement);
 renderer.backend.device.addEventListener('uncapturederror',e=>errors.push(e.error.message));
+const clearRanges=[];const createEncoder=renderer.backend.device.createCommandEncoder.bind(renderer.backend.device);
+renderer.backend.device.createCommandEncoder=(...args)=>{const encoder=createEncoder(...args),clear=encoder.clearBuffer.bind(encoder);encoder.clearBuffer=(buffer,offset=0,size=buffer.size-offset)=>{if(buffer.label==='spark-native-output')clearRanges.push({capacity:buffer.size,offset,size});return clear(buffer,offset,size);};return encoder;};
 let sourceBytes=0;const createBuffer=renderer.backend.device.createBuffer.bind(renderer.backend.device);
 renderer.backend.device.createBuffer=descriptor=>{const buffer=createBuffer(descriptor);if(descriptor.label?.startsWith('spark-native-source')){sourceBytes+=buffer.size;const destroy=buffer.destroy.bind(buffer);let live=true;buffer.destroy=()=>{if(live){sourceBytes-=buffer.size;live=false;}destroy();};}return buffer;};
 const camera=new THREE.PerspectiveCamera(60,1,.1,100);camera.position.z=4;
@@ -18,10 +20,12 @@ try {
   const scene=new THREE.Scene();spark=new SparkRenderer({renderer,enableLod:false,webgpuSort:mode});scene.add(spark);
   const source=new PackedSplats({construct:data=>push(data,0)});await source.initialized;owned.add(source);
   mesh=new SplatMesh({packedSplats:source});await mesh.initialized;scene.add(mesh);
-  for(const count of [1,2047,2048,2049,65537,65537,17,0,2050]){
+  for(const count of [1,2047,2048,2049,65537,2500000,2500000,17,0,2050]){
    while(source.numSplats<count)push(source,source.numSplats);
    source.numSplats=count;source.needsUpdate=true;
+   const clearsBefore=clearRanges.length;
    await spark.renderAsync(scene,camera);
+   if(count===17){const ranges=clearRanges.slice(clearsBefore);check(`${mode}: shrink clears consumed extent below retained capacity`,ranges.length>0&&ranges.every(r=>r.offset===0&&r.size<r.capacity&&r.size>=count*16),{ranges});}
    if(count===0)check(`${mode}: empty generation releases source GPU allocations`,sourceBytes===0,{sourceBytes});
    if(count>0){
     const backend=spark.webgpuBackend;
