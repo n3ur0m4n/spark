@@ -40,6 +40,7 @@ try {
   for (const name of [
     "native-lifecycle",
     "webgl-disposal",
+    "webgl-radial-invalidation",
     "native-counts",
     "native-device",
     "native-features",

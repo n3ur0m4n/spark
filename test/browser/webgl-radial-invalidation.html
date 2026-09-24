@@ -1,0 +1,34 @@
+<!doctype html><html><head><link rel="icon" href="data:,"></head><body><script type="module">
+import * as THREE from 'three';
+import {SparkRenderer,SplatMesh,PackedSplats} from '/src/index.ts';
+const checks=[],errors=[];
+const check=(name,ok,data={})=>{checks.push({name,ok,...data});if(!ok)throw Error(name);};
+window.addEventListener('unhandledrejection',e=>errors.push(String(e.reason)));
+const renderer=new THREE.WebGLRenderer({antialias:false,preserveDrawingBuffer:true});renderer.setSize(128,128);
+const scene=new THREE.Scene(),camera=new THREE.PerspectiveCamera(60,1,.1,100);camera.position.z=4;
+const source=new PackedSplats({construct:data=>{for(let i=0;i<64;i++)data.pushSplat(new THREE.Vector3((i%8-4)*.1,Math.floor(i/8)*.05,0),new THREE.Vector3(.06,.04,.03),new THREE.Quaternion(),.7,new THREE.Color(i%2,1-i%2,.3));}});await source.initialized;
+const mesh=new SplatMesh({packedSplats:source});await mesh.initialized;scene.add(mesh);
+const spark=new SparkRenderer({renderer,enableLod:false,autoUpdate:false,minSortIntervalMs:0});scene.add(spark);
+let reads=0;const read=spark.readbackDepth.bind(spark);spark.readbackDepth=(...args)=>{reads++;return read(...args);};
+const update=async(force=false)=>{camera.updateMatrixWorld();await spark.updateInternal({scene,camera,autoUpdate:!force});};
+const pixels=()=>{renderer.render(scene,camera);const a=new Uint8Array(128*128*4);renderer.getContext().readPixels(0,0,128,128,renderer.getContext().RGBA,renderer.getContext().UNSIGNED_BYTE,a);return a;};
+try{
+ await update(true);let before=reads;
+ camera.rotation.y=.12;await update();
+ check('radial rotation avoids redundant readback',reads===before);
+ const reused=pixels();const order=spark.orderingTexture.image.data.slice();
+ await update(true);const regenerated=pixels();
+ check('radial reused image equals forced generation',reused.every((v,i)=>v===regenerated[i]));
+ check('radial ordering equals forced generation',order.every((v,i)=>v===spark.orderingTexture.image.data[i]));
+ spark.sortRadial=false;await update(true);before=reads;camera.rotation.y=.24;await update();
+ check('directional rotation still sorts',reads===before+1);
+ spark.sortRadial=true;await update(true);before=reads;camera.position.x=.1;await update();
+ check('translation still regenerates',reads===before+1);
+ before=reads;mesh.position.x=.2;await update();check('transform change regenerates',reads===before+1);
+ before=reads;source.needsUpdate=true;mesh.updateVersion();await update();check('source revision regenerates',reads===before+1);
+ const original=mesh.frameUpdate;mesh.frameUpdate=function(ctx){return original.call(this,ctx);};
+ before=reads;camera.rotation.y=.36;await update();check('custom frameUpdate retains direction invalidation',reads===before+1);
+ mesh.frameUpdate=original;mesh.visible=false;before=reads;await update();check('visibility change regenerates',reads===before+1);
+ check('no unhandled errors',errors.length===0);window.lifecycleResult={passed:true,checks,errors};
+}catch(e){window.lifecycleResult={passed:false,checks,errors,error:String(e)};}finally{spark.dispose();mesh.dispose();source.dispose();renderer.dispose();}
+</script></body></html>

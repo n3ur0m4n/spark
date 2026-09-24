@@ -14,6 +14,7 @@ import { getSparkRendererCapabilities } from "./RendererCapabilities";
 import { SparkNativeRenderer } from "./SparkNativeRenderer";
 import type { SparkRenderStats } from "./SparkRenderStats";
 import { SplatAccumulator } from "./SplatAccumulator";
+import { isSplatEdit } from "./SplatEdit";
 import type { SplatGenerator } from "./SplatGenerator";
 import { SplatGeometry } from "./SplatGeometry";
 import { SplatMesh } from "./SplatMesh";
@@ -1346,10 +1347,10 @@ export class SparkRenderer<
     // stopped at the pose this.current was generated at, so regenerating every
     // frame would be redundant. sortDirty stays set from that generate, so the
     // final sort still runs once the in-flight one completes.
-    const viewChanged =
+    const positionChanged =
       center.distanceTo(this.current.viewOrigin) > 0.001 ||
-      dir.dot(this.current.viewDirection) < 0.999 ||
       sortCullCos !== this.sortCullCos;
+    const directionChanged = dir.dot(this.current.viewDirection) < 0.999;
 
     const next = this.accumulators.pop();
     if (!next) {
@@ -1396,6 +1397,41 @@ export class SparkRenderer<
     }
 
     let doUpdate = true;
+    // Only omit orientation invalidation for proven built-in generation.
+    // prepareGenerate/frameUpdate above still observes changes on every update.
+    let directionIndependent = false;
+    if (
+      (this.sortRadial ?? true) &&
+      // Cone culling (sortCullFov) selects splats by view direction.
+      sortCullCos === -2 &&
+      directionChanged &&
+      !positionChanged &&
+      !renderer.xr.isPresenting
+    ) {
+      directionIndependent = visibleGenerators.every(
+        (node) =>
+          Object.getPrototypeOf(node) === SplatMesh.prototype &&
+          node instanceof SplatMesh &&
+          node.hasNativeSourceGenerator() &&
+          !node.paged &&
+          !node.covSplats &&
+          (Object.getPrototypeOf(node.splats) === PackedSplats.prototype ||
+            Object.getPrototypeOf(node.splats) === ExtSplats.prototype) &&
+          !node.objectModifiers?.length &&
+          !node.worldModifiers?.length &&
+          !node.covObjectModifiers?.length &&
+          !node.covWorldModifiers?.length &&
+          !node.skinning &&
+          !node.edits?.length &&
+          !node.rgbaDisplaceEdits &&
+          !node.splatRgba,
+      );
+      scene.traverseVisible((node) => {
+        if (isSplatEdit(node)) directionIndependent = false;
+      });
+    }
+    const viewChanged =
+      positionChanged || (directionChanged && !directionIndependent);
     const needsUpdate = viewChanged || version !== this.current.version;
     const mappingUpdated = mappingVersion !== this.display.mappingVersion;
     this.latestMappingVersion = mappingVersion;
