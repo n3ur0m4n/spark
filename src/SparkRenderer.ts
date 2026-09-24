@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import { ExtSplats } from "./ExtSplats";
 import { OrderingBufferPool } from "./OrderingBufferPool";
+import { OrderingTrace } from "./OrderingTrace";
 import { PackedSplats } from "./PackedSplats";
 import { PagedSplats } from "./PagedSplats";
 import { Readback } from "./Readback";
@@ -931,6 +932,7 @@ export class SparkRenderer<
   dispose() {
     if (this.isDisposed) return;
     this.isDisposed = true;
+    this.orderingTrace.dispose();
     this.native?.dispose();
 
     // @ts-ignore Object3D has a dispose method in Three.js >= r186
@@ -1222,13 +1224,27 @@ export class SparkRenderer<
     spark.dirty = false;
   }
 
-  onAfterRender() {
+  private readonly orderingTrace = new OrderingTrace();
+
+  onAfterRender(
+    _renderer: SparkHostRenderer,
+    _scene: THREE.Scene,
+    camera: THREE.Camera,
+  ): void {
     const saved = this.stochasticSaved;
     if (saved) {
       this.stochasticSaved = null;
       this.material.blending = saved.blending;
       this.material.depthWrite = saved.depthWrite;
       this.material.depthTest = saved.depthTest;
+    }
+    const spark = SparkRenderer.sparkOverride ?? this;
+    if (!spark.native && !spark.isDisposed) {
+      spark.orderingTrace.draw(
+        spark.display.mappingVersion,
+        camera,
+        spark.activeSplats,
+      );
     }
   }
 
@@ -1453,6 +1469,7 @@ export class SparkRenderer<
     } else {
       generate();
       this.sortCullCos = sortCullCos;
+      this.orderingTrace.generatedAt(next);
 
       if (this.flushAfterGenerate) {
         const gl = renderer.getContext() as WebGL2RenderingContext;
@@ -1523,6 +1540,10 @@ export class SparkRenderer<
     }
 
     const current = this.current;
+    const traceRequest = this.orderingTrace.request(
+      current,
+      this.sortRadial ?? true,
+    );
 
     this.sortedCenter.copy(current.viewOrigin);
     this.sortedDir.copy(current.viewDirection);
@@ -1596,6 +1617,8 @@ export class SparkRenderer<
       activeSplats = result.activeSplats;
     }
 
+    const traceCompletedAt = this.orderingTrace.complete(traceRequest);
+
     if (this.sortDelay > 0) {
       await new Promise((resolve) => setTimeout(resolve, this.sortDelay));
     }
@@ -1645,6 +1668,8 @@ export class SparkRenderer<
     }
 
     // console.log(`Sorted (${this.minSortIntervalMs}) ${numSplats} splats in ${(performance.now() - now).toFixed(0)} ms`);
+
+    this.orderingTrace.commit(traceRequest, traceCompletedAt, activeSplats);
 
     if (this.current.mappingVersion === current.mappingVersion) {
       if (this.current.mappingVersion !== this.display.mappingVersion) {
