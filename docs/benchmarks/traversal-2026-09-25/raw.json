@@ -1,0 +1,101 @@
+{
+  "kind": "SparkLodTraversalComparison",
+  "referenceCommit": "d7e7f8cd83278067c01f0a5424cd73c34073b9c9",
+  "candidateCommit": "a9f1151e02d4cc6c58b65183bdefd46f08ad82f4",
+  "runtime": {
+    "node": "v24.18.0",
+    "platform": "darwin",
+    "arch": "arm64",
+    "cpu": "Apple M4 Max",
+    "parallelism": 14
+  },
+  "testCases": 452,
+  "samples": [
+    {
+      "budget": 1500000,
+      "repetition": 1,
+      "selected": 1500000,
+      "upstreamMs": 351.53850000000057,
+      "optimizedMs": 337.7581249999985
+    },
+    {
+      "budget": 1500000,
+      "repetition": 2,
+      "selected": 1500000,
+      "upstreamMs": 346.2275419999987,
+      "optimizedMs": 344.5480829999997
+    },
+    {
+      "budget": 1500000,
+      "repetition": 3,
+      "selected": 1500000,
+      "upstreamMs": 350.0828330000004,
+      "optimizedMs": 348.89224999999897
+    },
+    {
+      "budget": 1500000,
+      "repetition": 4,
+      "selected": 1500000,
+      "upstreamMs": 347.0507499999985,
+      "optimizedMs": 336.86104200000045
+    },
+    {
+      "budget": 1500000,
+      "repetition": 5,
+      "selected": 1500000,
+      "upstreamMs": 387.32179200000064,
+      "optimizedMs": 338.6319999999996
+    },
+    {
+      "budget": 2500000,
+      "repetition": 1,
+      "selected": 2463347,
+      "upstreamMs": 562.6227499999986,
+      "optimizedMs": 549.5830829999977
+    },
+    {
+      "budget": 2500000,
+      "repetition": 2,
+      "selected": 2463347,
+      "upstreamMs": 564.3392919999969,
+      "optimizedMs": 551.5990829999973
+    },
+    {
+      "budget": 2500000,
+      "repetition": 3,
+      "selected": 2463347,
+      "upstreamMs": 565.1478749999987,
+      "optimizedMs": 572.301707999999
+    },
+    {
+      "budget": 2500000,
+      "repetition": 4,
+      "selected": 2463347,
+      "upstreamMs": 565.4643329999999,
+      "optimizedMs": 553.1037499999984
+    },
+    {
+      "budget": 2500000,
+      "repetition": 5,
+      "selected": 2463347,
+      "upstreamMs": 564.414417,
+      "optimizedMs": 549.367374999998
+    }
+  ],
+  "fixture": {
+    "generator": "synthetic-lcg-integer-grid-v1",
+    "seed": 20260906,
+    "nodes": 4000001
+  },
+  "builds": [
+    {
+      "assetHash": "88c230c65f3b638a7fbdbe71935615f02eeac32cb52cd6d8f33e4cb697ac920b",
+      "wasmHash": "143175140950672991fb0d04aa6400d125b8614bfeec2e5821eb029464b3dc7c"
+    },
+    {
+      "assetHash": "88c230c65f3b638a7fbdbe71935615f02eeac32cb52cd6d8f33e4cb697ac920b",
+      "wasmHash": "cd3579ff30874990e2dc6a02e3cd44f08aac35945698a1dbd3cf21e794865a7c"
+    }
+  ],
+  "passed": true
+}
