@@ -1124,19 +1124,32 @@ export class WebGPUSplatBackend {
     const encoder = device.createCommandEncoder({
       label: "spark-native-generation",
     });
-    encoder.clearBuffer(this.generatedOutputBuffer);
-    encoder.clearBuffer(this.generatedOutputBuffer2);
+    // Initialize every texel copied below, including mapping gaps. Retained
+    // capacity outside this generation is neither copied nor consumed.
+    encoder.clearBuffer(this.generatedOutputBuffer, 0, bytes);
+    if (args.outputExt)
+      encoder.clearBuffer(this.generatedOutputBuffer2, 0, bytes);
     const fill = encoder.beginComputePass();
     fill.setPipeline(this.nativeFillPipeline);
     fill.setBindGroup(
       0,
       device.createBindGroup({
         layout: this.nativeFillPipeline.getBindGroupLayout(0),
-        entries: [{ binding: 0, resource: { buffer: slot.nativeDepths } }],
+        entries: [
+          {
+            binding: 0,
+            resource: {
+              buffer: slot.nativeDepths,
+              // arrayLength in the fill shader must describe the active span,
+              // not the retained buffer capacity after a previous larger scene.
+              size: args.numSplats * 4,
+            },
+          },
+        ],
       }),
     );
     fill.dispatchWorkgroups(
-      ...this.computeDispatchSize(slot.nativeDepths.size / 1024),
+      ...this.computeDispatchSize(Math.ceil(args.numSplats / 256)),
     );
     fill.end();
     try {

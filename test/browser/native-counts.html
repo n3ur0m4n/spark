@@ -18,11 +18,16 @@ try {
   const scene=new THREE.Scene();spark=new SparkRenderer({renderer,enableLod:false,webgpuSort:mode});scene.add(spark);
   const source=new PackedSplats({construct:data=>push(data,0)});await source.initialized;owned.add(source);
   mesh=new SplatMesh({packedSplats:source});await mesh.initialized;scene.add(mesh);
-  for(const count of [1,2047,2048,2049,17,0,2050]){
+  for(const count of [1,2047,2048,2049,65537,65537,17,0,2050]){
    while(source.numSplats<count)push(source,source.numSplats);
    source.numSplats=count;source.needsUpdate=true;
    await spark.renderAsync(scene,camera);
    if(count===0)check(`${mode}: empty generation releases source GPU allocations`,sourceBytes===0,{sourceBytes});
+   if(count>0){
+    const backend=spark.webgpuBackend;
+    const depths=await backend.readNativeDepths(count);
+    check(`${mode}: ${count} invalid entries initialized`,depths.every((value,i)=>i%7!==0||value===0x7f800000));
+   }
    const before=spark.getRenderStats();
    check(`${mode}: ${count} count availability`,before.drawnSplats===(mode==='radix'&&count?null:expected(count)),{before});
    const stats=await spark.readRenderStatsAsync();
