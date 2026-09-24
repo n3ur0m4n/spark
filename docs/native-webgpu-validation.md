@@ -50,7 +50,10 @@ commit an incomplete generation. Empty generations are valid and release
 uploaded source allocations while retaining reusable output capacity.
 
 Native rendering shares linear color and opaque depth with Three.js, then applies
-one final color conversion. It supports resize (including during an awaited update), alpha, tone mapping, perspective
+one final color conversion. Ordinary upstream WebGL can blend directly in its
+canvas output path, so default screenshots need not have identical colors.
+Cross-API image qualification uses a separately identified external linear
+WebGL composition control; ordinary upstream timings remain a distinct baseline. It supports resize (including during an awaited update), alpha, tone mapping, perspective
 and orthographic cameras. Spark removes its device listeners/resources on dispose
 and preserves the host device. Applications recreate the host renderer after
 device loss. A shared device-loss observer has removable subscriptions; disposed
@@ -104,12 +107,9 @@ and composition fixtures;
 no source alias can substitute checkout code. Raw results are retained under
 `test-results/package-browser/`. It requires a real hardware WebGPU adapter.
 
-The combined precursor was tested on Chrome 152 / Apple Metal against untouched
-official commit `4eb719afdb5b3655fe0bc290588e4728d9772405`. A private 20.23M-node
-scene selected and drew 2,499,991 splats with byte-identical selection, depth and
-ordering. The asset and footage are not part of the contribution. The standalone reference and radix revisions also pass this exact huge-scene
-comparison with a shared official WASM build. This is correctness evidence, not
-a performance claim.
+The deterministic fixtures use generated or repository-provided test data. No
+private diagnostic scene or footage is included. Generated attributes, depth
+words, ordering and counts are checked separately from final images.
 
 ## Open submission gates
 
@@ -119,13 +119,16 @@ a performance claim.
   fresh seeded holdout cases pass the strict <=1-channel image comparison and
   exact depth/order/counts. Older strict failures remain explicit; other hardware
   must validate the boundary behavior independently.
-- Repeat final clean-checkout qualification after the contribution commits are
-  frozen. The local native reference and radix integrations on upstream `834c3e6`
-  pass source and packaged browser checks on Chrome 153 / Apple M4 Max and Three r180/r186. CI execution and
-  other GPU/platform results remain pending; local checks do not establish them.
-- Capture five rotated repetitions at both resolutions and budgets with matched
-  composition, bounded readiness, quality metadata and instrumentation overhead.
-  Investigate repeatable regressions before selecting public performance claims.
+- This independent reference branch based on upstream `d7e7f8c` passes
+  types, lint, unit tests, WGSL validation, production/development builds, the
+  source browser suite and CommonJS/ESM/TypeScript package consumers on Three
+  r180/r186. Hardware checks use Chrome 153 / Apple M4 Max. Packaged development/minified browser
+  checks also pass on both Three versions. Remote CI and other GPU/platform
+  results remain pending; local checks do not establish them.
+- Performance claims require matched quality, camera route, physical resolution,
+  source/WASM identities and recording mode, with paired run-level results.
+  Diagnostic phase timings and submission intervals are distinct from presentation
+  FPS. This reference integration does not claim a public rendering speedup.
 - Final qualification must retain the WebGL disposal regression check. The
   candidate now cancels pending scheduling, snapshots active accumulator ownership
   before clearing its map, and guards late callbacks. Source and packaged browser

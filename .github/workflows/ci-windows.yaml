@@ -43,7 +43,7 @@ jobs:
         run: npm run build:wasm
 
       - name: Type check
-        run: npx tsc --noEmit
+        run: npm run types
 
       - name: Build package
         run: npm run build

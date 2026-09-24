@@ -25,6 +25,10 @@ try {
     ),
   );
   assert(
+    archive.files.some((file) => file.path === "NOTICE"),
+    "Bundled third-party notices must be included in the package",
+  );
+  assert(
     !archive.files.some((file) =>
       /\.(?:spz|splat|ply|rad|png|jpe?g|webm|mp4)$/i.test(file.path),
     ),

@@ -52,7 +52,7 @@
     "test:native:browser": "node scripts/test-native-browser.mjs"
   },
   "repository": "sparkjsdev/spark",
-  "files": ["dist"],
+  "files": ["dist", "NOTICE"],
   "license": "MIT",
   "devDependencies": {
     "@biomejs/biome": "1.9.4",
