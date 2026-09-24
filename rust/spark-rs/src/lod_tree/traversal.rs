@@ -19,8 +19,53 @@ pub(super) type Instance<'a> = (
 pub(super) struct Buffers {
     frontier: Frontier<(OrderedFloat<f32>, u32, u32)>,
     pub(super) touched: Vec<(u32, u32)>,
-    touched_set: AHashSet<(u32, u32)>,
+    membership_ids: AHashMap<u32, usize>,
+    memberships: Vec<Membership>,
+    instance_memberships: Vec<usize>,
     pub(super) instance_outputs: Vec<Vec<u32>>,
+}
+
+#[derive(Default)]
+struct Membership {
+    marks: Vec<u32>,
+    epoch: u32,
+    overflow: AHashSet<u32>,
+}
+
+impl Membership {
+    fn begin(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.marks.fill(0);
+            self.epoch = 1;
+        }
+        self.overflow.clear();
+    }
+
+    fn first_touch(&mut self, chunk: u32) -> bool {
+        if let Some(mark) = self.marks.get_mut(chunk as usize) {
+            let first = *mark != self.epoch;
+            *mark = self.epoch;
+            first
+        } else {
+            self.overflow.insert(chunk)
+        }
+    }
+}
+
+impl Buffers {
+    pub(super) fn forget_tree(&mut self, id: u32) {
+        if let Some(index) = self.membership_ids.remove(&id) {
+            self.memberships.swap_remove(index);
+            let old_last = self.memberships.len();
+            for slot in self.membership_ids.values_mut() {
+                if *slot == old_last {
+                    *slot = index;
+                }
+            }
+            self.instance_memberships.clear();
+        }
+    }
 }
 
 pub(super) struct Stats {
@@ -43,7 +88,9 @@ pub(super) fn select(
     let Buffers {
         frontier,
         touched,
-        touched_set,
+        membership_ids,
+        memberships,
+        instance_memberships,
         instance_outputs,
     } = buffers;
     let mut num_splats = 0;
@@ -56,7 +103,20 @@ pub(super) fn select(
     }
     let mut emitted = 0;
     touched.clear();
-    touched_set.clear();
+    for membership in memberships.iter_mut() {
+        membership.begin();
+    }
+    instance_memberships.clear();
+    for (lod_id, _, _, chunk_to_page, ..) in instances {
+        let index = *membership_ids.entry(*lod_id).or_insert_with(|| {
+            let mut membership = Membership::default();
+            membership.begin();
+            memberships.push(membership);
+            memberships.len() - 1
+        });
+        memberships[index].marks.resize(chunk_to_page.len(), 0);
+        instance_memberships.push(index);
+    }
 
     for (inst_index, instance) in instances.iter().enumerate() {
         let (lod_id, splats, ..) = instance;
@@ -71,7 +131,7 @@ pub(super) fn select(
         frontier.push((OrderedFloat(pixel_scale), inst_index as u32, root_index));
         num_splats += 1;
 
-        if touched_set.insert((*lod_id, 0)) {
+        if memberships[instance_memberships[inst_index]].first_touch(0) {
             touched.push((*lod_id, 0));
         }
     }
@@ -109,12 +169,14 @@ pub(super) fn select(
         _ = frontier.pop();
 
         let first_chunk = child_start >> 16;
-        if touched_set.insert((*lod_id, first_chunk)) {
+        if memberships[instance_memberships[inst_index as usize]].first_touch(first_chunk) {
             touched.push((*lod_id, first_chunk));
         }
 
         let last_chunk = (child_start + child_count as u32 - 1) >> 16;
-        if last_chunk != first_chunk && touched_set.insert((*lod_id, last_chunk)) {
+        if last_chunk != first_chunk
+            && memberships[instance_memberships[inst_index as usize]].first_touch(last_chunk)
+        {
             touched.push((*lod_id, last_chunk));
         }
 

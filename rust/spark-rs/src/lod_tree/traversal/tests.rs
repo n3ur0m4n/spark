@@ -306,3 +306,33 @@ fn disposing_last_tree_releases_pooled_selection_storage() {
         assert_eq!(state.traversal.instance_outputs.capacity(), 0);
     });
 }
+
+#[test]
+fn membership_epochs_overflow_and_tree_identity_reuse() {
+    let mut membership = Membership {
+        marks: vec![0; 2],
+        ..Default::default()
+    };
+    membership.begin();
+    assert!(membership.first_touch(0));
+    assert!(!membership.first_touch(0));
+    assert!(membership.first_touch(u32::MAX));
+    assert!(!membership.first_touch(u32::MAX));
+    assert_eq!(membership.marks.len(), 2);
+    membership.epoch = u32::MAX;
+    membership.begin();
+    assert!(membership.first_touch(0));
+    assert!(membership.first_touch(u32::MAX));
+    let trees = [tree(vec![node(1.0, 0, 0)]), tree(vec![node(1.0, 0, 0)])];
+    let mut input = instances(&trees, 0);
+    let mut scratch = Buffers::default();
+    check(&input, &[0, 0], 2, 0.0, &mut scratch);
+    assert_eq!(scratch.touched, vec![(0, 0), (1, 0)]);
+    input[1].0 = 0;
+    check(&input, &[0, 0], 2, 0.0, &mut scratch);
+    assert_eq!(scratch.touched, vec![(0, 0)]);
+    scratch.forget_tree(0);
+    check(&input, &[0, 0], 2, 0.0, &mut scratch);
+    assert_eq!(scratch.touched, vec![(0, 0)]);
+    assert_eq!(scratch.membership_ids.len(), scratch.memberships.len());
+}
