@@ -1129,7 +1129,10 @@ export class WebGPUSplatBackend {
     encoder.clearBuffer(this.generatedOutputBuffer, 0, bytes);
     if (args.outputExt)
       encoder.clearBuffer(this.generatedOutputBuffer2, 0, bytes);
-    const fill = encoder.beginComputePass();
+    const fill = encoder.beginComputePass({
+      label: "spark-native-depth-fill",
+      ...this.timestampWritesFor("depth-fill"),
+    });
     fill.setPipeline(this.nativeFillPipeline);
     fill.setBindGroup(
       0,
@@ -1159,6 +1162,9 @@ export class WebGPUSplatBackend {
         output: this.generatedOutputBuffer,
         output2: this.generatedOutputBuffer2,
         depths: slot.nativeDepths,
+        timestampWrites: this.gpuTimingAvailable
+          ? () => this.timestampWritesFor("generation")?.timestampWrites
+          : undefined,
       });
     } catch (error) {
       encoder.finish();
@@ -1299,7 +1305,10 @@ export class WebGPUSplatBackend {
       0,
       new Uint32Array([count, 0, 0, 0]),
     );
-    const pass = encoder.beginComputePass({ label: "spark-native-sort-keys" });
+    const pass = encoder.beginComputePass({
+      label: "spark-native-sort-keys",
+      ...this.timestampWritesFor("keys"),
+    });
     pass.setPipeline(pipeline);
     pass.setBindGroup(
       0,
@@ -1751,7 +1760,10 @@ export class WebGPUSplatBackend {
       ],
     });
     {
-      const pass = encoder.beginComputePass({ label: "spark-pack-ordering" });
+      const pass = encoder.beginComputePass({
+        label: "spark-pack-ordering",
+        ...this.timestampWritesFor("ordering-pack"),
+      });
       pass.setPipeline(this.packOrderingPipeline);
       pass.setBindGroup(0, packBg);
       pass.dispatchWorkgroups(

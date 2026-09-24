@@ -167,6 +167,7 @@ export class WebGPUGeneration {
       viewOrigin: number[];
       viewDirection: number[];
       sortRadial: boolean;
+      timestampWrites?: () => GPUComputePassTimestampWrites | undefined;
     },
   ) {
     if (this.disposed) throw new Error("Spark: native generation is disposed");
@@ -258,7 +259,10 @@ export class WebGPUGeneration {
           resource: { buffer },
         })),
       });
-      const pass = encoder.beginComputePass({ label: "spark-native-generate" });
+      const pass = encoder.beginComputePass({
+        label: "spark-native-generate",
+        timestampWrites: args.timestampWrites?.(),
+      });
       pass.setPipeline(this.pipeline);
       pass.setBindGroup(0, group);
       const [x, y] = calcDispatchSize(
