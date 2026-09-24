@@ -50,7 +50,15 @@ function fixture(seed, count) {
 function summarize(result, full) {
   const hash = createHash("sha256");
   const selections = result.instanceIndices.map(({ indices, numSplats }) => {
-    assert.equal(indices.length % 16384, 0, "WASM row padding");
+    assert.equal(
+      indices.length,
+      Math.ceil(numSplats / 16384) * 16384,
+      "WASM row capacity",
+    );
+    assert(
+      indices.subarray(numSplats).every((value) => value === 0),
+      "WASM padding must be zero",
+    );
     const sorted = indices.slice(0, numSplats).sort();
     for (let i = 1; i < sorted.length; i++)
       assert.notEqual(sorted[i], sorted[i - 1], "duplicate selection");
@@ -65,6 +73,7 @@ function summarize(result, full) {
   });
   return {
     selections,
+    lodIds: result.instanceIndices.map((instance) => instance.lodId),
     chunks: result.chunks,
     stats: {
       pixelLimit: result.pixelLimit,
@@ -187,6 +196,7 @@ if (!isMainThread) {
   const report = {
     kind: "SparkLodTraversalComparison",
     referenceCommit: option("--reference-commit") ?? null,
+    candidateCommit: option("--candidate-commit") ?? null,
     runtime: {
       node: process.version,
       platform: platform(),
@@ -198,6 +208,29 @@ if (!isMainThread) {
     samples: [],
   };
   try {
+    await Promise.all(
+      workers.map((w) => rpc(w, { type: "load", seed: 2026, nodes: 1 })),
+    );
+    for (const instances of [0, 1]) {
+      for (const budget of [0, 1]) {
+        const request = {
+          type: "traverse",
+          instances,
+          budget,
+          limit: 0,
+          view: 0,
+          foveate: 1,
+          full: true,
+        };
+        const [a, b] = await Promise.all(workers.map((w) => rpc(w, request)));
+        assert.deepEqual(
+          [b.selections, b.lodIds, b.chunks, b.stats, b.selected],
+          [a.selections, a.lodIds, a.chunks, a.stats, a.selected],
+          "empty instances and leaf-only roots",
+        );
+        report.testCases++;
+      }
+    }
     for (let seed = 0; seed < 16; seed++) {
       const loads = await Promise.all(
         workers.map((w) =>
@@ -222,6 +255,7 @@ if (!isMainThread) {
             a.selections,
             `selection: seed=${seed}, budget=${budget}, limit=${limit}`,
           );
+          assert.deepEqual(b.lodIds, a.lodIds, "instance tree identities");
           assert.deepEqual(b.chunks, a.chunks, "paging request order");
           assert.deepEqual(
             b.stats,
