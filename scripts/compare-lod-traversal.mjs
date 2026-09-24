@@ -66,6 +66,12 @@ function summarize(result, full) {
   return {
     selections,
     chunks: result.chunks,
+    stats: {
+      pixelLimit: result.pixelLimit,
+      outputSize: result.outputSize,
+      frontierSize: result.frontierSize,
+      leafCount: result.leafCount,
+    },
     selectionHash: hash.digest("hex"),
     selected: result.instanceIndices.reduce((n, x) => n + x.numSplats, 0),
   };
@@ -180,7 +186,7 @@ if (!isMainThread) {
   }
   const report = {
     kind: "SparkLodTraversalComparison",
-    referenceCommit: "722255799e26db7cc41c2649638b0aa5214624c6",
+    referenceCommit: option("--reference-commit") ?? null,
     runtime: {
       node: process.version,
       platform: platform(),
@@ -217,6 +223,11 @@ if (!isMainThread) {
             `selection: seed=${seed}, budget=${budget}, limit=${limit}`,
           );
           assert.deepEqual(b.chunks, a.chunks, "paging request order");
+          assert.deepEqual(
+            b.stats,
+            a.stats,
+            "all traversal result counters and pixel limit",
+          );
           report.testCases++;
         }
       }

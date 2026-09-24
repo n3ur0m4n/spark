@@ -67,7 +67,10 @@ fn check(input: &[Instance<'_>], roots: &[u32], budget: usize, limit: f32, buffe
         );
         total += actual.len();
     }
-    assert_eq!(stats.pixel_limit.to_bits(), reference_stats.pixel_limit.to_bits());
+    assert_eq!(
+        stats.pixel_limit.to_bits(),
+        reference_stats.pixel_limit.to_bits()
+    );
     assert_eq!(stats.emitted, reference_stats.emitted);
     assert_eq!(stats.drained, reference_stats.drained);
     assert_eq!(stats.leaves, reference_stats.leaves);

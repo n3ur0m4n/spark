@@ -138,5 +138,14 @@ pub(super) fn select_reference(
         instance_outputs[inst_index as usize].push(paged_index);
     }
 
-    (instance_outputs, touched.clone(), Stats { pixel_limit: min_pixel_scale, emitted: output_size, drained: frontier_size, leaves: leaf_count })
+    (
+        instance_outputs,
+        touched.clone(),
+        Stats {
+            pixel_limit: min_pixel_scale,
+            emitted: output_size,
+            drained: frontier_size,
+            leaves: leaf_count,
+        },
+    )
 }

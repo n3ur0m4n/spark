@@ -20,8 +20,6 @@ pub(super) struct Buffers {
     frontier: Frontier<(OrderedFloat<f32>, u32, u32)>,
     pub(super) touched: Vec<(u32, u32)>,
     touched_set: AHashSet<(u32, u32)>,
-    output: Vec<(u32, u32)>,
-    counts: Vec<usize>,
     pub(super) instance_outputs: Vec<Vec<u32>>,
 }
 
@@ -46,14 +44,17 @@ pub(super) fn select(
         frontier,
         touched,
         touched_set,
-        output,
-        counts,
         instance_outputs,
     } = buffers;
     let mut num_splats = 0;
     frontier.clear();
-    output.clear();
-    output.reserve(max_splats);
+    if instance_outputs.len() < num_instances {
+        instance_outputs.resize_with(num_instances, Vec::new);
+    }
+    for values in instance_outputs.iter_mut() {
+        values.clear();
+    }
+    let mut emitted = 0;
     touched.clear();
     touched_set.clear();
 
@@ -94,7 +95,8 @@ pub(super) fn select(
 
         if child_count == 0 {
             _ = frontier.pop();
-            output.push((inst_index, paged_index));
+            instance_outputs[inst_index as usize].push(paged_index);
+            emitted += 1;
             leaf_count += 1;
             continue;
         }
@@ -117,14 +119,16 @@ pub(super) fn select(
         }
 
         if last_chunk as usize >= chunk_to_page.len() {
-            output.push((inst_index, paged_index));
+            instance_outputs[inst_index as usize].push(paged_index);
+            emitted += 1;
             continue;
         }
         let first_page = chunk_to_page[first_chunk as usize];
         let last_page = chunk_to_page[last_chunk as usize];
 
         if first_page == 0xFFFFFFFF || last_page == 0xFFFFFFFF {
-            output.push((inst_index, paged_index));
+            instance_outputs[inst_index as usize].push(paged_index);
+            emitted += 1;
             continue;
         }
 
@@ -135,7 +139,8 @@ pub(super) fn select(
             let child_splat = &splats[paged_index as usize];
             let pixel_scale = compute_pixel_scale(child_splat, instance);
             if pixel_scale <= pixel_scale_limit {
-                output.push((inst_index, paged_index));
+                instance_outputs[inst_index as usize].push(paged_index);
+                emitted += 1;
             } else {
                 frontier.push((OrderedFloat(pixel_scale), inst_index, paged_index));
             }
@@ -144,28 +149,10 @@ pub(super) fn select(
         num_splats = new_num_splats;
     }
 
-    let output_size = output.len();
+    let output_size = emitted;
     let frontier_size = frontier.len();
 
     for (_, inst_index, paged_index) in frontier.drain() {
-        output.push((inst_index, paged_index));
-    }
-
-    counts.clear();
-    counts.resize(num_instances, 0);
-    for &(inst_index, _) in output.iter() {
-        counts[inst_index as usize] += 1;
-    }
-
-    if instance_outputs.len() < num_instances {
-        instance_outputs.resize_with(num_instances, Vec::new);
-    }
-    for (values, &count) in instance_outputs.iter_mut().zip(counts.iter()) {
-        values.clear();
-        values.reserve(count);
-    }
-
-    for &(inst_index, paged_index) in output.iter() {
         instance_outputs[inst_index as usize].push(paged_index);
     }
 
