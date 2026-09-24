@@ -29,7 +29,9 @@ try{
  before=reads;source.needsUpdate=true;mesh.updateVersion();await update();check('source revision regenerates',reads===before+1);
  const original=mesh.frameUpdate;mesh.frameUpdate=function(ctx){return original.call(this,ctx);};
  before=reads;camera.rotation.y=.36;await update();check('custom frameUpdate retains direction invalidation',reads===before+1);
- mesh.frameUpdate=original;mesh.visible=false;before=reads;await update();check('visibility change regenerates',reads===before+1);
+ mesh.frameUpdate=original;mesh.onFrame=()=>{};
+ before=reads;camera.rotation.y=.48;await update();check('custom onFrame retains direction invalidation',reads===before+1);
+ mesh.onFrame=undefined;mesh.visible=false;before=reads;await update();check('visibility change regenerates',reads===before+1);
  const trace=spark.orderingTrace.drain();
  check('real draws carry committed order identity',trace.events.some(e=>e.stage==='drawn'&&e.firstDraw&&e.mappingCompatible));
  check('draw observations remain bounded',trace.dropped===0);
