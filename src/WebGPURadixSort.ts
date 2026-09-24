@@ -82,6 +82,7 @@ export class WebGPURadixSort {
   private allocatedWorkgroups = 0;
   private workgroupCount = 0;
   private prefixWorkgroupCount = 0;
+  private activePrefixLevels = 0;
   private lastNumBits = 0;
   private lastSkipLastKeyWrite = false;
   private sortedIndices: GPUBuffer | null = null;
@@ -349,6 +350,7 @@ export class WebGPURadixSort {
     this.capacity = 0;
     this.allocatedWorkgroups = 0;
     this.prefixWorkgroupCount = 0;
+    this.activePrefixLevels = 0;
     // Invalidate any bind group a caller cached against the old buffers.
     this.bufferEpoch++;
   }
@@ -382,7 +384,7 @@ export class WebGPURadixSort {
       this.blockSums
     ) {
       if (this.prefixWorkgroupCount !== this.workgroupCount) {
-        this.rebuildPrefixLevels();
+        this.configurePrefixLevels();
       }
       return;
     }
@@ -401,6 +403,7 @@ export class WebGPURadixSort {
       BUCKET_COUNT * allocWorkgroups * 4,
     );
     this.rebuildPrefixLevels();
+    this.configurePrefixLevels();
   }
 
   private rebuildPrefixLevels(): void {
@@ -414,7 +417,7 @@ export class WebGPURadixSort {
     for (const buf of this.prefixUniforms) buf.destroy();
     this.prefixUniforms = [];
     let items = this.blockSums;
-    let count = BUCKET_COUNT * this.workgroupCount;
+    let count = BUCKET_COUNT * this.allocatedWorkgroups;
     while (count > 0) {
       const workgroups = Math.max(
         1,
@@ -444,6 +447,27 @@ export class WebGPURadixSort {
       if (workgroups <= 1) break;
       items = blockSums;
       count = workgroups;
+    }
+  }
+
+  // Scratch follows allocation capacity; dispatches follow the current sort.
+  // Do not scan inactive retained levels or their stale tail elements.
+  private configurePrefixLevels(): void {
+    let count = BUCKET_COUNT * this.workgroupCount;
+    this.activePrefixLevels = 0;
+    while (count > 0) {
+      const index = this.activePrefixLevels++;
+      const level = this.prefixLevels[index];
+      const groups = Math.ceil(count / PREFIX_ITEMS_PER_WORKGROUP);
+      level.count = count;
+      level.dispatch = dispatch2d(groups, this.maxWorkgroups);
+      this.device.queue.writeBuffer(
+        this.prefixUniforms[index],
+        0,
+        new Uint32Array([count, 0, 0, 0]),
+      );
+      if (groups <= 1) break;
+      count = groups;
     }
     this.prefixWorkgroupCount = this.workgroupCount;
   }
@@ -583,7 +607,7 @@ export class WebGPURadixSort {
     if (!this.prefixLayout || !this.prefixScanPipe || !this.prefixAddPipe) {
       return;
     }
-    for (let i = 0; i < this.prefixLevels.length; i++) {
+    for (let i = 0; i < this.activePrefixLevels; i++) {
       const level = this.prefixLevels[i];
       const uniform = this.prefixUniforms[i];
       const bg = this.device.createBindGroup({
@@ -600,7 +624,7 @@ export class WebGPURadixSort {
       passEnc.dispatchWorkgroups(level.dispatch.x, level.dispatch.y);
       passEnc.end();
     }
-    for (let i = this.prefixLevels.length - 2; i >= 0; i--) {
+    for (let i = this.activePrefixLevels - 2; i >= 0; i--) {
       const level = this.prefixLevels[i];
       const uniform = this.prefixUniforms[i];
       const bg = this.device.createBindGroup({

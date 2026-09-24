@@ -117,9 +117,28 @@
           }
         }
       }
+      // The preceding cases warmed multi-million capacity. Crossing logical
+      // workgroup and prefix-level boundaries must not replace scratch buffers.
+      let scratchAllocations = 0;
+      const createBuffer = device.createBuffer.bind(device);
+      device.createBuffer = descriptor => {
+        if (/^spark-(prefix|radix)/.test(descriptor.label || "")) scratchAllocations++;
+        return createBuffer(descriptor);
+      };
+      const reuseCounts = [1, 2047, 2048, 2049, 65536, 65537, 2097153, 0, 1];
+      for (const n of reuseCounts) {
+        const keys = Uint32Array.from({length:n}, (_, i) => (i * 17) % 251);
+        const gpu = await readSortedIndices(device, sorter, keys);
+        if (!arraysEqual(cpuRadixSort4bit(keys), gpu)) {
+          throw new Error(`Retained-prefix mismatch N=${n}`);
+        }
+      }
+      device.createBuffer = createBuffer;
+      if (scratchAllocations !== 0) throw new Error(`Scratch reallocated ${scratchAllocations} times`);
+      const resourceReuse = {counts: reuseCounts, scratchAllocations, passed:true};
       await device.queue.onSubmittedWorkDone();
       const pass = cases.every(test => test.pass) && errors.length === 0;
-      window.__sparkRadixSelftest = {pass, cases, errors,
+      window.__sparkRadixSelftest = {pass, cases, errors, resourceReuse,
         adapter: {vendor:info.vendor, architecture:info.architecture, device:info.device, description:info.description}};
       log(pass ? "ALL PASS" : "FAILED", pass ? "pass" : "fail");
       sorter.destroy();

@@ -28,6 +28,8 @@ try {
   assert.equal(result.pass, true, JSON.stringify(result));
   assert.equal(result.cases.length, 20);
   assert(result.cases.every((test) => test.pass));
+  assert.equal(result.resourceReuse?.passed, true);
+  assert.equal(result.resourceReuse.scratchAllocations, 0);
   assert.deepEqual(result.errors, []);
   assert.deepEqual(errors, []);
   assert(
