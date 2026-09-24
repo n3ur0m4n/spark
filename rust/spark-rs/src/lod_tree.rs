@@ -8,6 +8,8 @@ use js_sys::{Array, Object, Reflect, Uint32Array};
 use ordered_float::OrderedFloat;
 use wasm_bindgen::prelude::*;
 
+mod traversal;
+
 const MAX_SPLAT_CHUNK: usize = 65536;
 
 #[allow(dead_code)]
@@ -188,10 +190,7 @@ struct LodState {
     // pick worker); the traversal-only LoD worker skips their cost entirely.
     radii: bool,
     lod_trees: AHashMap<u32, LodTree>,
-    frontier: Frontier<(OrderedFloat<f32>, u32, u32)>,
-    output: Vec<(u32, u32)>,
-    touched: Vec<(u32, u32)>,
-    touched_set: AHashSet<(u32, u32)>,
+    traversal: traversal::Buffers,
     buffer: Vec<u32>,
 }
 
@@ -201,10 +200,7 @@ impl LodState {
             next_id: 1000,
             radii: false,
             lod_trees: AHashMap::new(),
-            frontier: Frontier::new(),
-            output: Vec::new(),
-            touched: Vec::new(),
-            touched_set: AHashSet::new(),
+            traversal: traversal::Buffers::default(),
             buffer: Vec::new(),
         }
     }
@@ -316,6 +312,9 @@ pub fn set_lod_radii(enabled: bool) {
 pub fn dispose_lod_tree(lod_id: u32) {
     STATE.with_borrow_mut(|state| {
         state.lod_trees.remove(&lod_id);
+        if state.lod_trees.is_empty() {
+            state.traversal = traversal::Buffers::default();
+        }
     })
 }
 
@@ -457,6 +456,9 @@ pub fn traverse_lod_trees(
 ) -> anyhow::Result<Object, JsValue> {
     let max_splats = max_splats as usize;
     let num_instances = lod_ids.len();
+    if root_pages.len() != num_instances {
+        return Err(JsValue::from_str("Invalid root_pages length"));
+    }
     if view_to_objects.len() != num_instances * 16 {
         return Err(JsValue::from_str("Invalid view_to_objects length"));
     }
@@ -477,7 +479,7 @@ pub fn traverse_lod_trees(
     }
 
     STATE.with_borrow_mut(|state| {
-        let LodState { lod_trees, frontier, output, touched, touched_set, .. } = state;
+        let LodState { lod_trees, traversal, .. } = state;
         let instances: Vec<_> = lod_ids.iter().enumerate().map(|(index, &lod_id)| {
             let lod_tree = lod_trees.get(&lod_id).unwrap();
             let LodTree { splats, page_to_chunk, chunk_to_page, .. } = &lod_tree;
@@ -493,112 +495,9 @@ pub fn traverse_lod_trees(
             (lod_id, splats.borrow(), page_to_chunk, chunk_to_page, origin, forward, lod_scale, behind_foveate, cone_foveate, cone_dot0, cone_dot)
         }).collect();
 
-        let mut num_splats = 0;
-        frontier.clear();
-        output.clear();
-        output.reserve(max_splats);
-        touched.clear();
-        touched_set.clear();
-
-        for (inst_index, instance) in instances.iter().enumerate() {
-            let (lod_id, splats, ..) = instance;
-            let root_page = root_pages[inst_index];
-            let root_page = if root_page == 0xFFFFFFFF { 0 } else { root_page };
-            let root_index = root_page << 16;
-            let pixel_scale = compute_pixel_scale(&splats[root_index as usize], instance);
-            frontier.push((OrderedFloat(pixel_scale), inst_index as u32, root_index));
-            num_splats += 1;
-
-            if touched_set.insert((*lod_id, 0)) {
-                touched.push((*lod_id, 0));
-            }
-        }
-        
-        let mut min_pixel_scale = f32::INFINITY;
-        let mut leaf_count = 0;
-
-        while let Some(&(OrderedFloat(pixel_scale), inst_index, paged_index)) = frontier.peek() {
-            min_pixel_scale = min_pixel_scale.min(pixel_scale);
-            if pixel_scale <= pixel_scale_limit {
-                break;
-            }
-
-            let instance = &instances[inst_index as usize];
-            let (lod_id, splats, _page_to_chunk, chunk_to_page, ..) = instance;
-            let LodSplat { child_count, child_start, .. } = splats[paged_index as usize];
-
-            if child_count == 0 {
-                _ = frontier.pop();
-                output.push((inst_index, paged_index));
-                leaf_count += 1;
-                continue;
-            }
-
-            let new_num_splats = num_splats - 1 + child_count as usize;
-            if new_num_splats > max_splats {
-                break;
-            }
-
-            _ = frontier.pop();
-
-            let first_chunk = child_start >> 16;
-            if touched_set.insert((*lod_id, first_chunk)) {
-                touched.push((*lod_id, first_chunk));
-            }
-
-            let last_chunk = (child_start + child_count as u32 - 1) >> 16;
-            if last_chunk != first_chunk && touched_set.insert((*lod_id, last_chunk)) {
-                touched.push((*lod_id, last_chunk));
-            }
-
-            if last_chunk as usize >= chunk_to_page.len() {
-                output.push((inst_index, paged_index));
-                continue;
-            }
-            let first_page = chunk_to_page[first_chunk as usize];
-            let last_page = chunk_to_page[last_chunk as usize];
-
-            if first_page == 0xFFFFFFFF || last_page == 0xFFFFFFFF {
-                output.push((inst_index, paged_index));
-                continue;
-            }
-
-            for child in child_start..child_start + child_count as u32 {
-                let child_chunk = (child >> 16) as usize;
-                let child_page = chunk_to_page[child_chunk];
-                let paged_index = (child_page << 16) | (child & 0xffff);
-                let pixel_scale = compute_pixel_scale(&splats[paged_index as usize], instance);
-                if pixel_scale <= pixel_scale_limit {
-                    output.push((inst_index, paged_index));
-                } else {
-                    frontier.push((OrderedFloat(pixel_scale), inst_index, paged_index));
-                }
-            }
-
-            num_splats = new_num_splats;
-        }
-
-        let output_size = output.len();
-        let frontier_size = frontier.len();
-
-        for (_, inst_index, paged_index) in frontier.drain() {
-            output.push((inst_index, paged_index));
-        }
-
-        let mut instance_counts = vec![0; num_instances];
-        for &(inst_index, _) in output.iter() {
-            instance_counts[inst_index as usize] += 1;
-        }
-
-        let mut instance_outputs = Vec::with_capacity(num_instances);
-        for counts in instance_counts {
-            instance_outputs.push(Vec::with_capacity(counts));
-        }
-
-        for &(inst_index, paged_index) in output.iter() {
-            instance_outputs[inst_index as usize].push(paged_index);
-        }
-
+        let stats = traversal::select(max_splats, pixel_scale_limit, root_pages, &instances, traversal);
+        let instance_outputs = &mut traversal.instance_outputs[..num_instances];
+        let touched = &traversal.touched;
         let instance_indices = Array::new();
 
         for (inst_index, instance_output) in instance_outputs.iter_mut().enumerate() {
@@ -626,12 +525,12 @@ pub fn traverse_lod_trees(
         }
 
         let result = Object::new();
-        Reflect::set(&result, &JsValue::from_str("pixelLimit"), &JsValue::from(min_pixel_scale)).unwrap();
+        Reflect::set(&result, &JsValue::from_str("pixelLimit"), &JsValue::from(stats.pixel_limit)).unwrap();
         Reflect::set(&result, &JsValue::from_str("instanceIndices"), &JsValue::from(instance_indices)).unwrap();
         Reflect::set(&result, &JsValue::from_str("chunks"), &JsValue::from(out_chunks)).unwrap();
-        Reflect::set(&result, &JsValue::from_str("outputSize"), &JsValue::from(output_size)).unwrap();
-        Reflect::set(&result, &JsValue::from_str("frontierSize"), &JsValue::from(frontier_size)).unwrap();
-        Reflect::set(&result, &JsValue::from_str("leafCount"), &JsValue::from(leaf_count)).unwrap();
+        Reflect::set(&result, &JsValue::from_str("outputSize"), &JsValue::from(stats.emitted)).unwrap();
+        Reflect::set(&result, &JsValue::from_str("frontierSize"), &JsValue::from(stats.drained)).unwrap();
+        Reflect::set(&result, &JsValue::from_str("leafCount"), &JsValue::from(stats.leaves)).unwrap();
         Ok(result)
     })
 }
