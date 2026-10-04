@@ -423,6 +423,13 @@ export class SplatPager {
     return this.pageFreelist.shift();
   }
 
+  // Whether the CPU copy of a page already holds the chunk mapped to it
+  // (mappings are updated before the page data is uploaded)
+  isPageUploaded(page: number) {
+    const pending = (upload: PageUpload) => upload.page === page;
+    return !this.newUploads.some(pending) && !this.readyUploads.some(pending);
+  }
+
   getSplatsChunk(splats: PagedSplats, chunk: number) {
     const chunks = this.splatsChunkToPage.get(splats);
     if (!chunks) {

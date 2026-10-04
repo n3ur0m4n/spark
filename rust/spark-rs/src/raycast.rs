@@ -1,3 +1,5 @@
+use std::array;
+
 use spark_lib::{
     decoder::SplatEncoding,
     splat_encode::{decode_ext_splat_center, decode_ext_splat_opacity, decode_ext_splat_quat, decode_ext_splat_scale, decode_packed_splat_center, decode_packed_splat_opacity, decode_packed_splat_quat, decode_packed_splat_scale},
@@ -6,7 +8,7 @@ use spark_lib::{
 pub fn raycast_packed_ellipsoids(
     buffer: &[u32], distances: &mut Vec<f32>, 
     origin: [f32; 3], dir: [f32; 3], min_opacity: f32, near: f32, far: f32,
-    encoding: &SplatEncoding,
+    encoding: &SplatEncoding, sigma: Option<f32>,
 ) {
     for packed in buffer.chunks(4) {
         let opacity = decode_packed_splat_opacity(packed, encoding);
@@ -17,7 +19,7 @@ pub fn raycast_packed_ellipsoids(
         let center = decode_packed_splat_center(packed);
         let scale = decode_packed_splat_scale(packed, encoding);
         let quat = decode_packed_splat_quat(packed);
-        if let Some(t) = raycast_ellipsoid(origin, dir, opacity, center, scale, quat) {
+        if let Some(t) = raycast_ellipsoid(origin, dir, opacity, center, scale, quat, sigma) {
             if t >= near && t <= far {
                 distances.push(t);
             }
@@ -28,6 +30,7 @@ pub fn raycast_packed_ellipsoids(
 pub fn raycast_ext_ellipsoids(
     buffer: &[u32], buffer2: &[u32], distances: &mut Vec<f32>, 
     origin: [f32; 3], dir: [f32; 3], min_opacity: f32, near: f32, far: f32,
+    sigma: Option<f32>,
 ) {
     assert_eq!(buffer.len(), buffer2.len());
     for (ext_a, ext_b) in buffer.chunks(4).zip(buffer2.chunks(4)) {
@@ -39,7 +42,7 @@ pub fn raycast_ext_ellipsoids(
         let center = decode_ext_splat_center(ext_a);
         let scale = decode_ext_splat_scale(ext_b);
         let quat = decode_ext_splat_quat(ext_b);
-        if let Some(t) = raycast_ellipsoid(origin, dir, opacity, center, scale, quat) {
+        if let Some(t) = raycast_ellipsoid(origin, dir, opacity, center, scale, quat, sigma) {
             if t >= near && t <= far {
                 distances.push(t);
             }
@@ -47,9 +50,16 @@ pub fn raycast_ext_ellipsoids(
     }
 }
 
-fn raycast_ellipsoid(
+/// Ray vs splat ellipsoid with semi-axes scale * (max(opacity, 1) * 4 - 3).
+/// With `sigma = Some(k)` the semi-axes are also scaled by k and the ellipsoid
+/// discriminant is evaluated in f64 as a - |o x d|^2 (Lagrange identity, equal
+/// to b^2 - ac), avoiding the catastrophic cancellation of b^2 - ac in f32 when
+/// |o| >> 1, e.g. small splats seen from far away. `None` keeps the original
+/// f32 behavior of SplatMesh.raycast().
+pub fn raycast_ellipsoid(
     origin: [f32; 3], dir: [f32; 3],
     opacity: f32, center: [f32; 3], scale: [f32; 3], quat: [f32; 4],
+    sigma: Option<f32>,
 ) -> Option<f32> {
     let origin = vec3_sub(origin, center);
     let inv_quat = [-quat[0], -quat[1], -quat[2], quat[3]];
@@ -58,7 +68,7 @@ fn raycast_ellipsoid(
     let local_origin = quat_vec(inv_quat, origin);
     let local_dir = quat_vec(inv_quat, dir);
 
-    let rescale = opacity.max(1.0) * 4.0 - 3.0;
+    let rescale = (opacity.max(1.0) * 4.0 - 3.0) * sigma.unwrap_or(1.0);
     let scale = scale.map(|s| s * rescale);
 
     let min_scale = scale[0].max(scale[1]).max(scale[2]) * 0.01;
@@ -98,6 +108,17 @@ fn raycast_ellipsoid(
             return None;
         }
         Some(t)
+    } else if sigma.is_some() {
+        let o: [f64; 3] = array::from_fn(|i| local_origin[i] as f64 / scale[i] as f64);
+        let d: [f64; 3] = array::from_fn(|i| local_dir[i] as f64 / scale[i] as f64);
+        let a = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+        let b = o[0] * d[0] + o[1] * d[1] + o[2] * d[2];
+        let cross = [o[1] * d[2] - o[2] * d[1], o[2] * d[0] - o[0] * d[2], o[0] * d[1] - o[1] * d[0]];
+        let discriminant = a - (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]);
+        if discriminant < 0.0 {
+            return None;
+        }
+        Some(((-b - discriminant.sqrt()) / a) as f32)
     } else {
         let inv_scale = [1.0 / scale[0], 1.0 / scale[1], 1.0 / scale[2]];
         let local_origin = vec3_mul(local_origin, inv_scale);

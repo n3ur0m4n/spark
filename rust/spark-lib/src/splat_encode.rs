@@ -485,9 +485,14 @@ pub fn encode_lod_tree(buffer: &mut [u32], center: &[f32], opacity: f32, scale: 
         1.0 + 0.7 * (a - 1.0)
     };
     let size = f16::from_f32(2.0 * expansion * avg_scale);
+    // Largest semi-axis of the raycast ellipsoid (scale * LoD opacity rescale),
+    // rounded up so it stays a bound, in the otherwise unused high bits of word 2
+    let extent = scale[0].max(scale[1]).max(scale[2]) * (opacity.max(1.0) * 4.0 - 3.0);
+    let extent16 = f16::from_f32(extent);
+    let extent16 = if extent16.to_f32() < extent { f16::from_bits(extent16.to_bits() + 1) } else { extent16 };
     buffer[0] = (center[0].to_bits() as u32) | ((center[1].to_bits() as u32) << 16);
     buffer[1] = (center[2].to_bits() as u32) | ((size.to_bits() as u32) << 16);
-    buffer[2] = child_count as u32;
+    buffer[2] = child_count as u32 | ((extent16.to_bits() as u32) << 16);
     buffer[3] = child_start;
 }
 
