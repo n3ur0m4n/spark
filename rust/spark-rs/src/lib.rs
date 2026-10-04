@@ -607,6 +607,37 @@ pub fn raycast_packed_buffer(
     count: u32,
     ln_scale_min: f32, ln_scale_max: f32, lod_opacity: bool,
 ) -> Float32Array {
+    raycast_packed_buffer_sigma(
+        [origin_x, origin_y, origin_z], [dir_x, dir_y, dir_z],
+        min_opacity, near, far, count, ln_scale_min, ln_scale_max, lod_opacity, None,
+    )
+}
+
+/// Same as raycast_packed_buffer, with ellipsoid semi-axes scaled by `sigma`
+/// and a precision-safe ellipsoid test (see raycast::raycast_ellipsoid).
+#[wasm_bindgen]
+pub fn raycast_packed_buffer_robust(
+    origin_x: f32, origin_y: f32, origin_z: f32,
+    dir_x: f32, dir_y: f32, dir_z: f32,
+    min_opacity: f32, near: f32, far: f32,
+    count: u32,
+    ln_scale_min: f32, ln_scale_max: f32, lod_opacity: bool,
+    sigma: f32,
+) -> Float32Array {
+    raycast_packed_buffer_sigma(
+        [origin_x, origin_y, origin_z], [dir_x, dir_y, dir_z],
+        min_opacity, near, far, count, ln_scale_min, ln_scale_max, lod_opacity, Some(sigma),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn raycast_packed_buffer_sigma(
+    origin: [f32; 3], dir: [f32; 3],
+    min_opacity: f32, near: f32, far: f32,
+    count: u32,
+    ln_scale_min: f32, ln_scale_max: f32, lod_opacity: bool,
+    sigma: Option<f32>,
+) -> Float32Array {
     RAYCAST_BUFFERS.with_borrow_mut(|(buffer, _, distances)| {
         let encoding = SplatEncoding {
             ln_scale_min,
@@ -619,8 +650,8 @@ pub fn raycast_packed_buffer(
         let subbuffer = &buffer[0..(4 * count as usize)];
         raycast_packed_ellipsoids(
             subbuffer, distances,
-            [origin_x, origin_y, origin_z], [dir_x, dir_y, dir_z],
-            min_opacity, near, far, &encoding,
+            origin, dir,
+            min_opacity, near, far, &encoding, sigma,
         );
 
         unsafe { Float32Array::view(distances) }
@@ -634,14 +665,42 @@ pub fn raycast_ext_buffers(
     min_opacity: f32, near: f32, far: f32,
     count: u32,
 ) -> Float32Array {
+    raycast_ext_buffers_sigma(
+        [origin_x, origin_y, origin_z], [dir_x, dir_y, dir_z],
+        min_opacity, near, far, count, None,
+    )
+}
+
+/// Same as raycast_ext_buffers, with ellipsoid semi-axes scaled by `sigma`
+/// and a precision-safe ellipsoid test (see raycast::raycast_ellipsoid).
+#[wasm_bindgen]
+pub fn raycast_ext_buffers_robust(
+    origin_x: f32, origin_y: f32, origin_z: f32,
+    dir_x: f32, dir_y: f32, dir_z: f32,
+    min_opacity: f32, near: f32, far: f32,
+    count: u32,
+    sigma: f32,
+) -> Float32Array {
+    raycast_ext_buffers_sigma(
+        [origin_x, origin_y, origin_z], [dir_x, dir_y, dir_z],
+        min_opacity, near, far, count, Some(sigma),
+    )
+}
+
+fn raycast_ext_buffers_sigma(
+    origin: [f32; 3], dir: [f32; 3],
+    min_opacity: f32, near: f32, far: f32,
+    count: u32,
+    sigma: Option<f32>,
+) -> Float32Array {
     RAYCAST_BUFFERS.with_borrow_mut(|(buffer, buffer2, distances)| {
         distances.clear();
         let subbuffer = &buffer[0..(4 * count as usize)];
         let subbuffer2 = &buffer2[0..(4 * count as usize)];
         raycast_ext_ellipsoids(
             subbuffer, subbuffer2, distances,
-            [origin_x, origin_y, origin_z], [dir_x, dir_y, dir_z],
-            min_opacity, near, far,
+            origin, dir,
+            min_opacity, near, far, sigma,
         );
 
         unsafe { Float32Array::view(distances) }
@@ -675,7 +734,7 @@ pub fn raycast_packed_splats(
             raycast_packed_ellipsoids(
                 subbuffer, &mut distances,
                 [origin_x, origin_y, origin_z], [dir_x, dir_y, dir_z],
-                min_opacity, near, far, &encoding,
+                min_opacity, near, far, &encoding, None,
             );
 
             base += chunk_size;

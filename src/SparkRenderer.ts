@@ -20,6 +20,7 @@ import {
   isVisionPro,
   uploadU32DataTextureRows,
 } from "./utils";
+import * as wasm from "./wasm";
 
 export interface SparkRendererOptions {
   /**
@@ -2177,6 +2178,106 @@ export class SparkRenderer extends THREE.Mesh {
     throw new Error(
       "Only LoD-enabled PackedSplats and ExtSplats are supported",
     );
+  }
+
+  /**
+   * Raycast a SplatMesh against its LoD tree, down to the finest level that is
+   * currently resident, instead of the coarse cut tested by SplatMesh.raycast().
+   * Resolves to the closest intersection (all of them with closestOnly: false),
+   * using a precision-safe ellipsoid test with semi-axes scaled by `sigma`
+   * (default 1, the SplatMesh.raycast() criterion; at most 2).
+   * With closestOnly: false the walk is capped at 65536 candidate nodes.
+   * Falls back to SplatMesh.raycast() for meshes without a LoD tree here.
+   */
+  async raycastAsync(
+    mesh: SplatMesh,
+    raycaster: THREE.Raycaster,
+    {
+      closestOnly = true,
+      sigma = 1,
+      signal,
+    }: { closestOnly?: boolean; sigma?: number; signal?: AbortSignal } = {},
+  ): Promise<THREE.Intersection[]> {
+    const toIntersections = (distances: number[]) =>
+      distances
+        .sort((a, b) => a - b)
+        .slice(0, closestOnly ? 1 : distances.length)
+        .map((distance) => ({
+          distance,
+          point: raycaster.ray.at(distance, new THREE.Vector3()),
+          object: mesh,
+        }));
+
+    const splats =
+      mesh.packedSplats?.lodSplats ?? mesh.extSplats?.lodSplats ?? mesh.paged;
+    const worldToMesh = mesh.matrixWorld.clone().invert();
+    const origin = raycaster.ray.origin.clone().applyMatrix4(worldToMesh);
+    const direction = raycaster.ray.direction
+      .clone()
+      .applyMatrix3(new THREE.Matrix3().setFromMatrix4(worldToMesh));
+    // Covering radii in the LoD worker bound ellipsoids up to 2 sigma
+    const raySigma = Math.min(sigma, 2);
+    // One raycast buffer of candidates per call
+    const maxCandidatesLimit = 65536;
+
+    let far = raycaster.far;
+    let closest = Number.POSITIVE_INFINITY;
+    // ponytail: a retry restarts the walk (8x more candidates, far clamped to the
+    // closest hit so far) instead of resuming it; resumable walk if this shows up.
+    for (let maxCandidates = 64; ; ) {
+      signal?.throwIfAborted();
+      const result =
+        splats &&
+        mesh.raycastable &&
+        wasm.isInitialized() &&
+        this.lodIds.has(splats)
+          ? await this.ensureLodWorker().exclusive(async (worker) => {
+              const record = this.lodIds.get(splats);
+              if (!record || (mesh.paged && record.rootPage === undefined)) {
+                return null;
+              }
+              const { nodes, nextDistance } = await worker.call(
+                "raycastLodTree",
+                {
+                  lodId: record.lodId,
+                  rootPage: record.rootPage,
+                  origin: origin.toArray(),
+                  direction: direction.toArray(),
+                  near: raycaster.near,
+                  far,
+                  maxCandidates,
+                },
+              );
+              const hits = mesh.raycastLodNodes(raycaster, nodes, raySigma);
+              return { hits, nextDistance };
+            })
+          : null;
+      signal?.throwIfAborted();
+
+      if (!result) {
+        const intersects: Parameters<SplatMesh["raycast"]>[1] = [];
+        mesh.raycast(raycaster, intersects);
+        return toIntersections(intersects.map(({ distance }) => distance));
+      }
+
+      const { hits, nextDistance } = result;
+      for (const hit of hits) {
+        closest = Math.min(closest, hit);
+      }
+      if (
+        nextDistance === Number.POSITIVE_INFINITY ||
+        (closestOnly && closest <= nextDistance) ||
+        maxCandidates === maxCandidatesLimit
+      ) {
+        return closestOnly
+          ? toIntersections(Number.isFinite(closest) ? [closest] : [])
+          : toIntersections(hits);
+      }
+      if (closestOnly) {
+        far = Math.min(far, closest);
+      }
+      maxCandidates = Math.min(maxCandidates * 8, maxCandidatesLimit);
+    }
   }
 
   get premultipliedAlpha(): boolean {

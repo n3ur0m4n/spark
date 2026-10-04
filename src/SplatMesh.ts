@@ -4,7 +4,9 @@ import {
   get_raycast_buffer,
   get_raycast_buffer2,
   raycast_ext_buffers,
+  raycast_ext_buffers_robust,
   raycast_packed_buffer,
+  raycast_packed_buffer_robust,
 } from "spark-rs";
 import { ExtSplats } from "./ExtSplats";
 import { PackedSplats } from "./PackedSplats";
@@ -1183,6 +1185,103 @@ export class SplatMesh extends SplatGenerator {
         object: this,
       });
     }
+  }
+
+  // Precision-safe ray test of LoD tree nodes for SparkRenderer.raycastAsync().
+  // Returns hit distances along raycaster.ray. Paged nodes are resolved through
+  // the pager's current chunk -> page map and skipped when their chunk is not
+  // (yet) in the CPU copy of the pages. At most get_raycast_buffer().length / 4
+  // nodes per call.
+  raycastLodNodes(
+    raycaster: THREE.Raycaster,
+    nodes: Uint32Array,
+    sigma: number,
+  ): number[] {
+    const paged = this.paged;
+    const pager = paged?.pager;
+    const ext = paged ? (pager?.extSplats ?? false) : this.extSplats != null;
+    const src1 = (
+      paged
+        ? pager?.packedTexture.value.image.data
+        : ext
+          ? this.extSplats?.lodSplats?.extArrays[0]
+          : this.packedSplats?.lodSplats?.packedArray
+    ) as Uint32Array | undefined;
+    const src2 = (
+      paged
+        ? pager?.extTexture.value.image.data
+        : this.extSplats?.lodSplats?.extArrays[1]
+    ) as Uint32Array | undefined;
+    if (!src1 || (ext && !src2)) {
+      return [];
+    }
+
+    const buffer = get_raycast_buffer();
+    const buffer2 = get_raycast_buffer2();
+    let count = 0;
+    for (const node of nodes) {
+      let index = node;
+      if (paged && pager) {
+        const page = pager.getSplatsChunk(paged, node >>> 16)?.page;
+        if (page === undefined || !pager.isPageUploaded(page)) {
+          continue;
+        }
+        index = (page << 16) | (node & 0xffff);
+      }
+      for (let j = 0; j < 4; ++j) {
+        buffer[count * 4 + j] = src1[index * 4 + j];
+        if (ext && src2) {
+          buffer2[count * 4 + j] = src2[index * 4 + j];
+        }
+      }
+      count += 1;
+    }
+
+    const { near, far, ray } = raycaster;
+    const worldToMesh = this.matrixWorld.clone().invert();
+    const worldToMeshRot = new THREE.Matrix3().setFromMatrix4(worldToMesh);
+    const origin = ray.origin.clone().applyMatrix4(worldToMesh);
+    const direction = ray.direction.clone().applyMatrix3(worldToMeshRot);
+    const opacity = this.minRaycastOpacity;
+    if (ext) {
+      return Array.from(
+        raycast_ext_buffers_robust(
+          origin.x,
+          origin.y,
+          origin.z,
+          direction.x,
+          direction.y,
+          direction.z,
+          opacity,
+          near,
+          far,
+          count,
+          sigma,
+        ),
+      );
+    }
+    const encoding =
+      (paged
+        ? paged.splatEncoding
+        : this.packedSplats?.lodSplats?.splatEncoding) ?? DEFAULT_SPLAT_ENCODING;
+    return Array.from(
+      raycast_packed_buffer_robust(
+        origin.x,
+        origin.y,
+        origin.z,
+        direction.x,
+        direction.y,
+        direction.z,
+        opacity,
+        near,
+        far,
+        count,
+        encoding.lnScaleMin,
+        encoding.lnScaleMax,
+        encoding.lodOpacity,
+        sigma,
+      ),
+    );
   }
 
   static raycastBuffer = new Float32Array(1024);

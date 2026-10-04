@@ -18,6 +18,7 @@ import init_wasm, {
   tiny_lod_extsplats,
   bhatt_lod_extsplats,
   get_lod_tree_level,
+  raycast_lod_tree,
 } from "spark-rs";
 import type { ExtResult, PackedResult, SplatEncoding } from "./defines";
 
@@ -37,6 +38,7 @@ const rpcHandlers = {
   updateLodTrees,
   traverseLodTrees,
   getLodTreeLevel,
+  raycastLodTree,
   nextChunk,
 };
 export type rpcHandlers = typeof rpcHandlers;
@@ -818,6 +820,34 @@ function getLodTreeLevel({
   level: number;
 }) {
   return get_lod_tree_level(lodId, level) as { indices: Uint32Array };
+}
+
+function raycastLodTree({
+  lodId,
+  rootPage,
+  origin,
+  direction,
+  near,
+  far,
+  maxCandidates,
+}: {
+  lodId: number;
+  rootPage?: number;
+  origin: number[];
+  direction: number[];
+  near: number;
+  far: number;
+  maxCandidates: number;
+}) {
+  return raycast_lod_tree(
+    lodId,
+    rootPage ?? 0xffffffff,
+    new Float64Array(origin),
+    new Float64Array(direction),
+    near,
+    far,
+    maxCandidates,
+  ) as { nodes: Uint32Array; nextDistance: number };
 }
 
 let nextChunkWaiter = (_chunk: Uint8Array) => {};
