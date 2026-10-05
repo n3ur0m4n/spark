@@ -192,7 +192,7 @@ mod tests {
         let quat = [0.0_f32, 0.0, 0.0, 1.0]; // identity rotation
         let opacity = 1.0_f32;
 
-        let hit = raycast_ellipsoid(origin, dir, opacity, center, scale, quat);
+        let hit = raycast_ellipsoid(origin, dir, opacity, center, scale, quat, None);
         assert!(hit.is_some(), "expected a hit on a tiny distant splat aimed at its center");
 
         let t = hit.unwrap();

@@ -1263,7 +1263,8 @@ export class SplatMesh extends SplatGenerator {
     const encoding =
       (paged
         ? paged.splatEncoding
-        : this.packedSplats?.lodSplats?.splatEncoding) ?? DEFAULT_SPLAT_ENCODING;
+        : this.packedSplats?.lodSplats?.splatEncoding) ??
+      DEFAULT_SPLAT_ENCODING;
     return Array.from(
       raycast_packed_buffer_robust(
         origin.x,

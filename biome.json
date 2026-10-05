@@ -22,7 +22,8 @@
       "examples/**/pkg",
       "test-results",
       "playwright-report",
-      "coverage"
+      "coverage",
+      "bench"
     ]
   },
   "formatter": {
