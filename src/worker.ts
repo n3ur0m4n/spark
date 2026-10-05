@@ -19,6 +19,7 @@ import init_wasm, {
   bhatt_lod_extsplats,
   get_lod_tree_level,
   raycast_lod_tree,
+  set_lod_radii,
 } from "spark-rs";
 import type { ExtResult, PackedResult, SplatEncoding } from "./defines";
 
@@ -39,6 +40,7 @@ const rpcHandlers = {
   traverseLodTrees,
   getLodTreeLevel,
   raycastLodTree,
+  setLodRadii,
   nextChunk,
 };
 export type rpcHandlers = typeof rpcHandlers;
@@ -677,6 +679,10 @@ function initLodTree({
     chunkToPage: Uint32Array;
   };
   return { lodId, chunkToPage };
+}
+
+function setLodRadii({ enabled }: { enabled: boolean }) {
+  set_lod_radii(enabled);
 }
 
 function disposeLodTree({ lodId }: { lodId: number }) {

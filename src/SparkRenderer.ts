@@ -21,6 +21,7 @@ import {
   uploadU32DataTextureRows,
 } from "./utils";
 import * as wasm from "./wasm";
+import type { rpcHandlers } from "./worker";
 
 export interface SparkRendererOptions {
   /**
@@ -412,6 +413,17 @@ export class SparkRenderer extends THREE.Mesh {
   lastLodRaycastTime = 0;
 
   lodWorker: SplatWorker | null = null;
+  // Raycast-only copy of the LoD trees (raycastAsync), so picks never queue
+  // behind traversals. Gets every tree create/update/dispose of lodWorker, with
+  // copied buffers and in the same order, so both assign the same lodIds.
+  pickWorker: SplatWorker | null = null;
+  // raycastPickWorker() state: one request in flight, FIFO of waiting ones,
+  // latest raycastAsync() generation per coalesce key
+  private pickBusy = false;
+  private pickQueue: { key?: string; go: (go: boolean) => void }[] = [];
+  private pickCounter = 0;
+  private pickLatest = new Map<string, number>();
+  private disposed = false;
   lodMeshes: { mesh: SplatMesh; version: number }[] = [];
   lodDirty = false;
   lodIds: Map<
@@ -692,6 +704,15 @@ export class SparkRenderer extends THREE.Mesh {
     // @ts-ignore Object3D has a dispose method in Three.js >= r186
     super.dispose?.();
 
+    // No worker is created again: pending picks abort, later ones reject
+    this.disposed = true;
+    const queue = this.pickQueue;
+    this.pickQueue = [];
+    for (const { go } of queue) go(false);
+    this.pickLatest.clear();
+    this.lodIds.clear();
+    this.lodIdToSplats.clear();
+
     if (this.updateTimeoutId !== undefined) {
       clearTimeout(this.updateTimeoutId);
       this.updateTimeoutId = undefined;
@@ -740,6 +761,10 @@ export class SparkRenderer extends THREE.Mesh {
     if (this.lodWorker) {
       this.lodWorker.dispose();
       this.lodWorker = null;
+    }
+    if (this.pickWorker) {
+      this.pickWorker.dispose();
+      this.pickWorker = null;
     }
     if (this.pager) {
       this.pager.dispose();
@@ -1169,10 +1194,41 @@ export class SparkRenderer extends THREE.Mesh {
   }
 
   private ensureLodWorker() {
+    if (this.disposed) {
+      throw new DOMException("SparkRenderer disposed", "AbortError");
+    }
     if (!this.lodWorker) {
       this.lodWorker = new SplatWorker();
+      this.pickWorker = new SplatWorker();
+      // Queued before any tree message: only the pick worker computes radii
+      this.callPickWorker("setLodRadii", { enabled: true });
     }
     return this.lodWorker;
+  }
+
+  /**
+   * Mirror a LoD tree message to the pick worker. Call it right before the
+   * matching lodWorker call, in the same tick, with copies of any buffers
+   * (lodWorker takes ownership of its own), so the two FIFOs stay in step.
+   */
+  private callPickWorker<T extends keyof rpcHandlers>(
+    name: T,
+    args: Parameters<rpcHandlers[T]>[0],
+    lodId?: Promise<{ lodId: number }>,
+  ) {
+    const pick = this.pickWorker?.call(name, args);
+    if (!pick) return;
+    Promise.all([pick, lodId]).then(
+      ([pickResult, lodResult]) => {
+        const pickLodId = (pickResult as { lodId?: number } | undefined)?.lodId;
+        if (lodResult && pickLodId !== lodResult.lodId) {
+          console.error(
+            `pick worker lodId ${pickLodId} != ${lodResult.lodId} (${name})`,
+          );
+        }
+      },
+      (error) => console.error(`pick worker ${name}:`, error),
+    );
   }
 
   defaultSplatTarget() {
@@ -1196,6 +1252,7 @@ export class SparkRenderer extends THREE.Mesh {
     camera: THREE.Camera;
     scene: THREE.Scene;
   }) {
+    if (this.disposed) return;
     const defaultSplatCount = this.defaultSplatTarget();
     const splatCount = this.lodSplatCount ?? defaultSplatCount;
     const maxSplats = splatCount * this.lodSplatScale;
@@ -1351,9 +1408,10 @@ export class SparkRenderer extends THREE.Mesh {
         onUpdate: () => this.setDirty(),
       });
 
-      const { lodId } = await worker.call("newLodTree", {
-        capacity: this.pager.maxSplats,
-      });
+      const args = { capacity: this.pager.maxSplats };
+      const call = worker.call("newLodTree", args);
+      this.callPickWorker("newLodTree", args, call);
+      const { lodId } = await call;
       this.pagerId = lodId;
     }
 
@@ -1408,6 +1466,12 @@ export class SparkRenderer extends THREE.Mesh {
     if (this.lodUpdates.length > 0) {
       const lodUpdates = this.lodUpdates;
       this.lodUpdates = [];
+      this.callPickWorker("updateLodTrees", {
+        ranges: lodUpdates.map((range) => ({
+          ...range,
+          lodTreeData: range.lodTreeData?.slice(),
+        })),
+      });
       await worker.call("updateLodTrees", { ranges: lodUpdates });
       this.lodDirty = true;
     }
@@ -1456,17 +1520,26 @@ export class SparkRenderer extends THREE.Mesh {
     splats: PackedSplats | ExtSplats | PagedSplats,
   ) {
     if (splats instanceof PackedSplats || splats instanceof ExtSplats) {
-      const { lodId } = await worker.call("initLodTree", {
-        numSplats: splats.numSplats ?? 0,
-        lodTree: (splats.extra.lodTree as Uint32Array).slice(),
+      const lodTree = splats.extra.lodTree as Uint32Array;
+      const numSplats = splats.numSplats ?? 0;
+      const call = worker.call("initLodTree", {
+        numSplats,
+        lodTree: lodTree.slice(),
       });
+      this.callPickWorker(
+        "initLodTree",
+        { numSplats, lodTree: lodTree.slice() },
+        call,
+      );
+      const { lodId } = await call;
       this.lodIds.set(splats, { lodId, lastTouched: performance.now() });
       this.lodIdToSplats.set(lodId, splats);
       // console.log("*** initLodTree", lodId, splats.extra.lodTree, splats);
     } else {
-      const { lodId } = await worker.call("newSharedLodTree", {
-        lodId: this.pagerId,
-      });
+      const args = { lodId: this.pagerId };
+      const call = worker.call("newSharedLodTree", args);
+      this.callPickWorker("newSharedLodTree", args, call);
+      const { lodId } = await call;
       this.lodIds.set(splats, { lodId, lastTouched: performance.now() });
       this.lodIdToSplats.set(lodId, splats);
       // console.log("*** newSharedLodTree", lodId, this.pagerId, splats);
@@ -1685,6 +1758,7 @@ export class SparkRenderer extends THREE.Mesh {
     }
 
     for (const { lodId } of expired) {
+      this.callPickWorker("disposeLodTree", { lodId });
       await worker.call("disposeLodTree", { lodId });
     }
   }
@@ -2188,16 +2262,41 @@ export class SparkRenderer extends THREE.Mesh {
    * (default 1, the SplatMesh.raycast() criterion; at most 2).
    * With closestOnly: false the walk is capped at 65536 candidate nodes.
    * Falls back to SplatMesh.raycast() for meshes without a LoD tree here.
+   * Requests are never dropped unless `coalesce` is set: then a newer request
+   * with the same key (the string, or mesh.uuid for true) supersedes this one,
+   * which rejects with an AbortError DOMException. Rejects likewise after
+   * dispose().
    */
   async raycastAsync(
     mesh: SplatMesh,
-    raycaster: THREE.Raycaster,
+    liveRaycaster: THREE.Raycaster,
     {
       closestOnly = true,
       sigma = 1,
       signal,
-    }: { closestOnly?: boolean; sigma?: number; signal?: AbortSignal } = {},
+      coalesce,
+    }: {
+      closestOnly?: boolean;
+      sigma?: number;
+      signal?: AbortSignal;
+      coalesce?: string | boolean;
+    } = {},
   ): Promise<THREE.Intersection[]> {
+    if (this.disposed) {
+      throw new DOMException("SparkRenderer disposed", "AbortError");
+    }
+    // Callers reuse and move their raycaster while we await: snapshot it
+    const raycaster = Object.assign(new THREE.Raycaster(), liveRaycaster, {
+      ray: liveRaycaster.ray.clone(),
+    });
+    const key =
+      coalesce === true
+        ? mesh.uuid
+        : typeof coalesce === "string"
+          ? coalesce
+          : undefined;
+    const generation = ++this.pickCounter;
+    if (key !== undefined) this.pickLatest.set(key, generation);
     const toIntersections = (distances: number[]) =>
       distances
         .sort((a, b) => a - b)
@@ -2231,26 +2330,30 @@ export class SparkRenderer extends THREE.Mesh {
         mesh.raycastable &&
         wasm.isInitialized() &&
         this.lodIds.has(splats)
-          ? await this.ensureLodWorker().exclusive(async (worker) => {
-              const record = this.lodIds.get(splats);
-              if (!record || (mesh.paged && record.rootPage === undefined)) {
-                return null;
-              }
-              const { nodes, nextDistance } = await worker.call(
-                "raycastLodTree",
-                {
-                  lodId: record.lodId,
-                  rootPage: record.rootPage,
-                  origin: origin.toArray(),
-                  direction: direction.toArray(),
-                  near: raycaster.near,
-                  far,
-                  maxCandidates,
-                },
-              );
-              const hits = mesh.raycastLodNodes(raycaster, nodes, raySigma);
-              return { hits, nextDistance };
-            })
+          ? await this.raycastPickWorker(
+              splats,
+              mesh,
+              {
+                origin: origin.toArray(),
+                direction: direction.toArray(),
+                near: raycaster.near,
+                far,
+                maxCandidates,
+              },
+              key,
+              generation,
+            ).then((result) =>
+              !result
+                ? result
+                : {
+                    hits: mesh.raycastLodNodes(
+                      raycaster,
+                      result.nodes,
+                      raySigma,
+                    ),
+                    nextDistance: result.nextDistance,
+                  },
+            )
           : null;
       signal?.throwIfAborted();
 
@@ -2277,6 +2380,75 @@ export class SparkRenderer extends THREE.Mesh {
         far = Math.min(far, closest);
       }
       maxCandidates = Math.min(maxCandidates * 8, maxCandidatesLimit);
+    }
+  }
+
+  /**
+   * One raycastLodTree on the pick worker, at most one in flight, the others
+   * waiting in FIFO order. A request with a coalesce `key` replaces the waiting
+   * request with the same key (latest wins), so a burst of hovers never piles
+   * up, and requests of a superseded raycastAsync() `generation` stop at their
+   * next round trip: both reject with an AbortError, as do waiting requests on
+   * dispose(). Requests without a key are never dropped.
+   * No lock needed for the tree state: record (rootPage) is
+   * read and the message posted in the same tick, and every tree update or
+   * disposal is mirrored to the pick worker in the same tick it changes lodIds,
+   * so its FIFO always holds the tree state this record describes.
+   */
+  private async raycastPickWorker(
+    splats: PackedSplats | ExtSplats | PagedSplats,
+    mesh: SplatMesh,
+    ray: Omit<
+      Parameters<rpcHandlers["raycastLodTree"]>[0],
+      "lodId" | "rootPage"
+    >,
+    key: string | undefined,
+    generation: number,
+  ) {
+    const superseded = () => new DOMException("Pick superseded", "AbortError");
+    if (this.pickBusy) {
+      const index =
+        key === undefined
+          ? -1
+          : this.pickQueue.findIndex((queued) => queued.key === key);
+      if (index >= 0) this.pickQueue.splice(index, 1)[0].go(false);
+      const go = await new Promise<boolean>((resolve) => {
+        this.pickQueue.push({ key, go: resolve });
+      });
+      // On go the finishing request handed its slot over: pickBusy stayed true
+      if (!go) throw superseded();
+    }
+    this.pickBusy = true;
+    try {
+      if (this.disposed) {
+        throw new DOMException("SparkRenderer disposed", "AbortError");
+      }
+      if (key !== undefined && this.pickLatest.get(key) !== generation) {
+        throw superseded();
+      }
+      this.ensureLodWorker();
+      const record = this.lodIds.get(splats);
+      if (
+        !this.pickWorker ||
+        !record ||
+        (mesh.paged && record.rootPage === undefined)
+      ) {
+        return null;
+      }
+      return await this.pickWorker.call("raycastLodTree", {
+        ...ray,
+        lodId: record.lodId,
+        rootPage: record.rootPage,
+      });
+    } catch (error) {
+      // dispose() terminated the worker under the in-flight request
+      throw this.disposed
+        ? new DOMException("SparkRenderer disposed", "AbortError")
+        : error;
+    } finally {
+      const next = this.pickQueue.shift();
+      if (next) next.go(true);
+      else this.pickBusy = false;
     }
   }
 

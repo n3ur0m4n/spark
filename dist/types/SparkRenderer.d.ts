@@ -372,6 +372,12 @@ export declare class SparkRenderer extends THREE.Mesh {
     lodRaycastIntervalMs: number;
     lastLodRaycastTime: number;
     lodWorker: SplatWorker | null;
+    pickWorker: SplatWorker | null;
+    private pickBusy;
+    private pickQueue;
+    private pickCounter;
+    private pickLatest;
+    private disposed;
     lodMeshes: {
         mesh: SplatMesh;
         version: number;
@@ -531,6 +537,12 @@ export declare class SparkRenderer extends THREE.Mesh {
     private updateInternal;
     private driveSort;
     private ensureLodWorker;
+    /**
+     * Mirror a LoD tree message to the pick worker. Call it right before the
+     * matching lodWorker call, in the same tick, with copies of any buffers
+     * (lodWorker takes ownership of its own), so the two FIFOs stay in step.
+     */
+    private callPickWorker;
     defaultSplatTarget(): 500000 | 750000 | 1000000 | 1500000 | 2500000;
     private driveLod;
     /** Body of the LoD update, run with exclusive access to the LoD worker. */
@@ -578,6 +590,38 @@ export declare class SparkRenderer extends THREE.Mesh {
     }): Promise<THREE.Texture>;
     recurseSetEnvMap(root: THREE.Object3D, envMap: THREE.Texture): void;
     getLodTreeLevel(splats: SplatMesh, level: number, pageColoring?: boolean): Promise<SplatMesh | null>;
+    /**
+     * Raycast a SplatMesh against its LoD tree, down to the finest level that is
+     * currently resident, instead of the coarse cut tested by SplatMesh.raycast().
+     * Resolves to the closest intersection (all of them with closestOnly: false),
+     * using a precision-safe ellipsoid test with semi-axes scaled by `sigma`
+     * (default 1, the SplatMesh.raycast() criterion; at most 2).
+     * With closestOnly: false the walk is capped at 65536 candidate nodes.
+     * Falls back to SplatMesh.raycast() for meshes without a LoD tree here.
+     * Requests are never dropped unless `coalesce` is set: then a newer request
+     * with the same key (the string, or mesh.uuid for true) supersedes this one,
+     * which rejects with an AbortError DOMException. Rejects likewise after
+     * dispose().
+     */
+    raycastAsync(mesh: SplatMesh, liveRaycaster: THREE.Raycaster, { closestOnly, sigma, signal, coalesce, }?: {
+        closestOnly?: boolean;
+        sigma?: number;
+        signal?: AbortSignal;
+        coalesce?: string | boolean;
+    }): Promise<THREE.Intersection[]>;
+    /**
+     * One raycastLodTree on the pick worker, at most one in flight, the others
+     * waiting in FIFO order. A request with a coalesce `key` replaces the waiting
+     * request with the same key (latest wins), so a burst of hovers never piles
+     * up, and requests of a superseded raycastAsync() `generation` stop at their
+     * next round trip: both reject with an AbortError, as do waiting requests on
+     * dispose(). Requests without a key are never dropped.
+     * No lock needed for the tree state: record (rootPage) is
+     * read and the message posted in the same tick, and every tree update or
+     * disposal is mirrored to the pick worker in the same tick it changes lodIds,
+     * so its FIFO always holds the tree state this record describes.
+     */
+    private raycastPickWorker;
     get premultipliedAlpha(): boolean;
     set premultipliedAlpha(value: boolean);
 }

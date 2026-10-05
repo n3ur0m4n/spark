@@ -124,6 +124,7 @@ export declare class SplatPager {
     dispose(): void;
     private ensureShTextures;
     private allocatePage;
+    isPageUploaded(page: number): boolean;
     getSplatsChunk(splats: PagedSplats, chunk: number): {
         page: number;
         lru: number;

@@ -15,6 +15,8 @@ declare const rpcHandlers: {
     updateLodTrees: typeof updateLodTrees;
     traverseLodTrees: typeof traverseLodTrees;
     getLodTreeLevel: typeof getLodTreeLevel;
+    raycastLodTree: typeof raycastLodTree;
+    setLodRadii: typeof setLodRadii;
     nextChunk: typeof nextChunk;
 };
 export type rpcHandlers = typeof rpcHandlers;
@@ -128,6 +130,9 @@ declare function initLodTree({ numSplats, lodTree, }: {
     lodId: number;
     chunkToPage: Uint32Array<ArrayBufferLike>;
 };
+declare function setLodRadii({ enabled }: {
+    enabled: boolean;
+}): void;
 declare function disposeLodTree({ lodId }: {
     lodId: number;
 }): void;
@@ -170,6 +175,18 @@ declare function getLodTreeLevel({ lodId, level, }: {
     level: number;
 }): {
     indices: Uint32Array;
+};
+declare function raycastLodTree({ lodId, rootPage, origin, direction, near, far, maxCandidates, }: {
+    lodId: number;
+    rootPage?: number;
+    origin: number[];
+    direction: number[];
+    near: number;
+    far: number;
+    maxCandidates: number;
+}): {
+    nodes: Uint32Array;
+    nextDistance: number;
 };
 declare function nextChunk({ chunk }: {
     chunk: Uint8Array;

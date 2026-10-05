@@ -173,12 +173,20 @@ struct LodTree {
     splats: Rc<RefCell<Vec<LodSplat>>>,
     page_to_chunk: Vec<u32>,
     chunk_to_page: Vec<u32>,
-    // chunk -> chunks holding parents of its nodes, for paged radius updates
-    chunk_parents: Vec<Vec<u32>>,
+    // tree index -> parent tree index (0xFFFFFFFF unknown), for paged radius
+    // updates: an arrival recomputes only the ancestors of its nodes
+    parents: Vec<u32>,
+    // chunks arrived since the last radii flush, see flush_dirty_radii()
+    dirty_chunks: Vec<u32>,
+    // flush_dirty_radii() scratch, kept so updates do not allocate
+    dirty_nodes: BinaryHeap<u32>,
 }
 
 struct LodState {
     next_id: u32,
+    // Raycast radii are maintained only where enabled by set_lod_radii() (the
+    // pick worker); the traversal-only LoD worker skips their cost entirely.
+    radii: bool,
     lod_trees: AHashMap<u32, LodTree>,
     frontier: Frontier<(OrderedFloat<f32>, u32, u32)>,
     output: Vec<(u32, u32)>,
@@ -191,6 +199,7 @@ impl LodState {
     fn new() -> Self {
         Self {
             next_id: 1000,
+            radii: false,
             lod_trees: AHashMap::new(),
             frontier: Frontier::new(),
             output: Vec::new(),
@@ -283,14 +292,24 @@ pub fn init_lod_tree(num_splats: u32, lod_tree: Uint32Array) -> Result<Object, J
         state.next_id += 1;
 
         set_lod_tree_data(state, lod_id, 0, 0, num_splats, &lod_tree);
-        let LodTree { splats, chunk_to_page, .. } = &state.lod_trees[&lod_id];
-        update_radii(&mut splats.borrow_mut(), chunk_to_page, 0, num_splats);
+        if state.radii {
+            let LodTree { splats, chunk_to_page, .. } = &state.lod_trees[&lod_id];
+            update_radii(&mut splats.borrow_mut(), chunk_to_page, 0, num_splats);
+        }
 
         let result = Object::new();
         Reflect::set(&result, &JsValue::from_str("lodId"), &JsValue::from(lod_id)).unwrap();
 
         Ok(result)
     })
+}
+
+/// Enable raycast covering radii in this worker: computed for trees created
+/// afterwards, and eagerly after every update_lod_trees(). Call before any tree
+/// is created; raycast_lod_tree() requires it.
+#[wasm_bindgen]
+pub fn set_lod_radii(enabled: bool) {
+    STATE.with_borrow_mut(|state| state.radii = enabled)
 }
 
 #[wasm_bindgen]
@@ -329,9 +348,13 @@ pub fn update_lod_trees(lod_ids: &[u32], page_bases: &[u32], chunk_bases: &[u32]
 
                 let lod_tree_data = Uint32Array::from(lod_tree_data);
                 set_lod_tree_data(state, lod_id, page_base, chunk_base, count, &lod_tree_data);
-                update_paged_radii(state.lod_trees.get_mut(&lod_id).unwrap(), chunk_base, chunk_base + count);
+                if state.radii {
+                    mark_chunks_arrived(state.lod_trees.get_mut(&lod_id).unwrap(), chunk_base, chunk_base + count);
+                }
             }
         }
+        // Eager: the next raycast finds radii ready instead of paying the flush
+        flush_all_dirty_radii(&mut state.lod_trees);
 
         let result = Object::new();
         // for (&lod_id, lod_tree) in state.lod_trees.iter() {
@@ -897,61 +920,114 @@ fn f16_round_up(x: f32) -> f16 {
 // fresh radii when new data is decoded into it (LodSplat::from_words).
 fn update_radii(splats: &mut [LodSplat], chunk_to_page: &[u32], start: u32, end: u32) {
     for index in (start..end).rev() {
-        let Some(paged) = resident_index(index, chunk_to_page) else { continue };
-        let Some(splat) = splats.get(paged as usize).cloned() else { continue };
-        if !descends(&splat, index, chunk_to_page) {
-            continue;
-        }
-        let center = splat.center();
-        let mut radius = splat.radius.to_f32();
-        for child in splat.child_start..splat.child_start + splat.child_count as u32 {
-            let child = resident_index(child, chunk_to_page).and_then(|paged| splats.get(paged as usize));
-            let reach = child.map_or(f32::INFINITY, |child| center.distance(child.center()) + child.radius.to_f32());
-            radius = radius.max(reach * (1.0 + 1.0e-5));
-        }
-        splats[paged as usize].radius = f16_round_up(radius);
+        update_radius(splats, chunk_to_page, index);
     }
 }
 
-// Radii for newly resident tree indices [start, end) of a paged tree, then for
-// resident ancestor chunks, whose nodes may now descend into the new chunk.
+// Grow the covering radius of resident tree index `index` to cover its resident
+// children (assumed final). Returns whether the radius changed, i.e. whether
+// its parent must be recomputed too.
+fn update_radius(splats: &mut [LodSplat], chunk_to_page: &[u32], index: u32) -> bool {
+    let Some(paged) = resident_index(index, chunk_to_page) else { return false };
+    let Some(splat) = splats.get(paged as usize).cloned() else { return false };
+    if !descends(&splat, index, chunk_to_page) {
+        return false;
+    }
+    let center = splat.center();
+    let mut radius = splat.radius.to_f32();
+    for child in splat.child_start..splat.child_start + splat.child_count as u32 {
+        let child = resident_index(child, chunk_to_page).and_then(|paged| splats.get(paged as usize));
+        let reach = child.map_or(f32::INFINITY, |child| center.distance(child.center()) + child.radius.to_f32());
+        radius = radius.max(reach * (1.0 + 1.0e-5));
+    }
+    let radius = f16_round_up(radius);
+    splats[paged as usize].radius = radius;
+    radius != splat.radius
+}
+
+// Newly resident tree indices [start, end) of a paged tree: record the parent
+// of their children and mark their chunks dirty. Radii are computed by
+// flush_dirty_radii(), so loading pays O(count) only.
 // Evictions need no update: radii then only cover more than needed.
-fn update_paged_radii(lod_tree: &mut LodTree, start: u32, end: u32) {
-    let LodTree { splats, chunk_to_page, chunk_parents, .. } = lod_tree;
-    let mut splats = splats.borrow_mut();
+fn mark_chunks_arrived(lod_tree: &mut LodTree, start: u32, end: u32) {
+    let LodTree { splats, chunk_to_page, parents, dirty_chunks, .. } = lod_tree;
+    let splats = splats.borrow();
     for index in start..end {
         let Some(paged) = resident_index(index, chunk_to_page) else { continue };
-        let LodSplat { child_start, child_count, .. } = splats[paged as usize];
-        if child_count == 0 {
+        let Some(&LodSplat { child_start, child_count, .. }) = splats.get(paged as usize) else { continue };
+        // Same rule as descends(): children follow their parent, so parent
+        // links strictly decrease and propagation always terminates.
+        if child_count == 0 || child_start <= index {
             continue;
         }
-        let chunk = index >> 16;
-        for child_chunk in [child_start >> 16, (child_start + child_count as u32 - 1) >> 16] {
-            if child_chunk != chunk {
-                let child_chunk = child_chunk as usize;
-                if child_chunk >= chunk_parents.len() {
-                    chunk_parents.resize_with(child_chunk + 1, Vec::new);
-                }
-                if !chunk_parents[child_chunk].contains(&chunk) {
-                    chunk_parents[child_chunk].push(chunk);
-                }
+        let children = child_start as usize..child_start as usize + child_count as usize;
+        if children.end > parents.len() {
+            parents.resize(children.end, 0xFFFFFFFF);
+        }
+        parents[children].fill(index);
+    }
+    dirty_chunks.extend((start >> 16)..end.div_ceil(65536));
+}
+
+// Flush every tree with pending arrivals. Trees sharing one splats Vec (paged)
+// are borrowed one at a time.
+fn flush_all_dirty_radii(lod_trees: &mut AHashMap<u32, LodTree>) {
+    for lod_tree in lod_trees.values_mut() {
+        flush_dirty_radii(lod_tree);
+    }
+}
+
+// Radii of the dirty chunks, then of only those ancestor nodes whose radius
+// actually changes: cost ~ arrived nodes + their changed ancestors, independent
+// of tree size. Order: children always have a higher tree index than their
+// parent, so processing dirty chunks and dirty nodes in one descending sweep
+// finalizes every child before its parent. Radii only grow, so stopping where
+// a radius is unchanged keeps every ancestor covering.
+fn flush_dirty_radii(lod_tree: &mut LodTree) {
+    if lod_tree.dirty_chunks.is_empty() {
+        return;
+    }
+    let LodTree { splats, chunk_to_page, parents, dirty_chunks, dirty_nodes, .. } = lod_tree;
+    let mut splats = splats.borrow_mut();
+    dirty_chunks.sort_unstable();
+    dirty_chunks.dedup();
+    while let Some(chunk) = dirty_chunks.pop() {
+        let (first, last) = (chunk << 16, (chunk << 16) | 0xFFFF);
+        pop_dirty_nodes(&mut splats, chunk_to_page, parents, dirty_nodes, Some(last));
+        if resident_index(first, chunk_to_page).is_none() {
+            continue;
+        }
+        update_radii(&mut splats, chunk_to_page, first, last + 1);
+        // Parents outside this chunk (siblings are contiguous: skip repeats)
+        let mut prev = 0xFFFFFFFF;
+        for &parent in parents.get(first as usize..(last as usize + 1).min(parents.len())).unwrap_or(&[]) {
+            if parent != prev && parent < first {
+                dirty_nodes.push(parent);
+                prev = parent;
             }
         }
     }
+    pop_dirty_nodes(&mut splats, chunk_to_page, parents, dirty_nodes, None);
+}
 
-    update_radii(&mut splats, chunk_to_page, start, end);
-
-    // ponytail: recomputes whole ancestor chunks (65536 nodes each, depth ~log of
-    // chunk count) per arriving chunk; keep per-node parent links if this shows up.
-    let mut queue: Vec<u32> = ((start >> 16)..end.div_ceil(65536))
-        .filter_map(|chunk| chunk_parents.get(chunk as usize))
-        .flatten()
-        .copied()
-        .collect();
-    while let Some(chunk) = queue.pop() {
-        if resident_index(chunk << 16, chunk_to_page).is_some() {
-            update_radii(&mut splats, chunk_to_page, chunk << 16, (chunk + 1) << 16);
-            queue.extend(chunk_parents.get(chunk as usize).into_iter().flatten().copied());
+// Recompute queued nodes with index > `above` (all if None), highest first,
+// queueing the parent of each node whose radius changed.
+fn pop_dirty_nodes(splats: &mut [LodSplat], chunk_to_page: &[u32], parents: &[u32], dirty_nodes: &mut BinaryHeap<u32>, above: Option<u32>) {
+    let mut prev = 0xFFFFFFFF;
+    while let Some(&index) = dirty_nodes.peek() {
+        if above.is_some_and(|above| index <= above) {
+            break;
+        }
+        dirty_nodes.pop();
+        // Duplicates pop consecutively and a popped node is never queued again
+        if index == prev {
+            continue;
+        }
+        prev = index;
+        if update_radius(splats, chunk_to_page, index) {
+            if let Some(&parent) = parents.get(index as usize).filter(|&&parent| parent != 0xFFFFFFFF) {
+                dirty_nodes.push(parent);
+            }
         }
     }
 }
@@ -1036,8 +1112,13 @@ pub fn raycast_lod_tree(
     if origin.len() != 3 || dir.len() != 3 {
         return Err(JsValue::from_str("Invalid origin or dir length"));
     }
-    STATE.with_borrow(|state| {
-        let lod_tree = state.lod_trees.get(&lod_id).ok_or_else(|| JsValue::from_str("Invalid lod_id"))?;
+    STATE.with_borrow_mut(|state| {
+        if !state.radii {
+            return Err(JsValue::from_str("LoD radii disabled in this worker, see set_lod_radii()"));
+        }
+        let lod_tree = state.lod_trees.get_mut(&lod_id).ok_or_else(|| JsValue::from_str("Invalid lod_id"))?;
+        // Safety net: normally already flushed eagerly by update_lod_trees()
+        flush_dirty_radii(lod_tree);
         let root_page = if root_page == 0xFFFFFFFF { 0 } else { root_page };
         let LodRaycast { nodes, next_distance, .. } = raycast_lod(
             &lod_tree.splats.borrow(), &lod_tree.chunk_to_page, root_page,
@@ -1376,7 +1457,8 @@ mod tests {
             };
             for chunk in order {
                 lod_tree.chunk_to_page[chunk as usize] = chunk;
-                update_paged_radii(&mut lod_tree, chunk << 16, ((chunk + 1) << 16).min(n));
+                mark_chunks_arrived(&mut lod_tree, chunk << 16, ((chunk + 1) << 16).min(n));
+                flush_dirty_radii(&mut lod_tree);
             }
             let radii = |s: &[LodSplat]| s.iter().map(|x| x.radius.to_bits()).collect::<Vec<_>>();
             assert!(radii(&lod_tree.splats.borrow()) == radii(&full), "chunk order {order:?}");
@@ -1393,5 +1475,246 @@ mod tests {
             let (t, _) = pick(&tree, &tree.splats, &resident, &ray, LOD_RAYCAST_MAX_SIGMA, 16);
             assert_eq!(t, brute_force(&tree, &cut, &ray, LOD_RAYCAST_MAX_SIGMA));
         }
+    }
+
+    // Every resident node the raycast descends from covers each resident child
+    fn assert_covering(splats: &[LodSplat], chunk_to_page: &[u32], n: u32) {
+        for index in 0..n {
+            let Some(paged) = resident_index(index, chunk_to_page) else { continue };
+            let node = &splats[paged as usize];
+            if !descends(node, index, chunk_to_page) {
+                continue;
+            }
+            for child in node.child_start..node.child_start + node.child_count as u32 {
+                let child = &splats[resident_index(child, chunk_to_page).unwrap() as usize];
+                let reach = node.center().distance(child.center()) + child.radius.to_f32();
+                assert!(node.radius.to_f32() >= reach, "node {index} radius {} < {reach}", node.radius.to_f32());
+            }
+        }
+    }
+
+    #[test]
+    fn lazy_radii_sparse_arrival_with_cycles() {
+        // 5 chunks, arriving in sparse order with an eviction and a re-arrival,
+        // raycasts (flushes) in between
+        let tree = build_tree(200000, 8, false);
+        let n = tree.splats.len() as u32;
+        let chunks = n.div_ceil(65536);
+        assert_eq!(chunks, 5);
+        let mut lod_tree = LodTree {
+            splats: Rc::new(RefCell::new(tree.splats.clone())),
+            chunk_to_page: vec![INVALID; chunks as usize],
+            ..Default::default()
+        };
+        let arrive = |lod_tree: &mut LodTree, chunk: u32| {
+            lod_tree.chunk_to_page[chunk as usize] = chunk;
+            let range = chunk << 16..((chunk + 1) << 16).min(n);
+            for i in range.clone() {
+                lod_tree.splats.borrow_mut()[i as usize] = tree.splats[i as usize].clone(); // fresh decode
+            }
+            mark_chunks_arrived(lod_tree, range.start, range.end);
+        };
+        for step in [vec![3, 0], vec![4, 1], vec![], vec![2]] {
+            for chunk in step {
+                arrive(&mut lod_tree, chunk);
+            }
+            flush_dirty_radii(&mut lod_tree);
+            assert!(lod_tree.dirty_chunks.is_empty());
+            assert_covering(&lod_tree.splats.borrow(), &lod_tree.chunk_to_page, n);
+        }
+        lod_tree.chunk_to_page[1] = INVALID;
+        arrive(&mut lod_tree, 1);
+        flush_dirty_radii(&mut lod_tree);
+        let lazy = lod_tree.splats.borrow().clone();
+        assert_covering(&lazy, &lod_tree.chunk_to_page, n);
+
+        // Same radii and hits as the eager full pass
+        let pages = identity_pages(&tree);
+        let mut eager = tree.splats.clone();
+        update_radii(&mut eager, &pages, 0, n);
+        let radii = |s: &[LodSplat]| s.iter().map(|x| x.radius.to_bits()).collect::<Vec<_>>();
+        assert!(radii(&lazy) == radii(&eager));
+        let mut hits = 0;
+        for ray in rays(&tree, 100, 9) {
+            let (t, _) = pick(&tree, &lazy, &pages, &ray, LOD_RAYCAST_MAX_SIGMA, 16);
+            assert_eq!(t, pick(&tree, &eager, &pages, &ray, LOD_RAYCAST_MAX_SIGMA, 16).0);
+            hits += t.is_some() as usize;
+        }
+        assert!(hits > 50, "too few hits: {hits}");
+    }
+
+    #[test]
+    fn many_chunk_arrivals_are_fast() {
+        // 1.1M-node tree in 17 chunks arriving last-to-first: arrivals only mark
+        // chunks dirty, one flush recomputes each chunk once
+        let tree = build_tree(850000, 10, false);
+        let n = tree.splats.len() as u32;
+        let chunks = n.div_ceil(65536);
+        assert!(chunks >= 17, "{chunks}");
+        let mut lod_tree = LodTree {
+            splats: Rc::new(RefCell::new(tree.splats.clone())),
+            chunk_to_page: vec![INVALID; chunks as usize],
+            ..Default::default()
+        };
+        let start = std::time::Instant::now();
+        for chunk in (0..chunks).rev() {
+            lod_tree.chunk_to_page[chunk as usize] = chunk;
+            mark_chunks_arrived(&mut lod_tree, chunk << 16, ((chunk + 1) << 16).min(n));
+        }
+        let marked = start.elapsed();
+        flush_dirty_radii(&mut lod_tree);
+        let flushed = start.elapsed();
+        assert!(marked.as_secs_f32() < 1.0 && flushed.as_secs_f32() < 2.0, "{marked:?} {flushed:?}");
+        assert_covering(&lod_tree.splats.borrow(), &lod_tree.chunk_to_page, n);
+    }
+
+    #[test]
+    fn flush_all_shared_splats() {
+        // Pager-style: two trees sharing one splats Vec, each owning one page.
+        // flush_all_dirty_radii() borrows them in turn and gives the full-pass radii.
+        let tree = build_tree(70000, 6, false);
+        let n = tree.splats.len() as u32;
+        let splats = Rc::new(RefCell::new(tree.splats.clone()));
+        let mut lod_trees = AHashMap::new();
+        for chunk in 0..2u32 {
+            let mut chunk_to_page = vec![INVALID; 2];
+            chunk_to_page[chunk as usize] = chunk;
+            let mut lod_tree = LodTree { splats: splats.clone(), chunk_to_page, ..Default::default() };
+            mark_chunks_arrived(&mut lod_tree, chunk << 16, ((chunk + 1) << 16).min(n));
+            lod_trees.insert(chunk, lod_tree);
+        }
+        flush_all_dirty_radii(&mut lod_trees);
+        assert!(lod_trees.values().all(|t| t.dirty_chunks.is_empty()));
+        // Each tree sees only its own page resident, so compare per page
+        for chunk in 0..2u32 {
+            let range = (chunk << 16) as usize..((chunk + 1) << 16).min(n) as usize;
+            let mut own = tree.splats.clone();
+            let mut chunk_to_page = vec![INVALID; 2];
+            chunk_to_page[chunk as usize] = chunk;
+            update_radii(&mut own, &chunk_to_page, chunk << 16, ((chunk + 1) << 16).min(n));
+            let got: Vec<_> = splats.borrow()[range.clone()].iter().map(|x| x.radius.to_bits()).collect();
+            let want: Vec<_> = own[range].iter().map(|x| x.radius.to_bits()).collect();
+            assert!(got == want, "page {chunk}");
+        }
+    }
+
+    // Same tree with the sibling groups of every level in random order (still
+    // level by level, children contiguous and after their parent), like the
+    // spatially batched build-lod layout: the parents of one chunk's nodes are
+    // spread over all chunks of the levels above.
+    fn shuffled_levels(tree: &Tree, seed: u64) -> Vec<LodSplat> {
+        let mut rng = Rng(seed);
+        // New order: old index and new parent index of every node
+        let mut order: Vec<(usize, u32)> = vec![(0, INVALID)];
+        let mut level = 0..1;
+        while !level.is_empty() {
+            let mut groups: Vec<(u32, usize, usize)> = order[level.clone()].iter().enumerate()
+                .filter(|(_, &(old, _))| tree.splats[old].child_count > 0)
+                .map(|(i, &(old, _))| {
+                    let LodSplat { child_start, child_count, .. } = tree.splats[old];
+                    ((level.start + i) as u32, child_start as usize, child_count as usize)
+                })
+                .collect();
+            for i in (1..groups.len()).rev() {
+                groups.swap(i, ((rng.next() * (i + 1) as f32) as usize).min(i));
+            }
+            let next = order.len();
+            for (parent, start, count) in groups {
+                order.extend((start..start + count).map(|child| (child, parent)));
+            }
+            level = next..order.len();
+        }
+        let mut children = vec![(0u32, 0u16); order.len()];
+        for (index, &(_, parent)) in order.iter().enumerate() {
+            if parent != INVALID {
+                let (start, count) = &mut children[parent as usize];
+                if *count == 0 {
+                    *start = index as u32;
+                }
+                *count += 1;
+            }
+        }
+        order.iter().zip(children).map(|(&(old, _), (child_start, child_count))| {
+            let mut words = [0u32; 4];
+            encode_lod_tree(&mut words, &tree.center[old], tree.opacity[old], &tree.scale[old], child_count, child_start);
+            LodSplat::from_words(words)
+        }).collect()
+    }
+
+    #[test]
+    fn small_update_cost_independent_of_tree_size() {
+        // One chunk re-arriving (fresh decode) into a fully resident tree costs
+        // about the same in a 2-chunk and a 17-chunk tree with spread-out
+        // parents (the old per-chunk closure recomputed nearly every chunk),
+        // and gives the same radii as a full recompute.
+        let mut best = Vec::new();
+        for leaves in [100_000, 800_000] {
+            let tree = build_tree(leaves, 13, false);
+            let fresh = shuffled_levels(&tree, 14);
+            let n = fresh.len() as u32;
+            let chunks = n.div_ceil(65536);
+            let pages: Vec<u32> = (0..chunks).collect();
+            let mut lod_tree = LodTree {
+                splats: Rc::new(RefCell::new(fresh.clone())),
+                chunk_to_page: pages.clone(),
+                ..Default::default()
+            };
+            mark_chunks_arrived(&mut lod_tree, 0, n);
+            flush_dirty_radii(&mut lod_tree);
+            let last = chunks - 1;
+            let range = (last << 16) as usize..n as usize;
+            let mut fastest = f64::INFINITY;
+            for _ in 0..3 {
+                lod_tree.splats.borrow_mut()[range.clone()].clone_from_slice(&fresh[range.clone()]);
+                let start = std::time::Instant::now();
+                mark_chunks_arrived(&mut lod_tree, range.start as u32, n);
+                flush_dirty_radii(&mut lod_tree);
+                fastest = fastest.min(start.elapsed().as_secs_f64());
+            }
+            let mut full = fresh.clone();
+            update_radii(&mut full, &pages, 0, n);
+            let radii = |s: &[LodSplat]| s.iter().map(|x| x.radius.to_bits()).collect::<Vec<_>>();
+            assert!(radii(&lod_tree.splats.borrow()) == radii(&full), "{chunks} chunks");
+            best.push((chunks, fastest));
+        }
+        let ((small_chunks, small), (big_chunks, big)) = (best[0], best[1]);
+        assert!(small_chunks <= 3 && big_chunks >= 17, "{best:?}");
+        assert!(big < small * 3.0 + 0.002, "{best:?}");
+    }
+
+    // Per-arrival radii cost on a realistic paged tree (~3.7M nodes): chunks
+    // arrive coarse to fine (pager order), each followed by a flush like
+    // update_lod_trees(), then single-chunk re-arrivals with everything resident.
+    // cargo test --release radii_update_bench -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn radii_update_bench() {
+        let tree = build_tree(2_600_000, 11, false);
+        let splats = shuffled_levels(&tree, 12);
+        let n = splats.len() as u32;
+        let chunks = n.div_ceil(65536);
+        let mut lod_tree = LodTree {
+            splats: Rc::new(RefCell::new(splats)),
+            chunk_to_page: vec![INVALID; chunks as usize],
+            ..Default::default()
+        };
+        let (mut total, mut worst) = (0.0f64, 0.0f64);
+        for chunk in 0..chunks {
+            let start = std::time::Instant::now();
+            lod_tree.chunk_to_page[chunk as usize] = chunk;
+            mark_chunks_arrived(&mut lod_tree, chunk << 16, ((chunk + 1) << 16).min(n));
+            flush_dirty_radii(&mut lod_tree);
+            let ms = start.elapsed().as_secs_f64() * 1000.0;
+            total += ms;
+            worst = worst.max(ms);
+        }
+        println!("nodes {n} chunks {chunks}: mean {:.2} ms worst {:.2} ms per arrival", total / chunks as f64, worst);
+        for chunk in [chunks - 1, chunks / 2] {
+            let start = std::time::Instant::now();
+            mark_chunks_arrived(&mut lod_tree, chunk << 16, ((chunk + 1) << 16).min(n));
+            flush_dirty_radii(&mut lod_tree);
+            println!("re-arrival chunk {chunk}: {:.2} ms", start.elapsed().as_secs_f64() * 1000.0);
+        }
+        assert_covering(&lod_tree.splats.borrow(), &lod_tree.chunk_to_page, n);
     }
 }
