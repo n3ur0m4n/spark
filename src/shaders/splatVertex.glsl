@@ -11,6 +11,16 @@ out vec3 vNdc;
 flat out uint vSplatIndex;
 flat out float adjustedStdDev;
 
+#ifdef SPARK_PICK_DEPTH
+// GPU pick only: per-fragment depth of the Gaussian's max-density point
+// along the pixel ray (see splatPickFragment.glsl).
+out vec3 vPickRay;              // view-space ray dir with z = -1 (affine over the quad)
+flat out vec3 vPickCenter;      // view-space splat center
+flat out vec3 vPickSinvDiag;    // inverse(cov3D) up to a scale factor: diagonal
+flat out vec3 vPickSinvOff;     // ... off-diagonal (xy, xz, yz)
+flat out vec2 vPickAux;         // x = regularized sqrt(cov3D zz), y = 1.0 -> fallback to center depth
+#endif
+
 // uniform uint numSplats;
 uniform vec2 renderSize;
 uniform vec4 renderToViewQuat;
@@ -170,6 +180,15 @@ void main() {
             gl_Position = projectionMatrix * vec4(viewPos, 1.0);
             vNdc = gl_Position.xyz / gl_Position.w;
 
+            #ifdef SPARK_PICK_DEPTH
+            // Real quad geometry: vNdc depth is already exact -> fallback.
+            vPickRay = vec3(0.0, 0.0, -1.0);
+            vPickCenter = viewCenter;
+            vPickSinvDiag = vec3(0.0);
+            vPickSinvOff = vec3(0.0);
+            vPickAux = vec2(0.0, 1.0);
+            #endif
+
             #include <logdepthbuf_vertex>
             return;
         }
@@ -189,6 +208,23 @@ void main() {
     // Compute the Jacobian of the splat's projection at its center
     vec2 scaledRenderSize = renderSize * focalAdjustment;
     vec2 focal = 0.5 * scaledRenderSize * vec2(projectionMatrix[0][0], projectionMatrix[1][1]);
+
+    // NDC center of the splat
+    vec3 ndcCenter = clipCenter.xyz / clipCenter.w;
+
+    #ifdef SPARK_PICK_DEPTH
+    // GPU pick early-out (cheap pre-test): pickAsync() renders only the pick
+    // window (setViewOffset crop into a size x size target), so the pick
+    // rectangle is exactly NDC [-1,1]^2. The quad's per-axis half-extent is
+    // at most sqrt(2) * maxPixelRadius pixels, so a center farther than that
+    // outside [-1,1] can never touch the window.
+    {
+        vec2 maxExtNdc = (2.0 * 1.4142136 * maxPixelRadius) / scaledRenderSize;
+        if (any(greaterThan(abs(ndcCenter.xy), vec2(1.0) + maxExtNdc))) {
+            return;
+        }
+    }
+    #endif
 
     mat3 J;
     if (isOrthographic) {
@@ -265,16 +301,56 @@ void main() {
         return;
     }
 
+    #ifdef SPARK_PICK_DEPTH
+    // GPU pick early-out (exact): axis-aligned bounds of the FULL quad
+    // (corners at +-eigenVec1*scale1 +-eigenVec2*scale2 px, not just the
+    // center) vs the pick rectangle NDC [-1,1]^2. Skips the Sigma^-1 work
+    // below for every splat that can't produce a fragment in the window.
+    {
+        vec2 extPx = abs(eigenVec1) * scale1 + abs(eigenVec2) * scale2;
+        vec2 extNdc = (2.0 / scaledRenderSize) * extPx;
+        if (any(greaterThan(ndcCenter.xy - extNdc, vec2(1.0))) ||
+            any(lessThan(ndcCenter.xy + extNdc, vec2(-1.0)))) {
+            return;
+        }
+    }
+    {
+        // cov3D is view-space in both branches above. Normalize by its max
+        // diagonal before inverting (keeps the determinant in fp32 range for
+        // tiny splats) and regularize with epsRel = (1e-3 * sigmaMax)^2 so
+        // flat/2D-like splats stay invertible. The fragment's
+        // t* = r^T S d / r^T S r is invariant to the uniform scale of S, so
+        // the normalization never needs undoing.
+        float covMax = max(max(cov3D[0][0], cov3D[1][1]), max(cov3D[2][2], 1e-30));
+        const float epsRel = 1e-6;
+        mat3 sInvN = inverse(cov3D * (1.0 / covMax) + mat3(epsRel));
+        vPickSinvDiag = vec3(sInvN[0][0], sInvN[1][1], sInvN[2][2]);
+        vPickSinvOff = vec3(sInvN[0][1], sInvN[0][2], sInvN[1][2]);
+        vPickCenter = viewCenter;
+        vPickAux = vec2(sqrt(cov3D[2][2] + epsRel * covMax), isOrthographic ? 1.0 : 0.0);
+    }
+    #endif
+
     // Compute the NDC coordinates for the ellipsoid's diagonal axes.
     vec2 pixelOffset = position.x * eigenVec1 * scale1 + position.y * eigenVec2 * scale2;
     vec2 ndcOffset = (2.0 / scaledRenderSize) * pixelOffset;
 
-    // Compute NDC center of the splat
-    vec3 ndcCenter = clipCenter.xyz / clipCenter.w;
     vec3 ndc = vec3(ndcCenter.xy + ndcOffset, ndcCenter.z);
 
     vNdc = ndc;
     gl_Position = vec4(ndc.xy * clipCenter.w, clipCenter.zw);
+
+    #ifdef SPARK_PICK_DEPTH
+    // Perspective (column-major): ndc.x = P[0][0]*x/(-z) - P[2][0] at z = -1,
+    // so x = (ndc.x + P[2][0]) / P[0][0]; setViewOffset puts its crop offset
+    // in P[2][0], P[2][1]. gl_Position.w is constant over the quad, so the
+    // varying interpolates exactly. Unused for ortho (vPickAux.y = 1).
+    vPickRay = vec3(
+        (ndc.x + projectionMatrix[2][0]) / projectionMatrix[0][0],
+        (ndc.y + projectionMatrix[2][1]) / projectionMatrix[1][1],
+        -1.0
+    );
+    #endif
 
     #include <logdepthbuf_vertex>
 }

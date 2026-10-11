@@ -6,6 +6,7 @@ import computeUvec4x2Vec4Template from "./shaders/computeUvec4x2_Vec4.glsl";
 import computeVec4Template from "./shaders/computeVec4.glsl";
 import splatDefines from "./shaders/splatDefines.glsl";
 import splatFragment from "./shaders/splatFragment.glsl";
+import splatPickFragment from "./shaders/splatPickFragment.glsl";
 import splatVertex from "./shaders/splatVertex.glsl";
 
 let shaders: Record<string, string> | null = null;
@@ -17,6 +18,7 @@ export function getShaders(): Record<string, string> {
     shaders = {
       splatVertex,
       splatFragment,
+      splatPickFragment,
       computeVec4Template,
       computeUvec4Vec4Template,
       computeUvec4x2Vec4Template,
