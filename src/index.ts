@@ -1,6 +1,7 @@
 export {
   SparkRenderer,
   type SparkRendererOptions,
+  type SparkPickResult,
 } from "./SparkRenderer";
 export { SplatAccumulator, type GeneratorMapping } from "./SplatAccumulator";
 

@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Spark • GPU Pick (prototype)</title>
+  <style>
+    body {
+      margin: 0;
+      background-color: black;
+    }
+    canvas {
+      touch-action: none;
+    }
+    #panel {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 10;
+      color: #eee;
+      font-family: monospace;
+      font-size: 12px;
+      background: rgba(0, 0, 0, 0.6);
+      padding: 10px 12px;
+      border-radius: 6px;
+      line-height: 1.5;
+      white-space: pre;
+      max-width: 420px;
+    }
+    #panel select, #panel input {
+      font-family: monospace;
+      font-size: 12px;
+    }
+    #panel .row {
+      margin-bottom: 6px;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="panel">
+    <div class="row">
+      Source:
+      <select id="source">
+        <option value="lod">IZS laboratorio -lod.rad (LoD/paged)</option>
+        <option value="nonlod">IZS laboratorio .sog (non-LoD)</option>
+      </select>
+    </div>
+    <div class="row">
+      <label><input type="checkbox" id="hover" /> Hover pick (pickAsync on pointermove)</label>
+    </div>
+    <div class="row">
+      <label><input type="checkbox" id="solid" /> Solid pass (2nd pass, ?solid=1)</label>
+    </div>
+    <div id="stats">Click on the splats to compare pickAsync (GPU) vs raycastAsync (CPU/LoD tree).</div>
+  </div>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "../js/vendor/three/build/three.module.js",
+        "three/addons/": "../js/vendor/three/examples/jsm/",
+        "@sparkjsdev/spark": "../../dist/spark.module.js"
+      }
+    }
+  </script>
+  <script type="module">
+    import * as THREE from "three";
+    import { SparkRenderer, SplatMesh, SparkControls } from "@sparkjsdev/spark";
+
+    const LOG_PREFIX = "[gpu-pick]";
+
+    // bench/data/*.rad|*.sog are served as plain static files from the repo
+    // root by Vite's dev server (they live inside the project root, so the
+    // default fs.allow boundary covers them) - not verified against a
+    // running dev server in this session, so an explicit ?url= override is
+    // provided as an escape hatch if the default path isn't reachable.
+    const DEFAULT_URLS = {
+      lod: "/bench/data/point_cloud_I_L2-lod.rad",
+      nonlod: "/bench/data/point_cloud_I_L2.sog",
+    };
+
+    const params = new URLSearchParams(location.search);
+    const urlOverride = params.get("url");
+    const initialSource =
+      params.get("mode") ||
+      (urlOverride ? (urlOverride.endsWith(".rad") ? "lod" : "nonlod") : "nonlod");
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.05, 1000);
+    camera.position.set(2.5209, 1.2685, 7.1886);
+    camera.lookAt(2.8373, 1.2096, 6.2419);
+    const renderer = new THREE.WebGLRenderer();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    function onWindowResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+    window.addEventListener("resize", onWindowResize, false);
+
+    const spark = new SparkRenderer({ renderer });
+    scene.add(spark);
+
+    // --- Controls: identici a SINTESI (src/hooks/useSceneInit.jsx) ------------
+    const controls = new SparkControls({ canvas: renderer.domElement });
+    // Q = su, E = giù (invertiti rispetto al default Spark)
+    controls.fpsMovement.keycodeMoveMapping.KeyQ = new THREE.Vector3(0, 1, 0);
+    controls.fpsMovement.keycodeMoveMapping.KeyE = new THREE.Vector3(0, -1, 0);
+    const pc = controls.pointerControls;
+    pc.pressMoveSpeed = 0;
+    pc.doublePressMoveSpeed = 0;
+    pc.triplePressMoveSpeed = 0;
+    pc.slideSpeed = 0.006;
+    pc.reverseSlide = true;
+    pc.moveInertia = 0.2;
+    pc.rotateInertia = 0.2;
+    pc.pointerRollScale = 0;
+    // Touch: rotazione a un dito invertita, mouse invariato (reverseRotate è condiviso)
+    const baseReverseRotate = pc.reverseRotate;
+    renderer.domElement.addEventListener("pointerdown", (e) => {
+      pc.reverseRotate = e.pointerType === "mouse" ? baseReverseRotate : !baseReverseRotate;
+    }, true);
+
+    // Bbox scena (mondo): solo per la mesh non-paged (.sog). MAI getBoundingBox()
+    // a runtime su una mesh paged (freeze): per il .rad resta null.
+    let sceneBox = null;
+
+    // Pan "ad afferrare": registrato DOPO SparkControls (il suo pointerdown ha già
+    // impostato pc.sliding). slideSpeed = metri per pixel alla profondità del punto
+    // sotto il cursore (pickAsync GPU al posto di picker.pick di SINTESI).
+    let panGrab = null;
+    const PAN_GRAB_SCALE = 0.75;
+    const grabTmp = new THREE.Vector3();
+    const grabFwd = new THREE.Vector3();
+    renderer.domElement.addEventListener("pointerdown", (e) => {
+      if (pc.sliding?.pointerId !== e.pointerId) return;
+      if (panGrab) panGrab.cancelled = true;
+      const token = { cancelled: false };
+      panGrab = token;
+      const canvasEl = renderer.domElement;
+      const h = canvasEl.clientHeight || 1;
+      const k = (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2)) / h;
+      const dFallback = sceneBox ? camera.position.distanceTo(sceneBox.getCenter(grabTmp)) : 10;
+      pc.slideSpeed = PAN_GRAB_SCALE * k * Math.max(dFallback, 0.5);
+      const rect = canvasEl.getBoundingClientRect();
+      spark
+        .pickAsync({ camera, x: e.clientX - rect.left, y: e.clientY - rect.top, size: 5, alphaThreshold: 0.3 })
+        .then((r) => {
+          if (!r || token.cancelled || panGrab !== token || !pc.sliding) return;
+          // Profondità view-space: distanza proiettata sull'asse di vista
+          const d = grabTmp.subVectors(r.point, camera.position).dot(camera.getWorldDirection(grabFwd));
+          if (d > 0) pc.slideSpeed = PAN_GRAB_SCALE * k * Math.max(d, 0.5);
+        })
+        .catch(() => {});
+    });
+
+    // Velocità pan/zoom come SINTESI useFrameLoop.js: base dentro la bbox,
+    // x speedMul = 1 + distanza fuori bbox / 10 m.
+    const PAN_BASE = 0.006;
+    const ZOOM_STEP = 1.0; // m per tick di rotella dentro la bbox
+    const ZOOM_MAX_TICKS = 6;
+    const SPEED_D0 = 10;
+    let wheelExcessY = 0;
+    const zoomDir = new THREE.Vector3();
+    function updateControlSpeeds() {
+      const speedMul = 1 + (sceneBox ? sceneBox.distanceToPoint(camera.position) : 0) / SPEED_D0;
+      // Zoom lineare: ZOOM_STEP m per tick (x speedMul); pc.scroll azzerato, Spark non lo riapplica
+      pc.scroll.y += wheelExcessY;
+      wheelExcessY = 0;
+      const dirSign = pc.reverseScroll ? -1 : 1;
+      let ticks = -pc.scroll.y * 0.01 * dirSign;
+      pc.scroll.set(0, 0, 0);
+      if (ticks !== 0) {
+        if (Math.abs(ticks) > ZOOM_MAX_TICKS) {
+          const capped = Math.sign(ticks) * ZOOM_MAX_TICKS;
+          wheelExcessY = -(ticks - capped) * 100 * dirSign;
+          ticks = capped;
+        }
+        camera.getWorldDirection(zoomDir);
+        camera.position.addScaledVector(zoomDir, ZOOM_STEP * ticks * speedMul);
+      }
+      // Drag "ad afferrare" in corso: slideSpeed fissato al pointerdown, non toccarlo
+      if (panGrab && !pc.sliding) panGrab = null;
+      if (!panGrab) pc.slideSpeed = PAN_BASE * speedMul;
+    }
+
+    const solidCheckbox = document.getElementById("solid");
+    solidCheckbox.checked = params.get("solid") === "1";
+
+    // --- Scene (re)loading -----------------------------------------------
+
+    let currentMesh = null;
+
+    function loadScene(source) {
+      if (currentMesh) {
+        scene.remove(currentMesh);
+        currentMesh.dispose();
+        currentMesh = null;
+      }
+      sceneBox = null;
+      const url =
+        urlOverride && source === initialSource ? urlOverride : DEFAULT_URLS[source];
+      console.log(LOG_PREFIX, "loading", source, url);
+      const mesh = new SplatMesh({
+        url,
+        paged: source === "lod",
+        onLoad: () => {
+          console.log(LOG_PREFIX, "loaded", url);
+          if (!mesh.paged && currentMesh === mesh) {
+            mesh.updateMatrixWorld(true);
+            sceneBox = mesh.getBoundingBox(true).clone().applyMatrix4(mesh.matrixWorld);
+          }
+        },
+      });
+      // Orientamento identico a SINTESI: DB ROTAZIONE {x: -PI/2}, nessuna posizione
+      mesh.rotation.set(-1.5707963268, 0, 0);
+      scene.add(mesh);
+      currentMesh = mesh;
+    }
+
+    const sourceSelect = document.getElementById("source");
+    sourceSelect.value = initialSource;
+    sourceSelect.addEventListener("change", () => loadScene(sourceSelect.value));
+    loadScene(initialSource);
+
+    // --- Pick/raycast markers ----------------------------------------------
+
+    const greenMarker = new THREE.Mesh(
+      new THREE.SphereGeometry(0.25, 16, 12),
+      new THREE.MeshBasicMaterial({ color: 0x00ff00, depthTest: false }),
+    );
+    const redMarker = new THREE.Mesh(
+      new THREE.SphereGeometry(0.25, 16, 12),
+      new THREE.MeshBasicMaterial({ color: 0xff0000, depthTest: false }),
+    );
+    greenMarker.renderOrder = 999;
+    redMarker.renderOrder = 999;
+    greenMarker.visible = false;
+    redMarker.visible = false;
+    scene.add(greenMarker, redMarker);
+
+    const statsEl = document.getElementById("stats");
+
+    function fmt(n, digits = 3) {
+      return typeof n === "number" && Number.isFinite(n) ? n.toFixed(digits) : "-";
+    }
+
+    async function pickAt(x, y) {
+      if (!currentMesh) return null;
+
+      const pickT0 = performance.now();
+      const pickPromise = spark
+        .pickAsync({ camera, x, y, size: 5, alphaThreshold: 0.3, solid: solidCheckbox.checked })
+        .then((result) => ({
+          result,
+          ms: result ? result.ms : performance.now() - pickT0,
+        }));
+
+      const canvas = renderer.domElement;
+      const ndc = new THREE.Vector2(
+        (x / canvas.clientWidth) * 2 - 1,
+        -(y / canvas.clientHeight) * 2 + 1,
+      );
+      const raycaster = new THREE.Raycaster();
+      raycaster.setFromCamera(ndc, camera);
+      const rayT0 = performance.now();
+      const rayPromise = spark
+        .raycastAsync(currentMesh, raycaster, { closestOnly: true })
+        .then((hits) => ({ hits, ms: performance.now() - rayT0 }));
+
+      const [pickOut, rayOut] = await Promise.all([pickPromise, rayPromise]);
+      return { pickOut, rayOut };
+    }
+
+    window.__gp = {
+      THREE,
+      camera,
+      spark,
+      renderer,
+      pickAt,
+      get mesh() { return currentMesh; },
+      controls,
+    };
+
+    async function clickPick(x, y) {
+      const out = await pickAt(x, y);
+      if (!out) return;
+      const { pickOut, rayOut } = out;
+      const { result } = pickOut;
+      const rayHit = rayOut.hits[0];
+
+      window.__gp.last = { pick: result, ray: rayHit };
+
+      greenMarker.visible = !!result;
+      if (result) greenMarker.position.copy(result.point);
+
+      redMarker.visible = !!rayHit;
+      if (rayHit) redMarker.position.copy(rayHit.point);
+
+      const dist =
+        result && rayHit ? result.point.distanceTo(rayHit.point) : null;
+
+      console.log(LOG_PREFIX, "pick", result, "raycast", rayHit);
+
+      statsEl.textContent =
+        `GPU pick:     ${fmt(pickOut.ms, 2)} ms\n` +
+        `raycastAsync: ${fmt(rayOut.ms, 2)} ms\n` +
+        `point delta:  ${fmt(dist)} m\n` +
+        `distanceMedia:  ${result ? fmt(result.distanceMedia) : "-"}\n` +
+        `distanceSolida: ${result && result.distanceSolida != null ? fmt(result.distanceSolida) : "-"}\n` +
+        `copertura:      ${result ? fmt(result.copertura) : "-"}\n` +
+        `floatType:      ${result ? result.floatType : "-"}`;
+    }
+
+    // --- Click (not drag) detection ----------------------------------------
+
+    const canvas = renderer.domElement;
+    let downPos = null;
+
+    canvas.addEventListener("pointerdown", (event) => {
+      downPos = { x: event.clientX, y: event.clientY };
+    });
+
+    canvas.addEventListener("pointerup", (event) => {
+      if (!downPos) return;
+      const dx = event.clientX - downPos.x;
+      const dy = event.clientY - downPos.y;
+      downPos = null;
+      if (Math.hypot(dx, dy) > 4) return; // was a drag, not a click
+
+      const rect = canvas.getBoundingClientRect();
+      const x = event.clientX - rect.left;
+      const y = event.clientY - rect.top;
+      clickPick(x, y).catch((err) => console.error(LOG_PREFIX, "pick failed", err));
+    });
+
+    // --- Hover pick ----------------------------------------------------------
+
+    const hoverCheckbox = document.getElementById("hover");
+    let hoverPending = null;
+    let hoverBusy = false;
+    const hoverMsSamples = [];
+
+    canvas.addEventListener("pointermove", (event) => {
+      if (!hoverCheckbox.checked) return;
+      const rect = canvas.getBoundingClientRect();
+      hoverPending = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    });
+
+    function tickHover() {
+      if (!hoverCheckbox.checked || !hoverPending || hoverBusy || !currentMesh) return;
+      const { x, y } = hoverPending;
+      hoverPending = null;
+      hoverBusy = true;
+      spark
+        .pickAsync({ camera, x, y, size: 5, alphaThreshold: 0.3, solid: solidCheckbox.checked })
+        .then((result) => {
+          if (result) {
+            greenMarker.visible = true;
+            greenMarker.position.copy(result.point);
+            hoverMsSamples.push(result.ms);
+            if (hoverMsSamples.length > 30) hoverMsSamples.shift();
+            const avg =
+              hoverMsSamples.reduce((a, b) => a + b, 0) / hoverMsSamples.length;
+            statsEl.textContent = `Hover pick avg: ${fmt(avg, 2)} ms (n=${hoverMsSamples.length})`;
+          }
+        })
+        .catch((err) => console.error(LOG_PREFIX, "hover pick failed", err))
+        .finally(() => {
+          hoverBusy = false;
+        });
+    }
+
+    // --- Main loop -----------------------------------------------------------
+
+    // Max 2 GPU frames in flight: a fence per rendered frame; skip rendering
+    // while >= 2 are still unsignaled (keeps the GPU queue short so a pick's
+    // readback doesn't wait behind a backlog of frames).
+    const gl = renderer.getContext();
+    const fences = [];
+
+    renderer.setAnimationLoop(function animate() {
+      while (fences.length && gl.clientWaitSync(fences[0], 0, 0) !== gl.TIMEOUT_EXPIRED) {
+        gl.deleteSync(fences.shift());
+      }
+      if (fences.length >= 2) return;
+      updateControlSpeeds();
+      controls.update(camera);
+      tickHover();
+      renderer.render(scene, camera);
+      fences.push(gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0));
+    });
+  </script>
+</body>
+
+</html>

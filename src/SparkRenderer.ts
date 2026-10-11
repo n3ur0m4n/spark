@@ -333,6 +333,28 @@ export interface SparkRendererOptions {
   depthWrite?: boolean;
 }
 
+/**
+ * Result of {@link SparkRenderer.pickAsync}. Depths/distances are linear
+ * view-space depth (world units along the camera's forward axis), not
+ * Euclidean distance from the camera.
+ */
+export interface SparkPickResult {
+  /** Best point: always pointMedia (pointSolida is extra info only). */
+  point: THREE.Vector3;
+  /** World point reconstructed from the alpha-weighted average depth. */
+  pointMedia: THREE.Vector3;
+  /** World point reconstructed from the first "solid" splat's depth, if any
+   *  (always null unless pickAsync() was called with solid: true). */
+  pointSolida: THREE.Vector3 | null;
+  distanceMedia: number;
+  distanceSolida: number | null;
+  /** Sum of alpha coverage (G channel) at the chosen pixel. */
+  copertura: number;
+  floatType: "float" | "half";
+  /** Wall-clock time for the whole pickAsync() call, in ms. */
+  ms: number;
+}
+
 export class SparkRenderer extends THREE.Mesh {
   readonly renderer: THREE.WebGLRenderer;
   readonly material: THREE.ShaderMaterial;
@@ -480,6 +502,22 @@ export class SparkRenderer extends THREE.Mesh {
   superPixels?: Uint8Array;
   targetPixels?: Uint8Array;
   superXY = 1;
+
+  // GPU pick (pickAsync) state: lazily created materials/targets, reused and
+  // only recreated when size or float-vs-half precision changes. Two
+  // passes are needed (see pickAsync()): a weighted-average pass
+  // (premultiplied "over" blend) and a first-solid-hit pass (MIN blend).
+  private pickMaterialMedia?: THREE.ShaderMaterial;
+  private pickMaterialSolid?: THREE.ShaderMaterial;
+  private pickTargetMedia?: THREE.WebGLRenderTarget;
+  private pickTargetSolid?: THREE.WebGLRenderTarget;
+  private pickTargetSize = 0;
+  private pickTargetIsFloat = false;
+  // Set for the duration of the synchronous pickAsync() render call so
+  // onBeforeRender() skips the sort/LoD-update trigger (see onBeforeRender);
+  // everything else in onBeforeRender (per-draw uniforms) still runs so the
+  // pick pass sees the viewport/camera it's actually given.
+  private pickPass = false;
 
   flushAfterGenerate = false;
   flushAfterRead = false;
@@ -733,6 +771,18 @@ export class SparkRenderer extends THREE.Mesh {
       this.backTarget.dispose();
       this.backTarget = undefined;
     }
+    if (this.pickTargetMedia) {
+      this.pickTargetMedia.dispose();
+      this.pickTargetMedia = undefined;
+    }
+    if (this.pickTargetSolid) {
+      this.pickTargetSolid.dispose();
+      this.pickTargetSolid = undefined;
+    }
+    this.pickMaterialMedia?.dispose();
+    this.pickMaterialMedia = undefined;
+    this.pickMaterialSolid?.dispose();
+    this.pickMaterialSolid = undefined;
     if (this.orderingTexture) {
       this.orderingTexture.dispose();
       this.orderingTexture = null;
@@ -791,7 +841,10 @@ export class SparkRenderer extends THREE.Mesh {
     spark.lastFrame = frame;
 
     // Trigger update (either sync in case of preUpdate, or async through setTimeout)
-    if (spark.autoUpdate && isNewFrame) {
+    // Skipped during a pickAsync() render: that pass reuses the splat
+    // ordering/LoD selection already computed for the current frame (just a
+    // narrower projection), so it must not kick off an extra sort/LoD update.
+    if (spark.autoUpdate && isNewFrame && !spark.pickPass) {
       const preUpdate = spark.preUpdate && !renderer.xr.isPresenting;
       const useCamera = renderer.xr.isPresenting
         ? renderer.xr.getCamera()
@@ -2384,6 +2437,274 @@ export class SparkRenderer extends THREE.Mesh {
   }
 
   /**
+   * GPU pick prototype: renders a tiny (size x size) crop of the current
+   * frame (same camera position/orientation, same splat ordering/LoD
+   * selection already computed this frame) in two passes into two offscreen
+   * float targets, then reconstructs the picked 3D point from the readback.
+   * Resolves to null if the pick window had no coverage at all.
+   *
+   * Pass "media" composites splats back-to-front with standard premultiplied
+   * "over" blending (the same blend the main splat shader uses), so R/A end
+   * up holding a true visibility-weighted average depth (R = sum(w*d),
+   * A = sum(w), w_i = a_i * product(1 - a_j) for every splat j in front of
+   * i) - NOT a naive alpha-weighted sum, which would let splats behind an
+   * opaque surface pull the average through/behind it.
+   * Pass "solid" uses MIN blending to find the depth of the frontmost splat
+   * with alpha > alphaThreshold, independent of the first pass. It runs only
+   * with `solid: true` (default false = single "media" pass).
+   *
+   * x, y are CSS pixels relative to renderer.domElement (same convention as
+   * mouse/pointer events), not canvas backing-store pixels.
+   *
+   * Prototype scope: only this SparkRenderer's splats are considered (every
+   * other direct child of its parent scene is temporarily hidden for the
+   * two synchronous render calls), and occlusion by non-splat opaque
+   * geometry is not handled.
+   */
+  async pickAsync({
+    camera,
+    x,
+    y,
+    size = 5,
+    alphaThreshold = 0.1,
+    solid = false,
+  }: {
+    camera: THREE.PerspectiveCamera | THREE.OrthographicCamera;
+    x: number;
+    y: number;
+    size?: number;
+    alphaThreshold?: number;
+    /** Also run the "solid" (first hit > alphaThreshold) pass. Default false:
+     *  one pass only, pointSolida/distanceSolida are null. */
+    solid?: boolean;
+  }): Promise<SparkPickResult | null> {
+    const t0 = performance.now();
+    const renderer = this.renderer;
+
+    // Lazily create the two pick materials. Both share the exact same
+    // uniforms *objects* as the main material (spread of `this.uniforms`,
+    // not a deep clone), so whatever onBeforeRender() writes into e.g.
+    // `this.uniforms.near.value` every frame is immediately visible here
+    // too, on top of their own alphaThreshold/pickSolidMode.
+    if (!this.pickMaterialMedia) {
+      const shaders = getShaders();
+      const commonParams = {
+        glslVersion: THREE.GLSL3,
+        vertexShader: shaders.splatVertex,
+        fragmentShader: shaders.splatPickFragment,
+        transparent: true,
+        depthTest: this.material.depthTest,
+        depthWrite: this.material.depthWrite,
+        side: THREE.DoubleSide,
+        allowOverride: false,
+        // Per-fragment max-density depth along the pixel ray instead of the
+        // flat splat-center depth (see splatVertex.glsl/splatPickFragment.glsl).
+        defines: { ...this.material.defines, SPARK_PICK_DEPTH: "" },
+      };
+      // Weighted-average pass: standard premultiplied "over" blending, the
+      // same (ONE, ONE_MINUS_SRC_ALPHA) THREE uses for NormalBlending with
+      // premultipliedAlpha true - no CustomBlending needed.
+      this.pickMaterialMedia = new THREE.ShaderMaterial({
+        ...commonParams,
+        premultipliedAlpha: true,
+        uniforms: {
+          ...this.uniforms,
+          alphaThreshold: { value: alphaThreshold },
+          pickSolidMode: { value: false },
+        },
+      });
+      // First-solid-hit pass: MIN blend keeps the smallest depth written.
+      // WebGL ignores src/dst factors for Min/Max equations; left at ONE.
+      this.pickMaterialSolid = new THREE.ShaderMaterial({
+        ...commonParams,
+        uniforms: {
+          ...this.uniforms,
+          alphaThreshold: { value: alphaThreshold },
+          pickSolidMode: { value: true },
+        },
+        blending: THREE.CustomBlending,
+        blendEquation: THREE.MinEquation,
+        blendSrc: THREE.OneFactor,
+        blendDst: THREE.OneFactor,
+        blendEquationAlpha: THREE.MinEquation,
+        blendSrcAlpha: THREE.OneFactor,
+        blendDstAlpha: THREE.OneFactor,
+      });
+    }
+    // Local consts so TS keeps the non-undefined narrowing from the lazy
+    // init above across the rest of this method.
+    const pickMaterialMedia = this.pickMaterialMedia;
+    const pickMaterialSolid = this.pickMaterialSolid;
+    if (!pickMaterialMedia || !pickMaterialSolid) {
+      throw new Error("pick materials not initialized");
+    }
+    (pickMaterialMedia.uniforms.alphaThreshold.value as number) =
+      alphaThreshold;
+    (pickMaterialSolid.uniforms.alphaThreshold.value as number) =
+      alphaThreshold;
+
+    // EXT_float_blend is required to blend into a FloatType target on many
+    // platforms (plain float rendering without blending doesn't need it);
+    // fall back to HalfFloatType otherwise.
+    const floatOk = renderer.extensions.has("EXT_float_blend");
+    const pickFloatType = floatOk ? THREE.FloatType : THREE.HalfFloatType;
+    const floatTypeName: "float" | "half" = floatOk ? "float" : "half";
+
+    const makeTarget = () =>
+      new THREE.WebGLRenderTarget(size, size, {
+        type: pickFloatType,
+        format: THREE.RGBAFormat,
+        depthBuffer: true,
+        stencilBuffer: false,
+        magFilter: THREE.NearestFilter,
+        minFilter: THREE.NearestFilter,
+      });
+
+    let targetMedia = this.pickTargetMedia;
+    let targetSolid = this.pickTargetSolid;
+    if (
+      !targetMedia ||
+      !targetSolid ||
+      this.pickTargetSize !== size ||
+      this.pickTargetIsFloat !== floatOk
+    ) {
+      targetMedia?.dispose();
+      targetSolid?.dispose();
+      targetMedia = makeTarget();
+      targetSolid = makeTarget();
+      this.pickTargetMedia = targetMedia;
+      this.pickTargetSolid = targetSolid;
+      this.pickTargetSize = size;
+      this.pickTargetIsFloat = floatOk;
+    }
+
+    const canvas = renderer.domElement;
+    const fullW = canvas.clientWidth || canvas.width;
+    const fullH = canvas.clientHeight || canvas.height;
+
+    const pickCamera = camera.clone();
+    pickCamera.setViewOffset(
+      fullW,
+      fullH,
+      x - size / 2,
+      y - size / 2,
+      size,
+      size,
+    );
+    pickCamera.updateProjectionMatrix();
+
+    // Keep this in sync with splatPickFragment.glsl's farBig(): both the
+    // clear value and the shader's "no solid hit" sentinel must agree so
+    // readback can tell a real depth from "nothing there".
+    const farBig = Math.min(60000, Math.max(1e4, camera.far * 4));
+
+    // Hide every other direct child of the scene for these two render
+    // calls: this SparkRenderer already batches every splat found in the
+    // scene into a single instanced draw, so rendering just `this` is
+    // enough to get all splats into the pick targets without other scene
+    // geometry (which the pick shaders/blend modes don't know how to
+    // handle) polluting them.
+    const scene = this.parent;
+    const hidden: THREE.Object3D[] = [];
+    if (scene) {
+      for (const child of scene.children) {
+        if (child !== (this as THREE.Object3D) && child.visible) {
+          hidden.push(child);
+          child.visible = false;
+        }
+      }
+    }
+
+    const prevTarget = renderer.getRenderTarget();
+    const prevAutoClear = renderer.autoClear;
+    const prevXrEnabled = renderer.xr.enabled;
+    const prevClearColor = new THREE.Color();
+    renderer.getClearColor(prevClearColor);
+    const prevClearAlpha = renderer.getClearAlpha();
+    const prevMaterial = this.material;
+    // `material` is declared readonly in the public API; this is an
+    // internal, same-tick swap for the pick render only.
+    const materialHolder = this as unknown as {
+      material: THREE.ShaderMaterial;
+    };
+
+    // Everything from here to the matching restore below runs
+    // synchronously (no `await` in between), so the renderer's "current"
+    // state is never observable as changed from outside this function - in
+    // particular, the main render loop can't run concurrently on a
+    // partially-swapped state. Both passes share one try/finally.
+    const prevClipXY = this.clipXY;
+    try {
+      renderer.xr.enabled = false;
+      this.pickPass = true;
+      // Disable center-based frustum clipping for picking: a splat whose
+      // quad covers the cursor can still have its center outside the tiny
+      // setViewOffset crop, and the vertex shader's clipXY cull would drop
+      // it before SPARK_PICK_DEPTH's exact quad-vs-NDC test ever runs.
+      this.clipXY = 1e6;
+      renderer.autoClear = false;
+
+      // Pass "media": clear to (0,0,0,0), premultiplied-over blend.
+      materialHolder.material = pickMaterialMedia;
+      renderer.setRenderTarget(targetMedia);
+      renderer.setClearColor(0x000000, 0);
+      renderer.clear(true, true, false);
+      renderer.render(scene ?? this, pickCamera);
+
+      if (solid) {
+        // Pass "solid" (only with solid: true): clear R(GBA) to farBig via the renderer's low-level
+        // state API - renderer.setClearColor()/Color only accept [0,1]
+        // components, which can't express a large sentinel, and this also
+        // sidesteps any doubt about alpha-specific clear clamping, since the
+        // sentinel is read back from the *color* (R) channel here.
+        // premultipliedAlpha=false so the (r,g,b)*=a scaling THREE applies
+        // for a premultiplied *canvas context* doesn't zero it out (our
+        // clear alpha is 0).
+        materialHolder.material = pickMaterialSolid;
+        renderer.setRenderTarget(targetSolid);
+        renderer.state.buffers.color.setClear(farBig, farBig, farBig, 0, false);
+        renderer.clear(true, true, false);
+        renderer.render(scene ?? this, pickCamera);
+      }
+    } finally {
+      this.pickPass = false;
+      this.clipXY = prevClipXY;
+      materialHolder.material = prevMaterial;
+      renderer.setRenderTarget(prevTarget);
+      renderer.autoClear = prevAutoClear;
+      renderer.xr.enabled = prevXrEnabled;
+      // Goes through the normal (cached) path, so it also corrects the
+      // state cache after the low-level setClear() call above.
+      renderer.setClearColor(prevClearColor, prevClearAlpha);
+      for (const child of hidden) child.visible = true;
+    }
+
+    // Safe to await now: render targets are read directly regardless of
+    // the renderer's currently-bound render target.
+    const [pixelsMedia, pixelsSolid] = await Promise.all([
+      readPickTargetPixels(renderer, targetMedia, size, floatOk),
+      solid ? readPickTargetPixels(renderer, targetSolid, size, floatOk) : null,
+    ]);
+
+    const result = pickResultFromPixels({
+      pixelsMedia,
+      pixelsSolid,
+      size,
+      camera,
+      x,
+      y,
+      fullW,
+      fullH,
+      farBig,
+      floatType: floatTypeName,
+    });
+    if (result) {
+      result.ms = performance.now() - t0;
+    }
+    return result;
+  }
+
+  /**
    * One raycastLodTree on the pick worker, at most one in flight, the others
    * waiting in FIFO order. A request with a coalesce `key` replaces the waiting
    * request with the same key (latest wins), so a burst of hovers never piles
@@ -2468,4 +2789,177 @@ export class SparkRenderer extends THREE.Mesh {
 // creates for an XR session, so instanceof cannot identify it.
 function checkIsXRRenderTarget(renderTarget: THREE.RenderTarget | null) {
   return (renderTarget as unknown as Record<string, boolean>)?.isXRRenderTarget;
+}
+
+// Reconstructs a view-space ray for pixel (ndcX, ndcY) in NDC space ([-1,1])
+// from the camera's own (unmodified, non-viewOffset) projection matrix, so
+// it matches whatever the camera was actually showing at full resolution.
+// Returns a point such that moving `d` world units along it reaches
+// view-space z = -d (i.e. walks the ray to the plane z_view = -d), matching
+// the linear depth splatPickFragment.glsl outputs.
+function viewPointAtDepth(
+  camera: THREE.PerspectiveCamera | THREE.OrthographicCamera,
+  ndcX: number,
+  ndcY: number,
+  d: number,
+): THREE.Vector3 {
+  const m = camera.projectionMatrix.elements;
+  if ("isOrthographicCamera" in camera) {
+    // Ortho projection: clipX = m00*viewX + m03; clipY = m11*viewY + m13
+    // (clipW === 1, so NDC === clip). Rays are parallel: (viewX, viewY, -d).
+    const viewX = (ndcX - m[12]) / m[0];
+    const viewY = (ndcY - m[13]) / m[5];
+    return new THREE.Vector3(viewX, viewY, -d);
+  }
+  // Perspective projection: clipX = m00*viewX + m02*viewZ, clipW = -viewZ.
+  // At viewZ = -1: ndcX = m00*viewX - m02 => viewX = (ndcX + m02) / m00.
+  const viewX = (ndcX + m[8]) / m[0];
+  const viewY = (ndcY + m[9]) / m[5];
+  return new THREE.Vector3(viewX * d, viewY * d, -d);
+}
+
+// Reads back a pickAsync() render target as a plain Float32Array, regardless
+// of whether it's FloatType (read directly) or HalfFloatType (read as raw
+// 16-bit words and expanded one by one - there's no native typed array for
+// half floats).
+async function readPickTargetPixels(
+  renderer: THREE.WebGLRenderer,
+  target: THREE.WebGLRenderTarget,
+  size: number,
+  floatOk: boolean,
+): Promise<Float32Array> {
+  const numComponents = size * size * 4;
+  if (floatOk) {
+    const pixels = new Float32Array(numComponents);
+    await renderer.readRenderTargetPixelsAsync(
+      target,
+      0,
+      0,
+      size,
+      size,
+      pixels,
+    );
+    return pixels;
+  }
+  const halfPixels = new Uint16Array(numComponents);
+  await renderer.readRenderTargetPixelsAsync(
+    target,
+    0,
+    0,
+    size,
+    size,
+    halfPixels,
+  );
+  const pixels = new Float32Array(numComponents);
+  for (let i = 0; i < numComponents; i++) {
+    pixels[i] = THREE.DataUtils.fromHalfFloat(halfPixels[i]);
+  }
+  return pixels;
+}
+
+function pickResultFromPixels({
+  pixelsMedia,
+  pixelsSolid,
+  size,
+  camera,
+  x,
+  y,
+  fullW,
+  fullH,
+  farBig,
+  floatType,
+}: {
+  // Layout per pixel (premultiplied-over pass): R = sum(w*d), A = sum(w).
+  pixelsMedia: Float32Array;
+  // Layout per pixel (MIN-blended pass): R = depth of first solid hit, or
+  // farBig() if none. null when the solid pass was skipped (solid: false).
+  pixelsSolid: Float32Array | null;
+  size: number;
+  camera: THREE.PerspectiveCamera | THREE.OrthographicCamera;
+  x: number;
+  y: number;
+  fullW: number;
+  fullH: number;
+  farBig: number;
+  floatType: "float" | "half";
+}): SparkPickResult | null {
+  const center = Math.floor(size / 2);
+  const solidThreshold = farBig * 0.5;
+
+  // Coverage (the "media" pass's accumulated alpha, channel A) decides
+  // whether a pixel counts as a hit at all. Prefer the center pixel (the
+  // actual click/hover point); row/col order (WebGL returns rows
+  // bottom-to-top) doesn't matter here since the center index is symmetric
+  // for odd `size`, the default.
+  let bestRow = -1;
+  let bestCol = -1;
+  const centerCoverage = pixelsMedia[(center * size + center) * 4 + 3];
+  if (centerCoverage > 1e-4) {
+    bestRow = center;
+    bestCol = center;
+  } else {
+    // Otherwise the pixel with the most coverage, closest to center on ties.
+    let bestCoverage = 0;
+    let bestDistSq = Number.POSITIVE_INFINITY;
+    for (let row = 0; row < size; row++) {
+      for (let col = 0; col < size; col++) {
+        const coverage = pixelsMedia[(row * size + col) * 4 + 3];
+        if (coverage <= 1e-4) continue;
+        const distSq = (row - center) ** 2 + (col - center) ** 2;
+        if (
+          coverage > bestCoverage ||
+          (coverage === bestCoverage && distSq < bestDistSq)
+        ) {
+          bestCoverage = coverage;
+          bestDistSq = distSq;
+          bestRow = row;
+          bestCol = col;
+        }
+      }
+    }
+  }
+
+  if (bestRow < 0) {
+    return null;
+  }
+
+  const i = (bestRow * size + bestCol) * 4;
+  const wSum = pixelsMedia[i]; // sum(w*d)
+  const coverage = pixelsMedia[i + 3]; // sum(w)
+  // depth of first solid hit, or farBig(); null if the solid pass was skipped
+  const solidDepth = pixelsSolid ? pixelsSolid[i] : null;
+
+  const dMedia = coverage > 1e-4 ? wSum / coverage : null;
+  const dSolida =
+    solidDepth !== null && solidDepth < solidThreshold ? solidDepth : null;
+
+  // ndcX/ndcY for the *center* of the pick window, in the full-resolution
+  // image's NDC space - the camera's real, unmodified projection matrix is
+  // used for this, not the cropped pickCamera's.
+  const ndcX = (x / fullW) * 2 - 1;
+  const ndcY = -(y / fullH) * 2 + 1;
+
+  const pointMedia =
+    dMedia !== null
+      ? viewPointAtDepth(camera, ndcX, ndcY, dMedia).applyMatrix4(
+          camera.matrixWorld,
+        )
+      : new THREE.Vector3();
+  const pointSolida =
+    dSolida !== null
+      ? viewPointAtDepth(camera, ndcX, ndcY, dSolida).applyMatrix4(
+          camera.matrixWorld,
+        )
+      : null;
+
+  return {
+    point: pointMedia,
+    pointMedia,
+    pointSolida,
+    distanceMedia: dMedia ?? Number.POSITIVE_INFINITY,
+    distanceSolida: dSolida,
+    copertura: coverage,
+    floatType,
+    ms: 0,
+  };
 }

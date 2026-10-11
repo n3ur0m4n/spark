@@ -7905,8 +7905,11 @@ var splatDefines_default = "const float LN_SCALE_MIN = -12.0;\nconst float LN_SC
 //#region src/shaders/splatFragment.glsl
 var splatFragment_default = "precision highp float;\nprecision highp int;\n\n#include <splatDefines>\n\nuniform float near;\nuniform float far;\nuniform bool encodeLinear;\nuniform float time;\nuniform bool debugFlag;\nuniform float maxStdDev;\nuniform float minAlpha;\nuniform bool disableFalloff;\nuniform float falloff;\n\nout vec4 fragColor;\n\nin vec4 vRgba;\nin vec2 vSplatUv;\nin vec3 vNdc;\nflat in uint vSplatIndex;\nflat in float adjustedStdDev;\n\n#include <logdepthbuf_pars_fragment>\n\nvoid main() {\n    vec4 rgba = vRgba;\n\n    float z2 = dot(vSplatUv, vSplatUv);\n    if (z2 > (adjustedStdDev * adjustedStdDev)) {\n        discard;\n    }\n\n    if (false) {\n    \n        float a = rgba.a;\n        float shifted = sqrt(z2) - max(0.0, a - 1.0);\n        float exponent = -0.5 * max(1.0, a) * sqr(max(0.0, shifted));\n        float min1a = min(1.0, a);\n        rgba.a = mix(min1a, min1a * exp(exponent), falloff);\n    } else {\n        \n        if (rgba.a <= 1.0) {\n            rgba.a = mix(rgba.a, rgba.a * exp(-0.5 * z2), falloff);\n        } else {\n            float a = exp((rgba.a*rgba.a - 1.0) / 2.718281828459045);\n            float alpha = 1.0 - pow(1.0 - exp(-0.5 * z2), a);\n            rgba.a = mix(1.0, alpha, falloff);\n        }\n    }\n\n    if (rgba.a < minAlpha) {\n        discard;\n    }\n    if (encodeLinear) {\n        rgba.rgb = srgbToLinear(rgba.rgb);\n    }\n\n    #ifdef PREMULTIPLIED_ALPHA\n        fragColor = vec4(rgba.rgb * rgba.a, rgba.a);\n    #else\n        fragColor = rgba;\n    #endif\n\n    #include <logdepthbuf_fragment>\n}";
 //#endregion
+//#region src/shaders/splatPickFragment.glsl
+var splatPickFragment_default = "precision highp float;\nprecision highp int;\n\n#include <splatDefines>\n\n#include <packing>\n\nuniform float near;\nuniform float far;\nuniform float maxStdDev;\nuniform float minAlpha;\nuniform float falloff;\n\nuniform float alphaThreshold;\n\nuniform bool pickSolidMode;\n\nout vec4 fragColor;\n\nin vec4 vRgba;\nin vec2 vSplatUv;\nin vec3 vNdc;\nflat in uint vSplatIndex;\nflat in float adjustedStdDev;\n\n#ifdef SPARK_PICK_DEPTH\nin vec3 vPickRay;\nflat in vec3 vPickCenter;\nflat in vec3 vPickSinvDiag;\nflat in vec3 vPickSinvOff;\nflat in vec2 vPickAux;\n#endif\n\n#include <logdepthbuf_pars_fragment>\n\nfloat farBig() {\n    return min(far * 4.0, 60000.0);\n}\n\nvoid main() {\n    vec4 rgba = vRgba;\n\n    float z2 = dot(vSplatUv, vSplatUv);\n    if (z2 > (adjustedStdDev * adjustedStdDev)) {\n        discard;\n    }\n\n    \n    if (rgba.a <= 1.0) {\n        rgba.a = mix(rgba.a, rgba.a * exp(-0.5 * z2), falloff);\n    } else {\n        float a = exp((rgba.a * rgba.a - 1.0) / 2.718281828459045);\n        float alpha = 1.0 - pow(1.0 - exp(-0.5 * z2), a);\n        rgba.a = mix(1.0, alpha, falloff);\n    }\n\n    if (rgba.a < minAlpha) {\n        discard;\n    }\n\n    float a = rgba.a;\n\n    \n    \n    \n    float depth01 = vNdc.z * 0.5 + 0.5;\n    float viewZ = isOrthographic\n        ? orthographicDepthToViewZ(depth01, near, far)\n        : perspectiveDepthToViewZ(depth01, near, far);\n    float d = -viewZ;\n\n    #ifdef SPARK_PICK_DEPTH\n    if (vPickAux.y < 0.5) {\n        \n        \n        \n        \n        \n        vec3 r = vPickRay;\n        vec3 sR = vec3(\n            dot(vec3(vPickSinvDiag.x, vPickSinvOff.x, vPickSinvOff.y), r),\n            dot(vec3(vPickSinvOff.x, vPickSinvDiag.y, vPickSinvOff.z), r),\n            dot(vec3(vPickSinvOff.y, vPickSinvOff.z, vPickSinvDiag.z), r)\n        );\n        float rSr = dot(r, sR);\n        float t0 = -vPickCenter.z;\n        d = t0;\n        if (rSr > 0.0) {\n            vec3 delta = vPickCenter - t0 * r;\n            float dt = dot(sR, delta) / rSr;\n            \n            \n            \n            \n            float bound = adjustedStdDev * vPickAux.x;\n            d = t0 + clamp(dt, -bound, bound);\n        }\n        d = max(d, near);\n    }\n    #endif\n\n    if (pickSolidMode) {\n        \n        \n        \n        \n        fragColor = vec4(a > alphaThreshold ? d : farBig(), 0.0, 0.0, 0.0);\n    } else {\n        \n        \n        \n        \n        \n        \n        \n        \n        \n        fragColor = vec4(d * a, 0.0, 0.0, a);\n    }\n\n    #include <logdepthbuf_fragment>\n}";
+//#endregion
 //#region src/shaders/splatVertex.glsl
-var splatVertex_default = "precision highp float;\nprecision highp int;\nprecision highp usampler2DArray;\n\n#include <splatDefines>\n\nout vec4 vRgba;\nout vec2 vSplatUv;\nout vec3 vNdc;\nflat out uint vSplatIndex;\nflat out float adjustedStdDev;\n\nuniform vec2 renderSize;\nuniform vec4 renderToViewQuat;\nuniform vec3 renderToViewPos;\nuniform mat3 renderToViewBasis;\nuniform float maxStdDev;\nuniform float minPixelRadius;\nuniform float maxPixelRadius;\nuniform bool enableExtSplats;\nuniform bool enableCovSplats;\nuniform float time;\nuniform float deltaTime;\nuniform bool debugFlag;\nuniform float minAlpha;\nuniform bool enable2DGS;\nuniform bool lodInflate;\nuniform float blurAmount;\nuniform float preBlurAmount;\nuniform float focalDistance;\nuniform float apertureAngle;\nuniform float clipXY;\nuniform float focalAdjustment;\n\nuniform usampler2D ordering;\nuniform usampler2DArray extSplats;\nuniform usampler2DArray extSplats2;\n\nbool isPerspectiveMatrix( mat4 m ) {\n    return m[ 2 ][ 3 ] == -1.0;\n}\n\n#include <logdepthbuf_pars_vertex>\n\nvoid main() {\n    \n    gl_Position = vec4(0.0, 0.0, 2.0, 1.0);\n\n    ivec2 orderingCoord = ivec2((gl_InstanceID >> 2) & 4095, gl_InstanceID >> 14);\n    uint splatIndex = texelFetch(ordering, orderingCoord, 0)[gl_InstanceID & 3];\n    if (splatIndex == 0xffffffffu) {\n        \n        return;\n    }\n\n    ivec3 texCoord = splatTexCoord(int(splatIndex));\n    vec3 center, scales, xxyyzz, xyxzyz;\n    vec4 quaternion, rgba;\n    mat3 cov3D;\n    bvec3 zeroScales = bvec3(false);\n\n    if (enableExtSplats) {\n        uvec4 ext1 = texelFetch(extSplats, texCoord, 0);\n        float alpha = unpackSplatExtAlpha(ext1);\n        if ((alpha == 0.0) || (alpha < minAlpha)) {\n            return;\n        }\n        uvec4 ext2 = texelFetch(extSplats2, texCoord, 0);\n\n        if (!enableCovSplats) {\n            unpackSplatExt(ext1, ext2, center, scales, quaternion, rgba);\n            zeroScales = equal(scales, vec3(0.0));\n            if (all(zeroScales)) {\n                return;\n            }\n        } else {\n            unpackSplatExtCov(ext1, ext2, center, rgba, xxyyzz, xyxzyz);\n            if (all(equal(xxyyzz, vec3(0.0))) && all(equal(xyxzyz, vec3(0.0)))) {\n                return;\n            }\n        }\n    } else {\n        uvec4 packedData = texelFetch(extSplats, texCoord, 0);\n        if (!enableCovSplats) {\n            unpackSplatEncoding(packedData, center, scales, quaternion, rgba, vec4(0.0, 1.0, LN_SCALE_MIN, LN_SCALE_MAX));\n            zeroScales = equal(scales, vec3(0.0));\n            if (all(zeroScales)) {\n                return;\n            }\n        } else {\n            unpackSplatCovEncoding(packedData, center, rgba, xxyyzz, xyxzyz, vec4(0.0, 1.0, LN_SCALE_MIN, LN_SCALE_MAX));\n            if (all(equal(xxyyzz, vec3(0.0))) && all(equal(xyxzyz, vec3(0.0)))) {\n                return;\n            }\n        }\n\n        rgba.a *= 2.0;\n        if ((rgba.a == 0.0) || (rgba.a < minAlpha)) {\n            return;\n        }\n    }\n\n    \n    \n    rgba.rgb = max(rgba.rgb, vec3(0.0));\n\n    adjustedStdDev = maxStdDev;\n    if (rgba.a > 1.0) {\n        \n        rgba.a = min(rgba.a * 4.0 - 3.0, 5.0);\n\n        if (lodInflate) {\n            \n            float opacity = exp((rgba.a * rgba.a - 1.0) / 2.718281828459045);\n            float rescale = pow(opacity, 1.0 / 3.0);\n            scales *= rescale;\n            rgba.a = 1.0;\n        }\n\n        \n        adjustedStdDev = maxStdDev + 0.7 * (rgba.a - 1.0);\n    }\n\n    \n    vec3 viewCenter = (!enableCovSplats ? quatVec(renderToViewQuat, center) : (renderToViewBasis * center)) + renderToViewPos;\n\n    \n    if (viewCenter.z >= 0.0) {\n        return;\n    }\n\n    \n    vec4 clipCenter = projectionMatrix * vec4(viewCenter, 1.0);\n\n    \n    if (abs(clipCenter.z) >= clipCenter.w) {\n        return;\n    }\n\n    \n    float clip = clipXY * clipCenter.w;\n    if (abs(clipCenter.x) > clip || abs(clipCenter.y) > clip) {\n        return;\n    }\n\n    vRgba = rgba;\n    vSplatUv = position.xy * adjustedStdDev;\n\n    \n    vSplatIndex = splatIndex;\n\n    if (!enableCovSplats) {\n        \n        vec4 viewQuaternion = quatQuat(renderToViewQuat, quaternion);\n\n        if (enable2DGS && any(zeroScales)) {\n            vec3 offset;\n            if (zeroScales.z) {\n                offset = vec3(vSplatUv.xy * scales.xy, 0.0);\n            } else if (zeroScales.y) {\n                offset = vec3(vSplatUv.x * scales.x, 0.0, vSplatUv.y * scales.z);\n            } else {\n                offset = vec3(0.0, vSplatUv.xy * scales.yz);\n            }\n\n            vec3 viewPos = viewCenter + quatVec(viewQuaternion, offset);\n            gl_Position = projectionMatrix * vec4(viewPos, 1.0);\n            vNdc = gl_Position.xyz / gl_Position.w;\n\n            #include <logdepthbuf_vertex>\n            return;\n        }\n\n        \n        mat3 RS = scaleQuaternionToMatrix(scales, viewQuaternion);\n        cov3D = RS * transpose(RS);\n    } else {\n        cov3D = mat3(\n            xxyyzz.x, xyxzyz.x, xyxzyz.y,\n            xyxzyz.x, xxyyzz.y, xyxzyz.z,\n            xyxzyz.y, xyxzyz.z, xxyyzz.z\n        );\n        cov3D = renderToViewBasis * cov3D * transpose(renderToViewBasis);\n    }\n\n    \n    vec2 scaledRenderSize = renderSize * focalAdjustment;\n    vec2 focal = 0.5 * scaledRenderSize * vec2(projectionMatrix[0][0], projectionMatrix[1][1]);\n\n    mat3 J;\n    if (isOrthographic) {\n        J = mat3(\n            focal.x, 0.0, 0.0,\n            0.0, focal.y, 0.0,\n            0.0, 0.0, 0.0\n        );\n    } else {\n        float invZ = 1.0 / viewCenter.z;\n        vec2 J1 = focal * invZ;\n        vec2 J2 = -(J1 * viewCenter.xy) * invZ;\n        J = mat3(\n            J1.x, 0.0, J2.x,\n            0.0, J1.y, J2.y,\n            0.0, 0.0, 0.0\n        );\n    }\n\n    \n    \n    mat3 cov2D = transpose(J) * cov3D * J;\n    float a = cov2D[0][0];\n    float d = cov2D[1][1];\n    float b = cov2D[0][1];\n\n    \n    a += preBlurAmount;\n    d += preBlurAmount;\n\n    float fullBlurAmount = blurAmount;\n    if ((focalDistance > 0.0) && (apertureAngle > 0.0)) {\n        float focusRadius = maxPixelRadius;\n        if (viewCenter.z < 0.0) {\n            float focusBlur = abs((-viewCenter.z - focalDistance) / viewCenter.z);\n            float apertureRadius = focal.x * tan(0.5 * apertureAngle);\n            focusRadius = focusBlur * apertureRadius;\n        }\n        fullBlurAmount = clamp(sqr(focusRadius), blurAmount, sqr(maxPixelRadius));\n    }\n\n    \n    float detOrig = a * d - b * b;\n    a += fullBlurAmount;\n    d += fullBlurAmount;\n    float det = a * d - b * b;\n\n    \n    float blurAdjust = sqrt(max(0.0, detOrig / det));\n    rgba.a *= blurAdjust;\n    if (rgba.a < minAlpha) {\n        return;\n    }\n    vRgba.a = rgba.a;\n\n    \n    float eigenAvg = 0.5 * (a + d);\n    float eigenDelta = sqrt(max(0.0, eigenAvg * eigenAvg - det));\n    float eigen1 = eigenAvg + eigenDelta;\n    float eigen2 = eigenAvg - eigenDelta;\n\n    vec2 eigenVec1 = (abs(b) > 0.001) ? normalize(vec2(b, eigen1 - a))\n        : ((a >= d) ? vec2(1.0, 0.0) : vec2(0.0, 1.0));\n    vec2 eigenVec2 = vec2(eigenVec1.y, -eigenVec1.x);\n\n    float scale1 = min(maxPixelRadius, adjustedStdDev * sqrt(eigen1));\n    float scale2 = min(maxPixelRadius, adjustedStdDev * sqrt(eigen2));\n    if (scale1 < minPixelRadius && scale2 < minPixelRadius) {\n        return;\n    }\n\n    \n    vec2 pixelOffset = position.x * eigenVec1 * scale1 + position.y * eigenVec2 * scale2;\n    vec2 ndcOffset = (2.0 / scaledRenderSize) * pixelOffset;\n\n    \n    vec3 ndcCenter = clipCenter.xyz / clipCenter.w;\n    vec3 ndc = vec3(ndcCenter.xy + ndcOffset, ndcCenter.z);\n\n    vNdc = ndc;\n    gl_Position = vec4(ndc.xy * clipCenter.w, clipCenter.zw);\n\n    #include <logdepthbuf_vertex>\n}";
+var splatVertex_default = "precision highp float;\nprecision highp int;\nprecision highp usampler2DArray;\n\n#include <splatDefines>\n\nout vec4 vRgba;\nout vec2 vSplatUv;\nout vec3 vNdc;\nflat out uint vSplatIndex;\nflat out float adjustedStdDev;\n\n#ifdef SPARK_PICK_DEPTH\n\nout vec3 vPickRay;              \nflat out vec3 vPickCenter;      \nflat out vec3 vPickSinvDiag;    \nflat out vec3 vPickSinvOff;     \nflat out vec2 vPickAux;         \n#endif\n\nuniform vec2 renderSize;\nuniform vec4 renderToViewQuat;\nuniform vec3 renderToViewPos;\nuniform mat3 renderToViewBasis;\nuniform float maxStdDev;\nuniform float minPixelRadius;\nuniform float maxPixelRadius;\nuniform bool enableExtSplats;\nuniform bool enableCovSplats;\nuniform float time;\nuniform float deltaTime;\nuniform bool debugFlag;\nuniform float minAlpha;\nuniform bool enable2DGS;\nuniform bool lodInflate;\nuniform float blurAmount;\nuniform float preBlurAmount;\nuniform float focalDistance;\nuniform float apertureAngle;\nuniform float clipXY;\nuniform float focalAdjustment;\n\nuniform usampler2D ordering;\nuniform usampler2DArray extSplats;\nuniform usampler2DArray extSplats2;\n\nbool isPerspectiveMatrix( mat4 m ) {\n    return m[ 2 ][ 3 ] == -1.0;\n}\n\n#include <logdepthbuf_pars_vertex>\n\nvoid main() {\n    \n    gl_Position = vec4(0.0, 0.0, 2.0, 1.0);\n\n    ivec2 orderingCoord = ivec2((gl_InstanceID >> 2) & 4095, gl_InstanceID >> 14);\n    uint splatIndex = texelFetch(ordering, orderingCoord, 0)[gl_InstanceID & 3];\n    if (splatIndex == 0xffffffffu) {\n        \n        return;\n    }\n\n    ivec3 texCoord = splatTexCoord(int(splatIndex));\n    vec3 center, scales, xxyyzz, xyxzyz;\n    vec4 quaternion, rgba;\n    mat3 cov3D;\n    bvec3 zeroScales = bvec3(false);\n\n    if (enableExtSplats) {\n        uvec4 ext1 = texelFetch(extSplats, texCoord, 0);\n        float alpha = unpackSplatExtAlpha(ext1);\n        if ((alpha == 0.0) || (alpha < minAlpha)) {\n            return;\n        }\n        uvec4 ext2 = texelFetch(extSplats2, texCoord, 0);\n\n        if (!enableCovSplats) {\n            unpackSplatExt(ext1, ext2, center, scales, quaternion, rgba);\n            zeroScales = equal(scales, vec3(0.0));\n            if (all(zeroScales)) {\n                return;\n            }\n        } else {\n            unpackSplatExtCov(ext1, ext2, center, rgba, xxyyzz, xyxzyz);\n            if (all(equal(xxyyzz, vec3(0.0))) && all(equal(xyxzyz, vec3(0.0)))) {\n                return;\n            }\n        }\n    } else {\n        uvec4 packedData = texelFetch(extSplats, texCoord, 0);\n        if (!enableCovSplats) {\n            unpackSplatEncoding(packedData, center, scales, quaternion, rgba, vec4(0.0, 1.0, LN_SCALE_MIN, LN_SCALE_MAX));\n            zeroScales = equal(scales, vec3(0.0));\n            if (all(zeroScales)) {\n                return;\n            }\n        } else {\n            unpackSplatCovEncoding(packedData, center, rgba, xxyyzz, xyxzyz, vec4(0.0, 1.0, LN_SCALE_MIN, LN_SCALE_MAX));\n            if (all(equal(xxyyzz, vec3(0.0))) && all(equal(xyxzyz, vec3(0.0)))) {\n                return;\n            }\n        }\n\n        rgba.a *= 2.0;\n        if ((rgba.a == 0.0) || (rgba.a < minAlpha)) {\n            return;\n        }\n    }\n\n    \n    \n    rgba.rgb = max(rgba.rgb, vec3(0.0));\n\n    adjustedStdDev = maxStdDev;\n    if (rgba.a > 1.0) {\n        \n        rgba.a = min(rgba.a * 4.0 - 3.0, 5.0);\n\n        if (lodInflate) {\n            \n            float opacity = exp((rgba.a * rgba.a - 1.0) / 2.718281828459045);\n            float rescale = pow(opacity, 1.0 / 3.0);\n            scales *= rescale;\n            rgba.a = 1.0;\n        }\n\n        \n        adjustedStdDev = maxStdDev + 0.7 * (rgba.a - 1.0);\n    }\n\n    \n    vec3 viewCenter = (!enableCovSplats ? quatVec(renderToViewQuat, center) : (renderToViewBasis * center)) + renderToViewPos;\n\n    \n    if (viewCenter.z >= 0.0) {\n        return;\n    }\n\n    \n    vec4 clipCenter = projectionMatrix * vec4(viewCenter, 1.0);\n\n    \n    if (abs(clipCenter.z) >= clipCenter.w) {\n        return;\n    }\n\n    \n    float clip = clipXY * clipCenter.w;\n    if (abs(clipCenter.x) > clip || abs(clipCenter.y) > clip) {\n        return;\n    }\n\n    vRgba = rgba;\n    vSplatUv = position.xy * adjustedStdDev;\n\n    \n    vSplatIndex = splatIndex;\n\n    if (!enableCovSplats) {\n        \n        vec4 viewQuaternion = quatQuat(renderToViewQuat, quaternion);\n\n        if (enable2DGS && any(zeroScales)) {\n            vec3 offset;\n            if (zeroScales.z) {\n                offset = vec3(vSplatUv.xy * scales.xy, 0.0);\n            } else if (zeroScales.y) {\n                offset = vec3(vSplatUv.x * scales.x, 0.0, vSplatUv.y * scales.z);\n            } else {\n                offset = vec3(0.0, vSplatUv.xy * scales.yz);\n            }\n\n            vec3 viewPos = viewCenter + quatVec(viewQuaternion, offset);\n            gl_Position = projectionMatrix * vec4(viewPos, 1.0);\n            vNdc = gl_Position.xyz / gl_Position.w;\n\n            #ifdef SPARK_PICK_DEPTH\n            \n            vPickRay = vec3(0.0, 0.0, -1.0);\n            vPickCenter = viewCenter;\n            vPickSinvDiag = vec3(0.0);\n            vPickSinvOff = vec3(0.0);\n            vPickAux = vec2(0.0, 1.0);\n            #endif\n\n            #include <logdepthbuf_vertex>\n            return;\n        }\n\n        \n        mat3 RS = scaleQuaternionToMatrix(scales, viewQuaternion);\n        cov3D = RS * transpose(RS);\n    } else {\n        cov3D = mat3(\n            xxyyzz.x, xyxzyz.x, xyxzyz.y,\n            xyxzyz.x, xxyyzz.y, xyxzyz.z,\n            xyxzyz.y, xyxzyz.z, xxyyzz.z\n        );\n        cov3D = renderToViewBasis * cov3D * transpose(renderToViewBasis);\n    }\n\n    \n    vec2 scaledRenderSize = renderSize * focalAdjustment;\n    vec2 focal = 0.5 * scaledRenderSize * vec2(projectionMatrix[0][0], projectionMatrix[1][1]);\n\n    \n    vec3 ndcCenter = clipCenter.xyz / clipCenter.w;\n\n    #ifdef SPARK_PICK_DEPTH\n    \n    \n    \n    \n    \n    {\n        vec2 maxExtNdc = (2.0 * 1.4142136 * maxPixelRadius) / scaledRenderSize;\n        if (any(greaterThan(abs(ndcCenter.xy), vec2(1.0) + maxExtNdc))) {\n            return;\n        }\n    }\n    #endif\n\n    mat3 J;\n    if (isOrthographic) {\n        J = mat3(\n            focal.x, 0.0, 0.0,\n            0.0, focal.y, 0.0,\n            0.0, 0.0, 0.0\n        );\n    } else {\n        float invZ = 1.0 / viewCenter.z;\n        vec2 J1 = focal * invZ;\n        vec2 J2 = -(J1 * viewCenter.xy) * invZ;\n        J = mat3(\n            J1.x, 0.0, J2.x,\n            0.0, J1.y, J2.y,\n            0.0, 0.0, 0.0\n        );\n    }\n\n    \n    \n    mat3 cov2D = transpose(J) * cov3D * J;\n    float a = cov2D[0][0];\n    float d = cov2D[1][1];\n    float b = cov2D[0][1];\n\n    \n    a += preBlurAmount;\n    d += preBlurAmount;\n\n    float fullBlurAmount = blurAmount;\n    if ((focalDistance > 0.0) && (apertureAngle > 0.0)) {\n        float focusRadius = maxPixelRadius;\n        if (viewCenter.z < 0.0) {\n            float focusBlur = abs((-viewCenter.z - focalDistance) / viewCenter.z);\n            float apertureRadius = focal.x * tan(0.5 * apertureAngle);\n            focusRadius = focusBlur * apertureRadius;\n        }\n        fullBlurAmount = clamp(sqr(focusRadius), blurAmount, sqr(maxPixelRadius));\n    }\n\n    \n    float detOrig = a * d - b * b;\n    a += fullBlurAmount;\n    d += fullBlurAmount;\n    float det = a * d - b * b;\n\n    \n    float blurAdjust = sqrt(max(0.0, detOrig / det));\n    rgba.a *= blurAdjust;\n    if (rgba.a < minAlpha) {\n        return;\n    }\n    vRgba.a = rgba.a;\n\n    \n    float eigenAvg = 0.5 * (a + d);\n    float eigenDelta = sqrt(max(0.0, eigenAvg * eigenAvg - det));\n    float eigen1 = eigenAvg + eigenDelta;\n    float eigen2 = eigenAvg - eigenDelta;\n\n    vec2 eigenVec1 = (abs(b) > 0.001) ? normalize(vec2(b, eigen1 - a))\n        : ((a >= d) ? vec2(1.0, 0.0) : vec2(0.0, 1.0));\n    vec2 eigenVec2 = vec2(eigenVec1.y, -eigenVec1.x);\n\n    float scale1 = min(maxPixelRadius, adjustedStdDev * sqrt(eigen1));\n    float scale2 = min(maxPixelRadius, adjustedStdDev * sqrt(eigen2));\n    if (scale1 < minPixelRadius && scale2 < minPixelRadius) {\n        return;\n    }\n\n    #ifdef SPARK_PICK_DEPTH\n    \n    \n    \n    \n    {\n        vec2 extPx = abs(eigenVec1) * scale1 + abs(eigenVec2) * scale2;\n        vec2 extNdc = (2.0 / scaledRenderSize) * extPx;\n        if (any(greaterThan(ndcCenter.xy - extNdc, vec2(1.0))) ||\n            any(lessThan(ndcCenter.xy + extNdc, vec2(-1.0)))) {\n            return;\n        }\n    }\n    {\n        \n        \n        \n        \n        \n        \n        float covMax = max(max(cov3D[0][0], cov3D[1][1]), max(cov3D[2][2], 1e-30));\n        const float epsRel = 1e-6;\n        mat3 sInvN = inverse(cov3D * (1.0 / covMax) + mat3(epsRel));\n        vPickSinvDiag = vec3(sInvN[0][0], sInvN[1][1], sInvN[2][2]);\n        vPickSinvOff = vec3(sInvN[0][1], sInvN[0][2], sInvN[1][2]);\n        vPickCenter = viewCenter;\n        vPickAux = vec2(sqrt(cov3D[2][2] + epsRel * covMax), isOrthographic ? 1.0 : 0.0);\n    }\n    #endif\n\n    \n    vec2 pixelOffset = position.x * eigenVec1 * scale1 + position.y * eigenVec2 * scale2;\n    vec2 ndcOffset = (2.0 / scaledRenderSize) * pixelOffset;\n\n    vec3 ndc = vec3(ndcCenter.xy + ndcOffset, ndcCenter.z);\n\n    vNdc = ndc;\n    gl_Position = vec4(ndc.xy * clipCenter.w, clipCenter.zw);\n\n    #ifdef SPARK_PICK_DEPTH\n    \n    \n    \n    \n    vPickRay = vec3(\n        (ndc.x + projectionMatrix[2][0]) / projectionMatrix[0][0],\n        (ndc.y + projectionMatrix[2][1]) / projectionMatrix[1][1],\n        -1.0\n    );\n    #endif\n\n    #include <logdepthbuf_vertex>\n}";
 //#endregion
 //#region src/shaders.ts
 var shaders = null;
@@ -7916,6 +7919,7 @@ function getShaders() {
 		shaders = {
 			splatVertex: splatVertex_default,
 			splatFragment: splatFragment_default,
+			splatPickFragment: splatPickFragment_default,
 			computeVec4Template: computeVec4_default,
 			computeUvec4Vec4Template: computeUvec4_Vec4_default,
 			computeUvec4x2Vec4Template: computeUvec4x2_Vec4_default,
@@ -12330,6 +12334,9 @@ var SparkRenderer = class SparkRenderer extends three.Mesh {
 		this.lastTraverseTime = 0;
 		this.pagerId = 0;
 		this.superXY = 1;
+		this.pickTargetSize = 0;
+		this.pickTargetIsFloat = false;
+		this.pickPass = false;
 		this.flushAfterGenerate = false;
 		this.flushAfterRead = false;
 		this.readPause = 1;
@@ -12477,6 +12484,18 @@ var SparkRenderer = class SparkRenderer extends three.Mesh {
 			this.backTarget.dispose();
 			this.backTarget = void 0;
 		}
+		if (this.pickTargetMedia) {
+			this.pickTargetMedia.dispose();
+			this.pickTargetMedia = void 0;
+		}
+		if (this.pickTargetSolid) {
+			this.pickTargetSolid.dispose();
+			this.pickTargetSolid = void 0;
+		}
+		this.pickMaterialMedia?.dispose();
+		this.pickMaterialMedia = void 0;
+		this.pickMaterialSolid?.dispose();
+		this.pickMaterialSolid = void 0;
 		if (this.orderingTexture) {
 			this.orderingTexture.dispose();
 			this.orderingTexture = null;
@@ -12517,7 +12536,7 @@ var SparkRenderer = class SparkRenderer extends three.Mesh {
 		const frame = renderer.info.render.frame;
 		const isNewFrame = frame !== spark.lastFrame;
 		spark.lastFrame = frame;
-		if (spark.autoUpdate && isNewFrame) {
+		if (spark.autoUpdate && isNewFrame && !spark.pickPass) {
 			const preUpdate = spark.preUpdate && !renderer.xr.isPresenting;
 			const useCamera = renderer.xr.isPresenting ? renderer.xr.getCamera() : camera;
 			if (preUpdate) spark.updateInternal({
@@ -13348,6 +13367,170 @@ var SparkRenderer = class SparkRenderer extends three.Mesh {
 		}
 	}
 	/**
+	* GPU pick prototype: renders a tiny (size x size) crop of the current
+	* frame (same camera position/orientation, same splat ordering/LoD
+	* selection already computed this frame) in two passes into two offscreen
+	* float targets, then reconstructs the picked 3D point from the readback.
+	* Resolves to null if the pick window had no coverage at all.
+	*
+	* Pass "media" composites splats back-to-front with standard premultiplied
+	* "over" blending (the same blend the main splat shader uses), so R/A end
+	* up holding a true visibility-weighted average depth (R = sum(w*d),
+	* A = sum(w), w_i = a_i * product(1 - a_j) for every splat j in front of
+	* i) - NOT a naive alpha-weighted sum, which would let splats behind an
+	* opaque surface pull the average through/behind it.
+	* Pass "solid" uses MIN blending to find the depth of the frontmost splat
+	* with alpha > alphaThreshold, independent of the first pass. It runs only
+	* with `solid: true` (default false = single "media" pass).
+	*
+	* x, y are CSS pixels relative to renderer.domElement (same convention as
+	* mouse/pointer events), not canvas backing-store pixels.
+	*
+	* Prototype scope: only this SparkRenderer's splats are considered (every
+	* other direct child of its parent scene is temporarily hidden for the
+	* two synchronous render calls), and occlusion by non-splat opaque
+	* geometry is not handled.
+	*/
+	async pickAsync({ camera, x, y, size = 5, alphaThreshold = .1, solid = false }) {
+		const t0 = performance.now();
+		const renderer = this.renderer;
+		if (!this.pickMaterialMedia) {
+			const shaders = getShaders();
+			const commonParams = {
+				glslVersion: three.GLSL3,
+				vertexShader: shaders.splatVertex,
+				fragmentShader: shaders.splatPickFragment,
+				transparent: true,
+				depthTest: this.material.depthTest,
+				depthWrite: this.material.depthWrite,
+				side: three.DoubleSide,
+				allowOverride: false,
+				defines: {
+					...this.material.defines,
+					SPARK_PICK_DEPTH: ""
+				}
+			};
+			this.pickMaterialMedia = new three.ShaderMaterial({
+				...commonParams,
+				premultipliedAlpha: true,
+				uniforms: {
+					...this.uniforms,
+					alphaThreshold: { value: alphaThreshold },
+					pickSolidMode: { value: false }
+				}
+			});
+			this.pickMaterialSolid = new three.ShaderMaterial({
+				...commonParams,
+				uniforms: {
+					...this.uniforms,
+					alphaThreshold: { value: alphaThreshold },
+					pickSolidMode: { value: true }
+				},
+				blending: three.CustomBlending,
+				blendEquation: three.MinEquation,
+				blendSrc: three.OneFactor,
+				blendDst: three.OneFactor,
+				blendEquationAlpha: three.MinEquation,
+				blendSrcAlpha: three.OneFactor,
+				blendDstAlpha: three.OneFactor
+			});
+		}
+		const pickMaterialMedia = this.pickMaterialMedia;
+		const pickMaterialSolid = this.pickMaterialSolid;
+		if (!pickMaterialMedia || !pickMaterialSolid) throw new Error("pick materials not initialized");
+		pickMaterialMedia.uniforms.alphaThreshold.value = alphaThreshold;
+		pickMaterialSolid.uniforms.alphaThreshold.value = alphaThreshold;
+		const floatOk = renderer.extensions.has("EXT_float_blend");
+		const pickFloatType = floatOk ? three.FloatType : three.HalfFloatType;
+		const floatTypeName = floatOk ? "float" : "half";
+		const makeTarget = () => new three.WebGLRenderTarget(size, size, {
+			type: pickFloatType,
+			format: three.RGBAFormat,
+			depthBuffer: true,
+			stencilBuffer: false,
+			magFilter: three.NearestFilter,
+			minFilter: three.NearestFilter
+		});
+		let targetMedia = this.pickTargetMedia;
+		let targetSolid = this.pickTargetSolid;
+		if (!targetMedia || !targetSolid || this.pickTargetSize !== size || this.pickTargetIsFloat !== floatOk) {
+			targetMedia?.dispose();
+			targetSolid?.dispose();
+			targetMedia = makeTarget();
+			targetSolid = makeTarget();
+			this.pickTargetMedia = targetMedia;
+			this.pickTargetSolid = targetSolid;
+			this.pickTargetSize = size;
+			this.pickTargetIsFloat = floatOk;
+		}
+		const canvas = renderer.domElement;
+		const fullW = canvas.clientWidth || canvas.width;
+		const fullH = canvas.clientHeight || canvas.height;
+		const pickCamera = camera.clone();
+		pickCamera.setViewOffset(fullW, fullH, x - size / 2, y - size / 2, size, size);
+		pickCamera.updateProjectionMatrix();
+		const farBig = Math.min(6e4, Math.max(1e4, camera.far * 4));
+		const scene = this.parent;
+		const hidden = [];
+		if (scene) {
+			for (const child of scene.children) if (child !== this && child.visible) {
+				hidden.push(child);
+				child.visible = false;
+			}
+		}
+		const prevTarget = renderer.getRenderTarget();
+		const prevAutoClear = renderer.autoClear;
+		const prevXrEnabled = renderer.xr.enabled;
+		const prevClearColor = new three.Color();
+		renderer.getClearColor(prevClearColor);
+		const prevClearAlpha = renderer.getClearAlpha();
+		const prevMaterial = this.material;
+		const materialHolder = this;
+		const prevClipXY = this.clipXY;
+		try {
+			renderer.xr.enabled = false;
+			this.pickPass = true;
+			this.clipXY = 1e6;
+			renderer.autoClear = false;
+			materialHolder.material = pickMaterialMedia;
+			renderer.setRenderTarget(targetMedia);
+			renderer.setClearColor(0, 0);
+			renderer.clear(true, true, false);
+			renderer.render(scene ?? this, pickCamera);
+			if (solid) {
+				materialHolder.material = pickMaterialSolid;
+				renderer.setRenderTarget(targetSolid);
+				renderer.state.buffers.color.setClear(farBig, farBig, farBig, 0, false);
+				renderer.clear(true, true, false);
+				renderer.render(scene ?? this, pickCamera);
+			}
+		} finally {
+			this.pickPass = false;
+			this.clipXY = prevClipXY;
+			materialHolder.material = prevMaterial;
+			renderer.setRenderTarget(prevTarget);
+			renderer.autoClear = prevAutoClear;
+			renderer.xr.enabled = prevXrEnabled;
+			renderer.setClearColor(prevClearColor, prevClearAlpha);
+			for (const child of hidden) child.visible = true;
+		}
+		const [pixelsMedia, pixelsSolid] = await Promise.all([readPickTargetPixels(renderer, targetMedia, size, floatOk), solid ? readPickTargetPixels(renderer, targetSolid, size, floatOk) : null]);
+		const result = pickResultFromPixels({
+			pixelsMedia,
+			pixelsSolid,
+			size,
+			camera,
+			x,
+			y,
+			fullW,
+			fullH,
+			farBig,
+			floatType: floatTypeName
+		});
+		if (result) result.ms = performance.now() - t0;
+		return result;
+	}
+	/**
 	* One raycastLodTree on the pick worker, at most one in flight, the others
 	* waiting in FIFO order. A request with a coalesce `key` replaces the waiting
 	* request with the same key (latest wins), so a burst of hovers never piles
@@ -13403,6 +13586,74 @@ var SparkRenderer = class SparkRenderer extends three.Mesh {
 };
 function checkIsXRRenderTarget(renderTarget) {
 	return renderTarget?.isXRRenderTarget;
+}
+function viewPointAtDepth(camera, ndcX, ndcY, d) {
+	const m = camera.projectionMatrix.elements;
+	if ("isOrthographicCamera" in camera) {
+		const viewX = (ndcX - m[12]) / m[0];
+		const viewY = (ndcY - m[13]) / m[5];
+		return new three.Vector3(viewX, viewY, -d);
+	}
+	const viewX = (ndcX + m[8]) / m[0];
+	const viewY = (ndcY + m[9]) / m[5];
+	return new three.Vector3(viewX * d, viewY * d, -d);
+}
+async function readPickTargetPixels(renderer, target, size, floatOk) {
+	const numComponents = size * size * 4;
+	if (floatOk) {
+		const pixels = new Float32Array(numComponents);
+		await renderer.readRenderTargetPixelsAsync(target, 0, 0, size, size, pixels);
+		return pixels;
+	}
+	const halfPixels = new Uint16Array(numComponents);
+	await renderer.readRenderTargetPixelsAsync(target, 0, 0, size, size, halfPixels);
+	const pixels = new Float32Array(numComponents);
+	for (let i = 0; i < numComponents; i++) pixels[i] = three.DataUtils.fromHalfFloat(halfPixels[i]);
+	return pixels;
+}
+function pickResultFromPixels({ pixelsMedia, pixelsSolid, size, camera, x, y, fullW, fullH, farBig, floatType }) {
+	const center = Math.floor(size / 2);
+	const solidThreshold = farBig * .5;
+	let bestRow = -1;
+	let bestCol = -1;
+	if (pixelsMedia[(center * size + center) * 4 + 3] > 1e-4) {
+		bestRow = center;
+		bestCol = center;
+	} else {
+		let bestCoverage = 0;
+		let bestDistSq = Number.POSITIVE_INFINITY;
+		for (let row = 0; row < size; row++) for (let col = 0; col < size; col++) {
+			const coverage = pixelsMedia[(row * size + col) * 4 + 3];
+			if (coverage <= 1e-4) continue;
+			const distSq = (row - center) ** 2 + (col - center) ** 2;
+			if (coverage > bestCoverage || coverage === bestCoverage && distSq < bestDistSq) {
+				bestCoverage = coverage;
+				bestDistSq = distSq;
+				bestRow = row;
+				bestCol = col;
+			}
+		}
+	}
+	if (bestRow < 0) return null;
+	const i = (bestRow * size + bestCol) * 4;
+	const wSum = pixelsMedia[i];
+	const coverage = pixelsMedia[i + 3];
+	const solidDepth = pixelsSolid ? pixelsSolid[i] : null;
+	const dMedia = coverage > 1e-4 ? wSum / coverage : null;
+	const dSolida = solidDepth !== null && solidDepth < solidThreshold ? solidDepth : null;
+	const ndcX = x / fullW * 2 - 1;
+	const ndcY = -(y / fullH) * 2 + 1;
+	const pointMedia = dMedia !== null ? viewPointAtDepth(camera, ndcX, ndcY, dMedia).applyMatrix4(camera.matrixWorld) : new three.Vector3();
+	return {
+		point: pointMedia,
+		pointMedia,
+		pointSolida: dSolida !== null ? viewPointAtDepth(camera, ndcX, ndcY, dSolida).applyMatrix4(camera.matrixWorld) : null,
+		distanceMedia: dMedia ?? Number.POSITIVE_INFINITY,
+		distanceSolida: dSolida,
+		copertura: coverage,
+		floatType,
+		ms: 0
+	};
 }
 //#endregion
 //#region src/spz.ts

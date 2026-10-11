@@ -306,6 +306,27 @@ export interface SparkRendererOptions {
      */
     depthWrite?: boolean;
 }
+/**
+ * Result of {@link SparkRenderer.pickAsync}. Depths/distances are linear
+ * view-space depth (world units along the camera's forward axis), not
+ * Euclidean distance from the camera.
+ */
+export interface SparkPickResult {
+    /** Best point: always pointMedia (pointSolida is extra info only). */
+    point: THREE.Vector3;
+    /** World point reconstructed from the alpha-weighted average depth. */
+    pointMedia: THREE.Vector3;
+    /** World point reconstructed from the first "solid" splat's depth, if any
+     *  (always null unless pickAsync() was called with solid: true). */
+    pointSolida: THREE.Vector3 | null;
+    distanceMedia: number;
+    distanceSolida: number | null;
+    /** Sum of alpha coverage (G channel) at the chosen pixel. */
+    copertura: number;
+    floatType: "float" | "half";
+    /** Wall-clock time for the whole pickAsync() call, in ms. */
+    ms: number;
+}
 export declare class SparkRenderer extends THREE.Mesh {
     readonly renderer: THREE.WebGLRenderer;
     readonly material: THREE.ShaderMaterial;
@@ -428,6 +449,13 @@ export declare class SparkRenderer extends THREE.Mesh {
     superPixels?: Uint8Array;
     targetPixels?: Uint8Array;
     superXY: number;
+    private pickMaterialMedia?;
+    private pickMaterialSolid?;
+    private pickTargetMedia?;
+    private pickTargetSolid?;
+    private pickTargetSize;
+    private pickTargetIsFloat;
+    private pickPass;
     flushAfterGenerate: boolean;
     flushAfterRead: boolean;
     readPause: number;
@@ -609,6 +637,41 @@ export declare class SparkRenderer extends THREE.Mesh {
         signal?: AbortSignal;
         coalesce?: string | boolean;
     }): Promise<THREE.Intersection[]>;
+    /**
+     * GPU pick prototype: renders a tiny (size x size) crop of the current
+     * frame (same camera position/orientation, same splat ordering/LoD
+     * selection already computed this frame) in two passes into two offscreen
+     * float targets, then reconstructs the picked 3D point from the readback.
+     * Resolves to null if the pick window had no coverage at all.
+     *
+     * Pass "media" composites splats back-to-front with standard premultiplied
+     * "over" blending (the same blend the main splat shader uses), so R/A end
+     * up holding a true visibility-weighted average depth (R = sum(w*d),
+     * A = sum(w), w_i = a_i * product(1 - a_j) for every splat j in front of
+     * i) - NOT a naive alpha-weighted sum, which would let splats behind an
+     * opaque surface pull the average through/behind it.
+     * Pass "solid" uses MIN blending to find the depth of the frontmost splat
+     * with alpha > alphaThreshold, independent of the first pass. It runs only
+     * with `solid: true` (default false = single "media" pass).
+     *
+     * x, y are CSS pixels relative to renderer.domElement (same convention as
+     * mouse/pointer events), not canvas backing-store pixels.
+     *
+     * Prototype scope: only this SparkRenderer's splats are considered (every
+     * other direct child of its parent scene is temporarily hidden for the
+     * two synchronous render calls), and occlusion by non-splat opaque
+     * geometry is not handled.
+     */
+    pickAsync({ camera, x, y, size, alphaThreshold, solid, }: {
+        camera: THREE.PerspectiveCamera | THREE.OrthographicCamera;
+        x: number;
+        y: number;
+        size?: number;
+        alphaThreshold?: number;
+        /** Also run the "solid" (first hit > alphaThreshold) pass. Default false:
+         *  one pass only, pointSolida/distanceSolida are null. */
+        solid?: boolean;
+    }): Promise<SparkPickResult | null>;
     /**
      * One raycastLodTree on the pick worker, at most one in flight, the others
      * waiting in FIFO order. A request with a coalesce `key` replaces the waiting
