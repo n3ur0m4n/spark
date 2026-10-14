@@ -13,6 +13,13 @@ import { SPLAT_TEX_HEIGHT, SPLAT_TEX_WIDTH } from "./defines";
 import { SPARK_ENABLE_HOOKS, sparkHook } from "./hooks";
 import { getShaders } from "./shaders";
 import {
+  type ParallelSortBuffers,
+  SORT_PARALLEL_MIN_SPLATS,
+  ensureParallelSortBuffers,
+  parallelSort16,
+  parallelSort32,
+} from "./sortParallel";
+import {
   isAndroid,
   isIos,
   isMobile,
@@ -164,6 +171,30 @@ export interface SparkRendererOptions {
    * @default 0
    */
   minSortIntervalMs?: number;
+  /**
+   * Number of workers for the depth sort. Above 1 the sort is split across
+   * that many workers via SharedArrayBuffer, used only when the page is
+   * crossOriginIsolated and there are at least 1M splats; otherwise a single
+   * worker sorts.
+   * @default max(1, min(4, hardwareConcurrency - 1))
+   */
+  sortThreads?: number;
+  /**
+   * Sort only splats whose center lies inside a cone around the view
+   * direction, with this full angle in degrees; the others are not drawn.
+   * Use a value larger than the camera's diagonal FOV (splats are culled by
+   * center, and the sort runs behind the camera motion). Ignored for
+   * orthographic cameras. 0 disables it.
+   * @default 0
+   */
+  sortCullFov?: number;
+  /**
+   * Sort by the depth rounded to 16-bit float (one counting pass instead of
+   * two radix passes). Same splats are drawn, ordering precision is ~1/2048
+   * of the distance.
+   * @default false
+   */
+  sort16?: boolean;
   /*
    * Flag to control whether LoD is enabled. @default true
    */
@@ -383,6 +414,11 @@ export class SparkRenderer extends THREE.Mesh {
 
   sortRadial: boolean;
   minSortIntervalMs: number;
+  sortThreads: number;
+  sortCullFov: number;
+  sort16: boolean;
+  // sortCullFov of the last generated accumulator, as cos(half angle)
+  private sortCullCos = -2;
 
   readonly timer: THREE.Timer;
   private readonly ownsTimer: boolean;
@@ -411,6 +447,10 @@ export class SparkRenderer extends THREE.Mesh {
   sortedCenter = new THREE.Vector3().setScalar(Number.NEGATIVE_INFINITY);
   sortedDir = new THREE.Vector3().setScalar(0);
   readback32 = new Uint32Array(0);
+  // Parallel sort: dedicated workers, shared buffers, upload copy of ordering
+  sortPool: SplatWorker[] = [];
+  private parallelSortBuffers?: ParallelSortBuffers;
+  private orderingUpload = new Uint32Array(0);
 
   // Meshes still loading; a render is requested when they finish.
   private readonly initWatched = new WeakSet<SplatMesh>();
@@ -514,7 +554,8 @@ export class SparkRenderer extends THREE.Mesh {
   private pickMaterialSolid?: THREE.ShaderMaterial;
   private pickTargetMedia?: THREE.WebGLRenderTarget;
   private pickTargetSolid?: THREE.WebGLRenderTarget;
-  private pickTargetSize = 0;
+  private pickTargetW = 0;
+  private pickTargetH = 0;
   private pickTargetIsFloat = false;
   // Set for the duration of the synchronous pickAsync() render call so
   // onBeforeRender() skips the sort/LoD-update trigger (see onBeforeRender);
@@ -590,6 +631,14 @@ export class SparkRenderer extends THREE.Mesh {
 
     this.sortRadial = options.sortRadial ?? true;
     this.minSortIntervalMs = options.minSortIntervalMs ?? 0;
+    this.sortThreads =
+      options.sortThreads ??
+      Math.max(
+        1,
+        Math.min(4, (globalThis.navigator?.hardwareConcurrency || 2) - 1),
+      );
+    this.sortCullFov = options.sortCullFov ?? 0;
+    this.sort16 = options.sort16 ?? false;
 
     this.enableLod = options.enableLod ?? true;
     // enableDriveLod defaults to true if enableLod is true, false otherwise
@@ -812,6 +861,11 @@ export class SparkRenderer extends THREE.Mesh {
       this.sortWorker.dispose();
       this.sortWorker = null;
     }
+    for (const worker of this.sortPool) {
+      worker.dispose();
+    }
+    this.sortPool = [];
+    this.parallelSortBuffers = undefined;
     if (this.lodWorker) {
       this.lodWorker.dispose();
       this.lodWorker = null;
@@ -1048,9 +1102,16 @@ export class SparkRenderer extends THREE.Mesh {
     const center = camera.getWorldPosition(new THREE.Vector3());
     const dir = camera.getWorldDirection(new THREE.Vector3());
 
+    const sortCullCos =
+      this.sortCullFov > 0 &&
+      !(camera as THREE.OrthographicCamera).isOrthographicCamera
+        ? Math.cos((Math.min(this.sortCullFov, 360) * Math.PI) / 360)
+        : -2;
+
     const viewChanged =
       center.distanceTo(this.sortedCenter) > 0.001 ||
-      dir.dot(this.sortedDir) < 0.999;
+      dir.dot(this.sortedDir) < 0.999 ||
+      sortCullCos !== this.sortCullCos;
 
     const next = this.accumulators.pop();
     if (!next) {
@@ -1070,6 +1131,7 @@ export class SparkRenderer extends THREE.Mesh {
         timer: this.timer,
         camera,
         sortRadial: this.sortRadial ?? true,
+        sortCullCos,
         renderSize: this.renderSize,
         previous: this.current,
         lodInstances: this.enableLod ? this.lodInstances : undefined,
@@ -1116,6 +1178,7 @@ export class SparkRenderer extends THREE.Mesh {
       this.accumulators.push(next);
     } else {
       generate();
+      this.sortCullCos = sortCullCos;
 
       if (this.flushAfterGenerate) {
         const gl = renderer.getContext() as WebGL2RenderingContext;
@@ -1195,7 +1258,6 @@ export class SparkRenderer extends THREE.Mesh {
     const orderingMaxSplats = rows * 16384;
     this.maxSplats = Math.max(this.maxSplats, orderingMaxSplats);
 
-    const ordering = new Uint32Array(this.maxSplats);
     const readback = Readback.ensureBuffer(maxSplats, this.readback32);
     this.readback32 = readback;
 
@@ -1213,14 +1275,55 @@ export class SparkRenderer extends THREE.Mesh {
     if (this.isDisposed) {
       return;
     }
-    if (!this.sortWorker) {
-      this.sortWorker = new SplatWorker();
+    const threads = Math.floor(this.sortThreads);
+    let ordering: Uint32Array;
+    let activeSplats: number;
+    if (
+      threads > 1 &&
+      numSplats >= SORT_PARALLEL_MIN_SPLATS &&
+      globalThis.crossOriginIsolated
+    ) {
+      // Read back into the regular buffer (readPixels into shared memory is
+      // not portable), then one copy into the shared keys.
+      const buffers = ensureParallelSortBuffers(
+        this.parallelSortBuffers,
+        this.maxSplats,
+        threads,
+      );
+      this.parallelSortBuffers = buffers;
+      buffers.keys.set(readback.subarray(0, numSplats));
+      while (this.sortPool.length < threads) {
+        this.sortPool.push(new SplatWorker());
+      }
+      const sortPool = this.sortPool;
+      const parallelSort = this.sort16 ? parallelSort16 : parallelSort32;
+      activeSplats = await parallelSort({
+        numSplats,
+        buffers,
+        call: (w, name, args) => sortPool[w].call(name, args as never),
+      });
+      // WebGL may reject uploads from shared memory: copy to a regular array
+      if (this.orderingUpload.length < this.maxSplats) {
+        this.orderingUpload = new Uint32Array(this.maxSplats);
+      }
+      ordering = this.orderingUpload;
+      ordering.set(buffers.ordering.subarray(0, activeSplats));
+    } else {
+      if (!this.sortWorker) {
+        this.sortWorker = new SplatWorker();
+      }
+      const result = await this.sortWorker.call(
+        this.sort16 ? "sortSplats32as16" : "sortSplats32",
+        {
+          numSplats,
+          readback,
+          ordering: new Uint32Array(this.maxSplats),
+        },
+      );
+      this.readback32 = result.readback;
+      ordering = result.ordering;
+      activeSplats = result.activeSplats;
     }
-    const result = await this.sortWorker.call("sortSplats32", {
-      numSplats,
-      readback,
-      ordering,
-    });
 
     if (this.sortDelay > 0) {
       await new Promise((resolve) => setTimeout(resolve, this.sortDelay));
@@ -1230,9 +1333,7 @@ export class SparkRenderer extends THREE.Mesh {
       return;
     }
 
-    this.readback32 = result.readback;
-
-    this.activeSplats = result.activeSplats;
+    this.activeSplats = activeSplats;
 
     if (this.orderingTexture) {
       if (rows > this.orderingTexture.image.height) {
@@ -1244,7 +1345,7 @@ export class SparkRenderer extends THREE.Mesh {
     if (!this.orderingTexture) {
       // console.log(`Allocating orderingTexture: ${4096}x${rows}`);
       const orderingTexture = new THREE.DataTexture(
-        result.ordering,
+        ordering,
         4096,
         rows,
         THREE.RGBAIntegerFormat,
@@ -1263,7 +1364,7 @@ export class SparkRenderer extends THREE.Mesh {
           this.orderingTexture,
           4096,
           rows,
-          result.ordering,
+          ordering,
         );
       }
     }
@@ -2530,6 +2631,197 @@ export class SparkRenderer extends THREE.Mesh {
   }): Promise<SparkPickResult | null> {
     const t0 = performance.now();
     const renderer = this.renderer;
+    const canvas = renderer.domElement;
+    const fullW = canvas.clientWidth || canvas.width;
+    const fullH = canvas.clientHeight || canvas.height;
+
+    const { targetMedia, targetSolid, floatOk, floatTypeName, farBig } =
+      this.pickRender({
+        camera,
+        fullW,
+        fullH,
+        ox: x - size / 2,
+        oy: y - size / 2,
+        w: size,
+        h: size,
+        alphaThreshold,
+        solid,
+      });
+
+    // Safe to await now: render targets are read directly regardless of
+    // the renderer's currently-bound render target.
+    const [pixelsMedia, pixelsSolid] = await Promise.all([
+      readPickTargetPixels(renderer, targetMedia, size, size, floatOk),
+      solid
+        ? readPickTargetPixels(renderer, targetSolid, size, size, floatOk)
+        : null,
+    ]);
+
+    const result = pickResultFromPixels({
+      pixelsMedia,
+      pixelsSolid,
+      size,
+      camera,
+      x,
+      y,
+      fullW,
+      fullH,
+      farBig,
+      floatType: floatTypeName,
+    });
+    if (result) {
+      result.ms = performance.now() - t0;
+    }
+    return result;
+  }
+
+  /**
+   * Batched variant of pickAsync() for several screen points at once: ONE
+   * "media" render + ONE readback of the window covering every point's
+   * size x size pick window, then per point exactly the pixel selection and
+   * depth -> world reconstruction pickAsync() does on its own window.
+   * x, y are CSS pixels relative to renderer.domElement, as in pickAsync().
+   * Results are in input order; null = no coverage, or the point's pick
+   * window is not entirely inside the canvas. No "solid" pass
+   * (pointSolida/distanceSolida are always null). `ms` is the whole call
+   * time, the same for every result.
+   * Pixel grid: every window is aligned to the first in-canvas point's
+   * sub-pixel offset; points at integer offsets from it (the usual case,
+   * e.g. integer CSS coordinates) see exactly the pixels pickAsync() would,
+   * others are rounded to the nearest pixel.
+   */
+  async pickPointsAsync({
+    camera,
+    points,
+    size = 5,
+    alphaThreshold = 0.1,
+  }: {
+    camera: THREE.PerspectiveCamera | THREE.OrthographicCamera;
+    points: { x: number; y: number }[];
+    size?: number;
+    alphaThreshold?: number;
+  }): Promise<(SparkPickResult | null)[]> {
+    const t0 = performance.now();
+    const renderer = this.renderer;
+    const canvas = renderer.domElement;
+    const fullW = canvas.clientWidth || canvas.width;
+    const fullH = canvas.clientHeight || canvas.height;
+    const half = size / 2;
+
+    // Integer offset (in pixels) of each point's window from the first valid
+    // window's top-left corner; null = window not entirely in the canvas.
+    let baseX = 0;
+    let baseY = 0;
+    let hasBase = false;
+    let minCol = Number.POSITIVE_INFINITY;
+    let minRow = Number.POSITIVE_INFINITY;
+    let maxCol = Number.NEGATIVE_INFINITY;
+    let maxRow = Number.NEGATIVE_INFINITY;
+    const cells = points.map(({ x, y }) => {
+      if (
+        x - half < 0 ||
+        y - half < 0 ||
+        x + half > fullW ||
+        y + half > fullH
+      ) {
+        return null;
+      }
+      if (!hasBase) {
+        baseX = x - half;
+        baseY = y - half;
+        hasBase = true;
+      }
+      const col = Math.round(x - half - baseX);
+      const row = Math.round(y - half - baseY);
+      minCol = Math.min(minCol, col);
+      minRow = Math.min(minRow, row);
+      maxCol = Math.max(maxCol, col);
+      maxRow = Math.max(maxRow, row);
+      return { col, row };
+    });
+    if (!hasBase) return points.map(() => null);
+
+    const w = maxCol - minCol + size;
+    const h = maxRow - minRow + size;
+    const { targetMedia, floatOk, floatTypeName, farBig } = this.pickRender({
+      camera,
+      fullW,
+      fullH,
+      ox: baseX + minCol,
+      oy: baseY + minRow,
+      w,
+      h,
+      alphaThreshold,
+      solid: false,
+    });
+
+    const pixels = await readPickTargetPixels(
+      renderer,
+      targetMedia,
+      w,
+      h,
+      floatOk,
+    );
+
+    const results = points.map(({ x, y }, index) => {
+      const cell = cells[index];
+      if (!cell) return null;
+      // Copy this point's size x size window out of the shared readback.
+      // Rows come back bottom-to-top: window row r (counted from its bottom)
+      // is shared row h - size - top + r, top = rows from the shared top.
+      const left = cell.col - minCol;
+      const top = cell.row - minRow;
+      const pixelsMedia = new Float32Array(size * size * 4);
+      for (let r = 0; r < size; r++) {
+        const src = ((h - size - top + r) * w + left) * 4;
+        pixelsMedia.set(pixels.subarray(src, src + size * 4), r * size * 4);
+      }
+      return pickResultFromPixels({
+        pixelsMedia,
+        pixelsSolid: null,
+        size,
+        camera,
+        x,
+        y,
+        fullW,
+        fullH,
+        farBig,
+        floatType: floatTypeName,
+      });
+    });
+    const ms = performance.now() - t0;
+    for (const result of results) {
+      if (result) result.ms = ms;
+    }
+    return results;
+  }
+
+  // Synchronous part shared by pickAsync()/pickPointsAsync(): renders the
+  // w x h CSS-pixel crop of the full frame whose top-left corner is
+  // (ox, oy) into the pick target(s). Nothing here awaits, so the
+  // renderer's state swap is never observable from outside.
+  private pickRender({
+    camera,
+    fullW,
+    fullH,
+    ox,
+    oy,
+    w,
+    h,
+    alphaThreshold,
+    solid,
+  }: {
+    camera: THREE.PerspectiveCamera | THREE.OrthographicCamera;
+    fullW: number;
+    fullH: number;
+    ox: number;
+    oy: number;
+    w: number;
+    h: number;
+    alphaThreshold: number;
+    solid: boolean;
+  }) {
+    const renderer = this.renderer;
 
     // Lazily create the two pick materials. Both share the exact same
     // uniforms *objects* as the main material (spread of `this.uniforms`,
@@ -2601,7 +2893,7 @@ export class SparkRenderer extends THREE.Mesh {
     const floatTypeName: "float" | "half" = floatOk ? "float" : "half";
 
     const makeTarget = () =>
-      new THREE.WebGLRenderTarget(size, size, {
+      new THREE.WebGLRenderTarget(w, h, {
         type: pickFloatType,
         format: THREE.RGBAFormat,
         depthBuffer: true,
@@ -2615,7 +2907,8 @@ export class SparkRenderer extends THREE.Mesh {
     if (
       !targetMedia ||
       !targetSolid ||
-      this.pickTargetSize !== size ||
+      this.pickTargetW !== w ||
+      this.pickTargetH !== h ||
       this.pickTargetIsFloat !== floatOk
     ) {
       targetMedia?.dispose();
@@ -2624,23 +2917,13 @@ export class SparkRenderer extends THREE.Mesh {
       targetSolid = makeTarget();
       this.pickTargetMedia = targetMedia;
       this.pickTargetSolid = targetSolid;
-      this.pickTargetSize = size;
+      this.pickTargetW = w;
+      this.pickTargetH = h;
       this.pickTargetIsFloat = floatOk;
     }
 
-    const canvas = renderer.domElement;
-    const fullW = canvas.clientWidth || canvas.width;
-    const fullH = canvas.clientHeight || canvas.height;
-
     const pickCamera = camera.clone();
-    pickCamera.setViewOffset(
-      fullW,
-      fullH,
-      x - size / 2,
-      y - size / 2,
-      size,
-      size,
-    );
+    pickCamera.setViewOffset(fullW, fullH, ox, oy, w, h);
     pickCamera.updateProjectionMatrix();
 
     // Keep this in sync with splatPickFragment.glsl's farBig(): both the
@@ -2729,29 +3012,7 @@ export class SparkRenderer extends THREE.Mesh {
       for (const child of hidden) child.visible = true;
     }
 
-    // Safe to await now: render targets are read directly regardless of
-    // the renderer's currently-bound render target.
-    const [pixelsMedia, pixelsSolid] = await Promise.all([
-      readPickTargetPixels(renderer, targetMedia, size, floatOk),
-      solid ? readPickTargetPixels(renderer, targetSolid, size, floatOk) : null,
-    ]);
-
-    const result = pickResultFromPixels({
-      pixelsMedia,
-      pixelsSolid,
-      size,
-      camera,
-      x,
-      y,
-      fullW,
-      fullH,
-      farBig,
-      floatType: floatTypeName,
-    });
-    if (result) {
-      result.ms = performance.now() - t0;
-    }
-    return result;
+    return { targetMedia, targetSolid, floatOk, floatTypeName, farBig };
   }
 
   /**
@@ -2875,31 +3136,18 @@ function viewPointAtDepth(
 async function readPickTargetPixels(
   renderer: THREE.WebGLRenderer,
   target: THREE.WebGLRenderTarget,
-  size: number,
+  w: number,
+  h: number,
   floatOk: boolean,
 ): Promise<Float32Array> {
-  const numComponents = size * size * 4;
+  const numComponents = w * h * 4;
   if (floatOk) {
     const pixels = new Float32Array(numComponents);
-    await renderer.readRenderTargetPixelsAsync(
-      target,
-      0,
-      0,
-      size,
-      size,
-      pixels,
-    );
+    await renderer.readRenderTargetPixelsAsync(target, 0, 0, w, h, pixels);
     return pixels;
   }
   const halfPixels = new Uint16Array(numComponents);
-  await renderer.readRenderTargetPixelsAsync(
-    target,
-    0,
-    0,
-    size,
-    size,
-    halfPixels,
-  );
+  await renderer.readRenderTargetPixelsAsync(target, 0, 0, w, h, halfPixels);
   const pixels = new Float32Array(numComponents);
   for (let i = 0; i < numComponents; i++) {
     pixels[i] = THREE.DataUtils.fromHalfFloat(halfPixels[i]);

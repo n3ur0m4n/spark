@@ -305,8 +305,10 @@ export function getTransferable(ctx: unknown): Transferable[] {
       if (obj instanceof ArrayBuffer) {
         buffers.push(obj);
       } else if (ArrayBuffer.isView(obj)) {
-        // Handles TypedArrays and DataView
-        buffers.push(obj.buffer as ArrayBuffer);
+        // Handles TypedArrays and DataView; shared memory is not transferable
+        if (obj.buffer instanceof ArrayBuffer) {
+          buffers.push(obj.buffer);
+        }
       } else if (Array.isArray(obj)) {
         obj.forEach(traverse);
       } else {
