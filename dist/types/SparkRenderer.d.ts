@@ -141,6 +141,30 @@ export interface SparkRendererOptions {
      * @default 0
      */
     minSortIntervalMs?: number;
+    /**
+     * Number of workers for the depth sort. Above 1 the sort is split across
+     * that many workers via SharedArrayBuffer, used only when the page is
+     * crossOriginIsolated and there are at least 1M splats; otherwise a single
+     * worker sorts.
+     * @default max(1, min(4, hardwareConcurrency - 1))
+     */
+    sortThreads?: number;
+    /**
+     * Sort only splats whose center lies inside a cone around the view
+     * direction, with this full angle in degrees; the others are not drawn.
+     * Use a value larger than the camera's diagonal FOV (splats are culled by
+     * center, and the sort runs behind the camera motion). Ignored for
+     * orthographic cameras. 0 disables it.
+     * @default 0
+     */
+    sortCullFov?: number;
+    /**
+     * Sort by the depth rounded to 16-bit float (one counting pass instead of
+     * two radix passes). Same splats are drawn, ordering precision is ~1/2048
+     * of the distance.
+     * @default false
+     */
+    sort16?: boolean;
     enableLod?: boolean;
     /**
      * Whether to drive LOD updates (compute lodInstances, update pager, etc.).
@@ -351,6 +375,10 @@ export declare class SparkRenderer extends THREE.Mesh {
     focalAdjustment: number;
     sortRadial: boolean;
     minSortIntervalMs: number;
+    sortThreads: number;
+    sortCullFov: number;
+    sort16: boolean;
+    private sortCullCos;
     readonly timer: THREE.Timer;
     private readonly ownsTimer;
     lastFrame: number;
@@ -372,6 +400,9 @@ export declare class SparkRenderer extends THREE.Mesh {
     sortedCenter: THREE.Vector3;
     sortedDir: THREE.Vector3;
     readback32: Uint32Array<ArrayBuffer>;
+    sortPool: SplatWorker[];
+    private parallelSortBuffers?;
+    private orderingUpload;
     private readonly initWatched;
     enableLod: boolean;
     enableDriveLod: boolean;
@@ -453,7 +484,8 @@ export declare class SparkRenderer extends THREE.Mesh {
     private pickMaterialSolid?;
     private pickTargetMedia?;
     private pickTargetSolid?;
-    private pickTargetSize;
+    private pickTargetW;
+    private pickTargetH;
     private pickTargetIsFloat;
     private pickPass;
     flushAfterGenerate: boolean;
@@ -672,6 +704,31 @@ export declare class SparkRenderer extends THREE.Mesh {
          *  one pass only, pointSolida/distanceSolida are null. */
         solid?: boolean;
     }): Promise<SparkPickResult | null>;
+    /**
+     * Batched variant of pickAsync() for several screen points at once: ONE
+     * "media" render + ONE readback of the window covering every point's
+     * size x size pick window, then per point exactly the pixel selection and
+     * depth -> world reconstruction pickAsync() does on its own window.
+     * x, y are CSS pixels relative to renderer.domElement, as in pickAsync().
+     * Results are in input order; null = no coverage, or the point's pick
+     * window is not entirely inside the canvas. No "solid" pass
+     * (pointSolida/distanceSolida are always null). `ms` is the whole call
+     * time, the same for every result.
+     * Pixel grid: every window is aligned to the first in-canvas point's
+     * sub-pixel offset; points at integer offsets from it (the usual case,
+     * e.g. integer CSS coordinates) see exactly the pixels pickAsync() would,
+     * others are rounded to the nearest pixel.
+     */
+    pickPointsAsync({ camera, points, size, alphaThreshold, }: {
+        camera: THREE.PerspectiveCamera | THREE.OrthographicCamera;
+        points: {
+            x: number;
+            y: number;
+        }[];
+        size?: number;
+        alphaThreshold?: number;
+    }): Promise<(SparkPickResult | null)[]>;
+    private pickRender;
     /**
      * One raycastLodTree on the pick worker, at most one in flight, the others
      * waiting in FIFO order. A request with a coalesce `key` replaces the waiting

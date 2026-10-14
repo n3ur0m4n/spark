@@ -3,7 +3,7 @@ import { FullScreenQuad } from "three/addons/postprocessing/Pass.js";
 import { Readback } from "./Readback";
 import { type CovSplatGenerator, type GsplatGenerator, SplatGenerator } from "./SplatGenerator";
 import { SplatMesh } from "./SplatMesh";
-import { DynoBool, DynoProgram, DynoProgramTemplate, DynoUsampler2DArray, DynoVec3 } from "./dyno";
+import { DynoBool, DynoFloat, DynoProgram, DynoProgramTemplate, DynoUsampler2DArray, DynoVec3 } from "./dyno";
 export type GeneratorMapping = {
     node: SplatGenerator;
     generator?: GsplatGenerator;
@@ -22,6 +22,7 @@ export declare class SplatAccumulator {
     static viewCenterUniform: DynoVec3<THREE.Vector3, "value">;
     static viewDirUniform: DynoVec3<THREE.Vector3, "value">;
     static sortRadialUniform: DynoBool<string>;
+    static sortCullCosUniform: DynoFloat<"value">;
     maxSplats: number;
     numSplats: number;
     target: THREE.WebGLArrayRenderTarget | null;
@@ -69,12 +70,13 @@ export declare class SplatAccumulator {
     }): {
         nextBase: number;
     };
-    prepareGenerate({ renderer, scene, timer, camera, sortRadial, renderSize, previous, lodInstances, }: {
+    prepareGenerate({ renderer, scene, timer, camera, sortRadial, sortCullCos, renderSize, previous, lodInstances, }: {
         renderer: THREE.WebGLRenderer;
         scene: THREE.Scene;
         timer: THREE.Timer;
         camera: THREE.Camera;
         sortRadial: boolean;
+        sortCullCos?: number;
         renderSize: THREE.Vector2;
         previous: SplatAccumulator;
         lodInstances?: Map<SplatMesh, {

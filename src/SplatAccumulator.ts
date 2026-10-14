@@ -18,6 +18,7 @@ import {
   type CovSplat,
   Dyno,
   DynoBool,
+  DynoFloat,
   DynoProgram,
   DynoProgramTemplate,
   DynoUsampler2DArray,
@@ -64,6 +65,8 @@ export class SplatAccumulator {
   static viewCenterUniform = new DynoVec3({ value: new THREE.Vector3() });
   static viewDirUniform = new DynoVec3({ value: new THREE.Vector3() });
   static sortRadialUniform = new DynoBool({ value: true });
+  // cos of the sort cone half angle, -2 = no cone culling
+  static sortCullCosUniform = new DynoFloat({ value: -2 });
   maxSplats = 0;
   numSplats = 0;
   target: THREE.WebGLArrayRenderTarget | null = null;
@@ -319,6 +322,7 @@ export class SplatAccumulator {
               SplatAccumulator.viewCenterUniform,
               SplatAccumulator.viewDirUniform,
               SplatAccumulator.sortRadialUniform,
+              SplatAccumulator.sortCullCosUniform,
             );
             roots.push(outputDepth);
           }
@@ -328,6 +332,7 @@ export class SplatAccumulator {
               SplatAccumulator.viewCenterUniform,
               SplatAccumulator.viewDirUniform,
               SplatAccumulator.sortRadialUniform,
+              SplatAccumulator.sortCullCosUniform,
             );
             roots.push(outputDepth);
           }
@@ -444,6 +449,7 @@ export class SplatAccumulator {
     timer,
     camera,
     sortRadial,
+    sortCullCos = -2,
     renderSize,
     previous,
     lodInstances,
@@ -453,6 +459,7 @@ export class SplatAccumulator {
     timer: THREE.Timer;
     camera: THREE.Camera;
     sortRadial: boolean;
+    sortCullCos?: number;
     renderSize: THREE.Vector2;
     previous: SplatAccumulator;
     lodInstances?: Map<
@@ -466,6 +473,7 @@ export class SplatAccumulator {
     SplatAccumulator.viewCenterUniform.value.copy(this.viewOrigin);
     SplatAccumulator.viewDirUniform.value.copy(this.viewDirection);
     SplatAccumulator.sortRadialUniform.value = sortRadial;
+    SplatAccumulator.sortCullCosUniform.value = sortCullCos;
 
     this.time = timer.getElapsed();
     this.deltaTime = timer.getDelta();

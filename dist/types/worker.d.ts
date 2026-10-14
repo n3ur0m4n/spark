@@ -1,7 +1,14 @@
 import type { ExtResult, PackedResult, SplatEncoding } from "./defines";
+import { sortPar16ScatterJs, sortParScatterJs } from "./sortParallel";
 declare const rpcHandlers: {
     sortSplats16: typeof sortSplats16;
     sortSplats32: typeof sortSplats32;
+    sortParHist: typeof sortParHist;
+    sortParScatter: typeof sortParScatterJs;
+    sortParRegion: typeof sortParRegion;
+    sortSplats32as16: typeof sortSplats32as16;
+    sortPar16Hist: typeof sortPar16Hist;
+    sortPar16Scatter: typeof sortPar16ScatterJs;
     loadPackedSplats: typeof loadPackedSplats;
     loadExtSplats: typeof loadExtSplats;
     tinyLodPackedSplats: typeof tinyLodPackedSplats;
@@ -38,6 +45,30 @@ declare function sortSplats32({ numSplats, readback, ordering, }: {
     readback: Uint32Array<ArrayBuffer>;
     ordering: Uint32Array<ArrayBuffer>;
 };
+declare function sortSplats32as16({ numSplats, readback, ordering, }: {
+    numSplats: number;
+    readback: Uint32Array<ArrayBuffer>;
+    ordering: Uint32Array<ArrayBuffer>;
+}): {
+    activeSplats: number;
+    readback: Uint32Array<ArrayBuffer>;
+    ordering: Uint32Array<ArrayBuffer>;
+};
+declare function sortPar16Hist({ keys, keys16, hist, }: {
+    keys: Uint32Array;
+    keys16: Uint16Array;
+    hist: Uint32Array;
+}): void;
+declare function sortParHist({ keys, start, end, hist, }: {
+    keys: Uint32Array;
+    start: number;
+    end: number;
+    hist: Uint32Array;
+}): void;
+declare function sortParRegion({ pairs, ordering, }: {
+    pairs: Uint32Array;
+    ordering: Uint32Array;
+}): void;
 declare function loadPackedSplats({ url, requestHeader, withCredentials, fileBytes, fileType, pathName, chunked, chunkedLength, encoding, lod, lodBase, lodAbove, nonLod, sh1Codes, sh2Codes, sh3Codes, }: {
     url?: string;
     requestHeader?: Record<string, string>;

@@ -29,14 +29,30 @@ export const outputSplatDepth = (
   viewCenter: DynoVal<"vec3">,
   viewDir: DynoVal<"vec3">,
   sortRadial: DynoVal<"bool">,
-) => new OutputSplatDepth({ gsplat, viewCenter, viewDir, sortRadial });
+  sortCullCos: DynoVal<"float">,
+) =>
+  new OutputSplatDepth({
+    gsplat,
+    viewCenter,
+    viewDir,
+    sortRadial,
+    sortCullCos,
+  });
 
 export const outputCovSplatDepth = (
   covsplat: DynoVal<typeof CovSplat>,
   viewCenter: DynoVal<"vec3">,
   viewDir: DynoVal<"vec3">,
   sortRadial: DynoVal<"bool">,
-) => new OutputCovSplatDepth({ covsplat, viewCenter, viewDir, sortRadial });
+  sortCullCos: DynoVal<"float">,
+) =>
+  new OutputCovSplatDepth({
+    covsplat,
+    viewCenter,
+    viewDir,
+    sortRadial,
+    sortCullCos,
+  });
 
 export const outputRgba8 = (rgba8: DynoVal<"vec4">) =>
   new OutputRgba8({ rgba8 });
@@ -173,6 +189,7 @@ class OutputSplatDepth extends Dyno<
     viewCenter: "vec3";
     viewDir: "vec3";
     sortRadial: "bool";
+    sortCullCos: "float";
   },
   Record<string, never>
 > {
@@ -181,11 +198,13 @@ class OutputSplatDepth extends Dyno<
     viewCenter,
     viewDir,
     sortRadial,
+    sortCullCos,
   }: {
     gsplat: DynoVal<typeof Gsplat>;
     viewCenter: DynoVal<"vec3">;
     viewDir: DynoVal<"vec3">;
     sortRadial: DynoVal<"bool">;
+    sortCullCos: DynoVal<"float">;
   }) {
     super({
       inTypes: {
@@ -193,18 +212,23 @@ class OutputSplatDepth extends Dyno<
         viewCenter: "vec3",
         viewDir: "vec3",
         sortRadial: "bool",
+        sortCullCos: "float",
       },
-      inputs: { gsplat, viewCenter, viewDir, sortRadial },
+      inputs: { gsplat, viewCenter, viewDir, sortRadial, sortCullCos },
       globals: () => [defineGsplat],
       statements: ({ inputs }) => {
-        const { gsplat, viewCenter, viewDir, sortRadial } = inputs;
-        if (gsplat && viewCenter && viewDir && sortRadial) {
+        const { gsplat, viewCenter, viewDir, sortRadial, sortCullCos } = inputs;
+        if (gsplat && viewCenter && viewDir && sortRadial && sortCullCos) {
           return unindentLines(/* glsl */ `
             float metric = 1.0 / 0.0;
             if (isGsplatActive(${gsplat}.flags)) {
               vec3 center = ${gsplat}.center - ${viewCenter};
-              if (${sortRadial}) {
-                metric = length(center);
+              float dist = length(center);
+              // Outside the sort cone (sortCullFov): stays +inf, not drawn.
+              // Disabled when sortCullCos <= -1; dist 0 is never culled.
+              if (dist > 0.0 && dot(center, ${viewDir}) < ${sortCullCos} * dist) {
+              } else if (${sortRadial}) {
+                metric = dist;
               } else {
                 float bias = 100.0; // reduce popping
                 metric = dot(center, ${viewDir}) + bias;
@@ -225,6 +249,7 @@ class OutputCovSplatDepth extends Dyno<
     viewCenter: "vec3";
     viewDir: "vec3";
     sortRadial: "bool";
+    sortCullCos: "float";
   },
   Record<string, never>
 > {
@@ -233,11 +258,13 @@ class OutputCovSplatDepth extends Dyno<
     viewCenter,
     viewDir,
     sortRadial,
+    sortCullCos,
   }: {
     covsplat: DynoVal<typeof CovSplat>;
     viewCenter: DynoVal<"vec3">;
     viewDir: DynoVal<"vec3">;
     sortRadial: DynoVal<"bool">;
+    sortCullCos: DynoVal<"float">;
   }) {
     super({
       inTypes: {
@@ -245,18 +272,24 @@ class OutputCovSplatDepth extends Dyno<
         viewCenter: "vec3",
         viewDir: "vec3",
         sortRadial: "bool",
+        sortCullCos: "float",
       },
-      inputs: { covsplat, viewCenter, viewDir, sortRadial },
+      inputs: { covsplat, viewCenter, viewDir, sortRadial, sortCullCos },
       globals: () => [defineCovSplat],
       statements: ({ inputs }) => {
-        const { covsplat, viewCenter, viewDir, sortRadial } = inputs;
-        if (covsplat && viewCenter && viewDir && sortRadial) {
+        const { covsplat, viewCenter, viewDir, sortRadial, sortCullCos } =
+          inputs;
+        if (covsplat && viewCenter && viewDir && sortRadial && sortCullCos) {
           return unindentLines(/* glsl */ `
             float metric = 1.0 / 0.0;
             if (isCovSplatActive(${covsplat}.flags)) {
               vec3 center = ${covsplat}.center - ${viewCenter};
-              if (${sortRadial}) {
-                metric = length(center);
+              float dist = length(center);
+              // Outside the sort cone (sortCullFov): stays +inf, not drawn.
+              // Disabled when sortCullCos <= -1; dist 0 is never culled.
+              if (dist > 0.0 && dot(center, ${viewDir}) < ${sortCullCos} * dist) {
+              } else if (${sortRadial}) {
+                metric = dist;
               } else {
                 float bias = 100.0; // reduce popping
                 metric = dot(center, ${viewDir}) + bias;

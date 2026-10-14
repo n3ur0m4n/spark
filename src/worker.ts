@@ -1,6 +1,10 @@
 import init_wasm, {
   sort_splats,
   sort32_splats,
+  sort32_par_hist,
+  sort32_par_region,
+  sort32_as16_splats,
+  sort16_par_hist,
   decode_to_gsplatarray,
   decode_to_csplatarray,
   decode_to_packedsplats,
@@ -22,10 +26,17 @@ import init_wasm, {
   set_lod_radii,
 } from "spark-rs";
 import type { ExtResult, PackedResult, SplatEncoding } from "./defines";
+import { sortPar16ScatterJs, sortParScatterJs } from "./sortParallel";
 
 const rpcHandlers = {
   sortSplats16,
   sortSplats32,
+  sortParHist,
+  sortParScatter: sortParScatterJs,
+  sortParRegion,
+  sortSplats32as16,
+  sortPar16Hist,
+  sortPar16Scatter: sortPar16ScatterJs,
   loadPackedSplats,
   loadExtSplats,
   tinyLodPackedSplats,
@@ -99,6 +110,57 @@ function sortSplats32({
 }) {
   const activeSplats = sort32_splats(numSplats, readback, ordering);
   return { activeSplats, readback, ordering };
+}
+
+// f32 keys sorted by their f16 rounding (SparkRenderer sort16)
+function sortSplats32as16({
+  numSplats,
+  readback,
+  ordering,
+}: {
+  numSplats: number;
+  readback: Uint32Array<ArrayBuffer>;
+  ordering: Uint32Array<ArrayBuffer>;
+}) {
+  const activeSplats = sort32_as16_splats(numSplats, readback, ordering);
+  return { activeSplats, readback, ordering };
+}
+
+function sortPar16Hist({
+  keys,
+  keys16,
+  hist,
+}: {
+  keys: Uint32Array;
+  keys16: Uint16Array;
+  hist: Uint32Array;
+}) {
+  sort16_par_hist(keys, keys16, hist);
+}
+
+// Parallel sort kernels (src/sortParallel.ts), buffers are SharedArrayBuffer views
+function sortParHist({
+  keys,
+  start,
+  end,
+  hist,
+}: {
+  keys: Uint32Array;
+  start: number;
+  end: number;
+  hist: Uint32Array;
+}) {
+  sort32_par_hist(keys.subarray(start, end), hist);
+}
+
+function sortParRegion({
+  pairs,
+  ordering,
+}: {
+  pairs: Uint32Array;
+  ordering: Uint32Array;
+}) {
+  sort32_par_region(pairs, ordering);
 }
 
 async function decodeBytesUrl({

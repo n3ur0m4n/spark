@@ -23,7 +23,7 @@ mod raycast;
 use raycast::{raycast_packed_ellipsoids, raycast_ext_ellipsoids};
 
 mod sort;
-use sort::{sort_internal, SortBuffers, sort32_internal, Sort32Buffers};
+use sort::{sort_internal, SortBuffers, sort32_internal, Sort32Buffers, sort32_hist_hi, sort32_region, sort32_as16_internal, sort16_hist};
 
 #[cfg(feature = "gsplat")]
 mod transform;
@@ -51,6 +51,7 @@ pub fn simd_enabled() -> bool {
 thread_local! {
     static SORT_BUFFERS: RefCell<SortBuffers> = RefCell::new(SortBuffers::default());
     static SORT32_BUFFERS: RefCell<Sort32Buffers> = RefCell::new(Sort32Buffers::default());
+    static PAR_SORT_BUFFERS: RefCell<ParSortBuffers> = RefCell::new(ParSortBuffers::default());
 }
 
 macro_rules! stub_fn {
@@ -119,6 +120,87 @@ pub fn sort32_splats(
     });
 
     active_splats
+}
+
+// Parallel sort kernels (see sort.rs / src/sortParallel.ts). Inputs are
+// SharedArrayBuffer views: WASM memory is not shared, so copy in, run, copy out.
+// The scatter step runs in JS on the shared buffers (src/sortParallel.ts).
+#[derive(Default)]
+struct ParSortBuffers {
+    keys: Vec<u32>,
+    hist: Vec<u32>,
+    keys16: Vec<u16>,
+    tmp: Vec<u64>,
+    out: Vec<u32>,
+}
+
+fn grow<T: Default + Clone>(v: &mut Vec<T>, n: usize) {
+    if v.len() < n {
+        v.resize(n, T::default());
+    }
+}
+
+#[wasm_bindgen]
+pub fn sort32_par_hist(keys: Uint32Array, hist: Uint32Array) {
+    PAR_SORT_BUFFERS.with_borrow_mut(|b| {
+        let n = keys.length() as usize;
+        grow(&mut b.keys, n);
+        keys.copy_to(&mut b.keys[..n]);
+        b.hist.clear();
+        b.hist.resize(1 << 16, 0);
+        sort32_hist_hi(&b.keys[..n], &mut b.hist);
+        hist.copy_from(&b.hist);
+    });
+}
+
+/// `pairs`: interleaved (key, index) of one region, `ordering`: its output.
+#[wasm_bindgen]
+pub fn sort32_par_region(pairs: Uint32Array, ordering: Uint32Array) {
+    PAR_SORT_BUFFERS.with_borrow_mut(|b| {
+        let n = ordering.length() as usize;
+        grow(&mut b.keys, 2 * n);
+        grow(&mut b.out, n);
+        pairs.copy_to(&mut b.keys[..2 * n]);
+        sort32_region(&b.keys[..2 * n], &mut b.tmp, &mut b.out[..n]);
+        ordering.copy_from(&b.out[..n]);
+    });
+}
+
+/// 16-bit sort of 32-bit keys, single worker (see sort.rs sort32_as16_internal).
+#[wasm_bindgen]
+pub fn sort32_as16_splats(
+    num_splats: u32, readback: Uint32Array, ordering: Uint32Array,
+) -> u32 {
+    let n = num_splats as usize;
+    PAR_SORT_BUFFERS.with_borrow_mut(|par| {
+        grow(&mut par.keys, n);
+        readback.subarray(0, num_splats).copy_to(&mut par.keys[..n]);
+        SORT_BUFFERS.with_borrow_mut(|buffers| {
+            let active_splats = sort32_as16_internal(buffers, &par.keys[..n]);
+            if active_splats > 0 {
+                ordering
+                    .subarray(0, active_splats)
+                    .copy_from(&buffers.ordering[..active_splats as usize]);
+            }
+            active_splats
+        })
+    })
+}
+
+/// Parallel 16-bit sort, step 1: f16 keys of one slice into `keys16`, counts into `hist`.
+#[wasm_bindgen]
+pub fn sort16_par_hist(keys: Uint32Array, keys16: Uint16Array, hist: Uint32Array) {
+    PAR_SORT_BUFFERS.with_borrow_mut(|b| {
+        let n = keys.length() as usize;
+        grow(&mut b.keys, n);
+        let hist_len = hist.length() as usize;
+        grow(&mut b.keys16, n);
+        grow(&mut b.hist, hist_len);
+        keys.copy_to(&mut b.keys[..n]);
+        sort16_hist(&b.keys[..n], &mut b.keys16[..n], &mut b.hist[..hist_len]);
+        keys16.copy_from(&b.keys16[..n]);
+        hist.copy_from(&b.hist[..hist_len]);
+    });
 }
 
 #[wasm_bindgen]
