@@ -435,6 +435,8 @@ export class SparkRenderer extends THREE.Mesh {
   current: SplatAccumulator;
   accumulators: SplatAccumulator[] = [];
 
+  private isDisposed = false;
+
   sorting = false;
   sortDirty = false;
   // Mapping version the latest update produced.
@@ -495,6 +497,7 @@ export class SparkRenderer extends THREE.Mesh {
   lodIdToSplats: Map<number, PackedSplats | ExtSplats | PagedSplats> =
     new Map();
   lodInitQueue: (PackedSplats | ExtSplats | PagedSplats)[] = [];
+  private lodInitFailed = new WeakSet<PackedSplats | ExtSplats | PagedSplats>();
   lastLod?: {
     pos: THREE.Vector3;
     quat: THREE.Quaternion;
@@ -788,6 +791,8 @@ export class SparkRenderer extends THREE.Mesh {
   }
 
   dispose() {
+    this.isDisposed = true;
+
     // @ts-ignore Object3D has a dispose method in Three.js >= r186
     super.dispose?.();
 
@@ -847,11 +852,10 @@ export class SparkRenderer extends THREE.Mesh {
       accumulator.dispose();
     }
 
-    const instances = this.lodInstances.values();
-    this.lodInstances.clear();
-    for (const instance of instances) {
+    for (const instance of this.lodInstances.values()) {
       instance.texture.dispose();
     }
+    this.lodInstances.clear();
 
     if (this.sortWorker) {
       this.sortWorker.dispose();
@@ -877,7 +881,7 @@ export class SparkRenderer extends THREE.Mesh {
   }
 
   setDirty() {
-    if (!this.dirty) {
+    if (!this.isDisposed && !this.dirty) {
       this.dirty = true;
       this.onDirty?.();
     }
@@ -1070,6 +1074,9 @@ export class SparkRenderer extends THREE.Mesh {
     camera: THREE.Camera;
     autoUpdate: boolean;
   }) {
+    if (this.isDisposed) {
+      return;
+    }
     const renderer = this.renderer;
     if (this.ownsTimer) {
       this.timer.update();
@@ -1186,6 +1193,7 @@ export class SparkRenderer extends THREE.Mesh {
 
   private async driveSort() {
     if (
+      this.isDisposed ||
       this.sorting ||
       !this.sortDirty ||
       this.latestMappingVersion !== this.current.mappingVersion ||
@@ -1219,6 +1227,10 @@ export class SparkRenderer extends THREE.Mesh {
       await new Promise((resolve) => setTimeout(resolve, this.readPause));
     }
 
+    if (this.isDisposed) {
+      return;
+    }
+
     const current = this.current;
 
     this.sortedCenter.copy(current.viewOrigin);
@@ -1241,6 +1253,10 @@ export class SparkRenderer extends THREE.Mesh {
 
     if (this.sortPause > 0) {
       await new Promise((resolve) => setTimeout(resolve, this.sortPause));
+    }
+
+    if (this.isDisposed) {
+      return;
     }
 
     const threads = Math.floor(this.sortThreads);
@@ -1295,6 +1311,10 @@ export class SparkRenderer extends THREE.Mesh {
 
     if (this.sortDelay > 0) {
       await new Promise((resolve) => setTimeout(resolve, this.sortDelay));
+    }
+
+    if (this.isDisposed) {
+      return;
     }
 
     this.activeSplats = activeSplats;
@@ -1502,7 +1522,7 @@ export class SparkRenderer extends THREE.Mesh {
         const record = this.lodIds.get(splats);
         if (record) {
           record.lastTouched = now;
-        } else {
+        } else if (!this.lodInitFailed.has(splats)) {
           this.lodInitQueue.push(splats);
         }
       }
@@ -1585,8 +1605,16 @@ export class SparkRenderer extends THREE.Mesh {
       while (lodInitQueue.length > 0) {
         const splats = lodInitQueue.shift();
         if (splats) {
-          await this.initLodTree(worker, splats);
-          this.lodDirty = true;
+          try {
+            await this.initLodTree(worker, splats);
+            this.lodDirty = true;
+          } catch (error) {
+            if (this.isDisposed) {
+              return;
+            }
+            this.lodInitFailed.add(splats);
+            console.error("initLodTree error", error);
+          }
         }
       }
     }

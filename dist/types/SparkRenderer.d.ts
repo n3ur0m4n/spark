@@ -391,6 +391,7 @@ export declare class SparkRenderer extends THREE.Mesh {
     display: SplatAccumulator;
     current: SplatAccumulator;
     accumulators: SplatAccumulator[];
+    private isDisposed;
     sorting: boolean;
     sortDirty: boolean;
     private latestMappingVersion;
@@ -442,6 +443,7 @@ export declare class SparkRenderer extends THREE.Mesh {
     }>;
     lodIdToSplats: Map<number, PackedSplats | ExtSplats | PagedSplats>;
     lodInitQueue: (PackedSplats | ExtSplats | PagedSplats)[];
+    private lodInitFailed;
     lastLod?: {
         pos: THREE.Vector3;
         quat: THREE.Quaternion;

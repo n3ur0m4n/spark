@@ -1,9 +1,15 @@
 import * as THREE from "three";
-import { expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
+import { PackedSplats } from "../../src/PackedSplats";
 import { SparkRenderer } from "../../src/SparkRenderer";
 import { SplatGenerator } from "../../src/SplatGenerator";
+import { SplatMesh } from "../../src/SplatMesh";
 import { Dyno, dynoBlock } from "../../src/dyno/base";
 import { Gsplat } from "../../src/dyno/splats";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 const stubRenderer = {
   info: { render: { frame: 0 } },
@@ -56,6 +62,7 @@ async function setup(...meshes: THREE.Object3D[]) {
         replies.push(() => resolve({ ...args, activeSplats: args.numSplats })),
       );
     },
+    dispose() {},
   } as unknown as typeof spark.sortWorker;
 
   const frame = async () => {
@@ -75,6 +82,33 @@ async function setup(...meshes: THREE.Object3D[]) {
   await finishSorts();
   sorts.length = 0;
   return { spark, camera, sorts, frame, finishSorts };
+}
+
+async function setupLod() {
+  const mesh = new SplatMesh({
+    packedSplats: new PackedSplats({
+      lodSplats: new PackedSplats({ extra: { lodTree: new Uint32Array(4) } }),
+    }),
+  });
+  const { spark, frame } = await setup(mesh);
+  const lodWorker = {
+    tryExclusive: (run: (worker: unknown) => unknown) => run(lodWorker),
+    call: async () => ({
+      lodId: 1,
+      keyIndices: {
+        [mesh.uuid]: {
+          lodId: 1,
+          numSplats: 0,
+          indices: new Uint32Array(16384),
+        },
+      },
+    }),
+    dispose() {},
+  };
+  spark.lodWorker = lodWorker as unknown as SparkRenderer["lodWorker"];
+  spark.enableLod = true;
+  spark.enableDriveLod = true;
+  return { spark, frame, mesh };
 }
 
 // A camera move during a sort asks for another sort. If a new mapping then
@@ -165,4 +199,115 @@ test("a change during a sort is sorted after it", async () => {
 
   await finishSorts();
   expect(sorts.map((s) => s.version)).toEqual([v0 + 1, v0 + 2]);
+});
+
+describe("a LoD tree that fails to initialize", () => {
+  async function render(...lodTrees: unknown[]) {
+    const { spark, frame } = await setup(
+      ...lodTrees.map(
+        (lodTree) =>
+          new SplatMesh({
+            packedSplats: new PackedSplats({
+              lodSplats: new PackedSplats({ extra: { lodTree } }),
+            }),
+          }),
+      ),
+    );
+    const lodWorker = {
+      tryExclusive: (run: (worker: unknown) => unknown) => run(lodWorker),
+      call: async () => ({ lodId: 1, keyIndices: {}, chunks: [] }),
+      dispose() {},
+    };
+    spark.lodWorker = lodWorker as unknown as SparkRenderer["lodWorker"];
+    spark.enableLod = true;
+    spark.enableDriveLod = true;
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    return { spark, frame, lodWorker, error };
+  }
+
+  test("is logged once and not tried again, and the others still initialize", async () => {
+    const failing = {
+      slice: vi.fn(() => {
+        throw new RangeError("Array buffer allocation failed");
+      }),
+    };
+    const { spark, frame, error } = await render(failing, new Uint32Array(4));
+
+    await frame();
+    await frame();
+
+    expect(failing.slice).toHaveBeenCalledTimes(1);
+    expect(error).toHaveBeenCalledTimes(1);
+    expect(spark.lodIds.size).toBe(1);
+  });
+
+  test("is not logged when dispose() interrupts it", async () => {
+    const { spark, frame, lodWorker, error } = await render(new Uint32Array(4));
+    vi.spyOn(lodWorker, "call").mockImplementation(async () => {
+      spark.dispose();
+      throw new Error("Worker terminate");
+    });
+
+    await frame();
+
+    expect(error).not.toHaveBeenCalled();
+  });
+});
+
+async function expectNoUnhandledRejection(run: () => Promise<void>) {
+  const unhandled = vi.fn();
+  process.on("unhandledRejection", unhandled);
+  await run();
+  await flushPromises();
+  process.off("unhandledRejection", unhandled);
+  expect(unhandled).not.toHaveBeenCalled();
+}
+
+describe("a disposed SparkRenderer", () => {
+  test("disposes its LoD index textures", async () => {
+    const { spark, frame, mesh } = await setupLod();
+    await frame();
+    const disposed = vi.fn();
+    spark.lodInstances.get(mesh)?.texture.addEventListener("dispose", disposed);
+
+    spark.dispose();
+
+    expect(disposed).toHaveBeenCalledOnce();
+  });
+
+  test("does nothing when updated or rendered", async () => {
+    const spark = new SparkRenderer({ renderer: stubRenderer });
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera();
+    spark.dispose();
+
+    await spark.update({ scene, camera });
+    spark.onBeforeRender(stubRenderer, scene, camera);
+
+    expect(spark.current.target).toBeNull();
+    expect(spark.lodWorker).toBeNull();
+  });
+
+  test("creates no sort worker when disposed during the readback", async () => {
+    const { spark, camera, frame } = await setup(splatGenerator(64));
+    vi.spyOn(stubRenderer, "readRenderTargetPixelsAsync").mockImplementation(
+      async () => spark.dispose(),
+    );
+    camera.position.x += 1;
+
+    await expectNoUnhandledRejection(frame);
+
+    expect(spark.sortWorker).toBeNull();
+  });
+
+  test("requests no render", () => {
+    const onDirty = vi.fn();
+    const spark = new SparkRenderer({ renderer: stubRenderer, onDirty });
+    spark.dirty = false;
+    spark.dispose();
+
+    spark.setDirty();
+
+    expect(onDirty).not.toHaveBeenCalled();
+  });
 });
