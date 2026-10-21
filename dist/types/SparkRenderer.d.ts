@@ -165,6 +165,23 @@ export interface SparkRendererOptions {
      * @default false
      */
     sort16?: boolean;
+    /**
+     * Sort-free stochastic rendering: each splat fragment is kept with
+     * probability alpha and written opaque with depth, drawn front-to-back
+     * from the last sorted order. Noisy but order-independent, so a stale sort
+     * while moving shows no popping. "movement" uses it only while the camera
+     * moves and returns to the sorted render stochasticSettleMs after it stops.
+     * Applied only to renders to the canvas (or the XR framebuffer); renders
+     * to other render targets always use the sorted path.
+     * @default "off"
+     */
+    stochastic?: "off" | "on" | "movement";
+    /**
+     * With stochastic "movement": milliseconds without camera changes before
+     * switching back to the sorted render.
+     * @default 100
+     */
+    stochasticSettleMs?: number;
     enableLod?: boolean;
     /**
      * Whether to drive LOD updates (compute lodInstances, update pager, etc.).
@@ -379,6 +396,13 @@ export declare class SparkRenderer extends THREE.Mesh {
     sortCullFov: number;
     sort16: boolean;
     private sortCullCos;
+    stochastic: "off" | "on" | "movement";
+    stochasticSettleMs: number;
+    private stochasticPose;
+    private stochasticMoveTime;
+    private stochasticTimeoutId;
+    private stochasticActive;
+    private stochasticSaved;
     readonly timer: THREE.Timer;
     private readonly ownsTimer;
     lastFrame: number;
@@ -587,10 +611,18 @@ export declare class SparkRenderer extends THREE.Mesh {
         debugFlag: {
             value: boolean;
         };
+        stochastic: {
+            value: boolean;
+        };
+        instanceCount: {
+            value: number;
+        };
     };
     dispose(): void;
     setDirty(): void;
     onBeforeRender(renderer: THREE.WebGLRenderer, scene: THREE.Scene, camera: THREE.Camera): void;
+    onAfterRender(): void;
+    private updateStochastic;
     clearSplats(): void;
     update({ scene, camera, }: {
         scene: THREE.Scene;

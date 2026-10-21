@@ -13,6 +13,7 @@ uniform float maxStdDev;
 uniform float minAlpha;
 uniform bool disableFalloff;
 uniform float falloff;
+uniform bool stochastic;
 
 out vec4 fragColor;
 
@@ -57,11 +58,26 @@ void main() {
         rgba.rgb = srgbToLinear(rgba.rgb);
     }
 
+    if (stochastic) {
+        // Keep the fragment with probability alpha, written opaque. Fixed
+        // seed (no time) so a still view is stable; PCG-style integer hash.
+        uvec2 coord = uvec2(gl_FragCoord.xy);
+        uint state = 0x9e3779b9u * coord.x + 0x85ebca6bu * coord.y + 0xc2b2ae35u * vSplatIndex;
+        state = state * 747796405u + 2891336453u;
+        uint hash = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+        hash = (hash >> 22u) ^ hash;
+        float rnd = float(hash) / 4294967296.0;
+        if (rnd >= rgba.a) {
+            discard;
+        }
+        fragColor = vec4(rgba.rgb, 1.0);
+    } else {
     #ifdef PREMULTIPLIED_ALPHA
         fragColor = vec4(rgba.rgb * rgba.a, rgba.a);
     #else
         fragColor = rgba;
     #endif
+    }
 
     #include <logdepthbuf_fragment>
 }

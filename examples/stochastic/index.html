@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Spark • Stochastic Rendering</title>
+  <style>
+    body {
+      margin: 0;
+    }
+  </style>
+</head>
+
+<body>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "../js/vendor/three/build/three.module.js",
+        "three/addons/": "../js/vendor/three/examples/jsm/",
+        "@sparkjsdev/spark": "../../dist/spark.module.js",
+        "lil-gui": "../js/vendor/lil-gui/dist/lil-gui.esm.js"
+      }
+    }
+  </script>
+  <script type="module">
+    import * as THREE from "three";
+    import { SparkRenderer, SparkControls, SplatMesh } from "@sparkjsdev/spark";
+    import GUI from "lil-gui";
+    import { getAssetFileURL } from "../js/get-asset-url.js";
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+    const renderer = new THREE.WebGLRenderer();
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    window.addEventListener('resize', onWindowResize, false);
+    function onWindowResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    // Frame of reference moved by SparkControls
+    const localFrame = new THREE.Group();
+    scene.add(localFrame);
+
+    // Lower the splat rendering width to sqrt(5) std devs for more performance
+    const spark = new SparkRenderer({
+      renderer,
+      maxStdDev: Math.sqrt(5),
+      stochastic: "movement",
+      stochasticSettleMs: 100,
+    });
+    localFrame.add(spark);
+    localFrame.add(camera);
+
+    // ---- Scene selector (valley / Laboratorio IZS) --------------------------
+    // Laboratorio IZS: .sog non-paged, nessun LoD (DB elem 9: ROTAZIONE {x: -PI/2})
+    const IZS_URL = "/examples/stochastic/data/point_cloud_I_L2.sog";
+
+    let currentMesh = null;
+
+    async function loadScene(name) {
+      if (currentMesh) {
+        scene.remove(currentMesh);
+        currentMesh.dispose();
+        currentMesh = null;
+      }
+
+      let mesh;
+      if (name === "valley") {
+        const splatURL = await getAssetFileURL("valley.spz");
+        mesh = new SplatMesh({ url: splatURL });
+        mesh.quaternion.set(1, 0, 0, 0);
+        mesh.scale.setScalar(0.5);
+      } else {
+        mesh = new SplatMesh({ url: IZS_URL });
+        mesh.rotation.set(-Math.PI / 2, 0, 0);
+      }
+      scene.add(mesh);
+      currentMesh = mesh;
+
+      await mesh.initialized;
+      if (currentMesh !== mesh) return; // scene switched again while loading
+
+      // Bbox mondo: sicuro solo perché questa mesh non è paged (niente LoD/.rad)
+      mesh.updateMatrixWorld(true);
+      const bbox = mesh.getBoundingBox(true).clone().applyMatrix4(mesh.matrixWorld);
+
+      // Camera al centro della bbox, vista orizzontale lungo +X
+      localFrame.position.copy(bbox.getCenter(new THREE.Vector3()));
+      localFrame.rotation.set(0, -Math.PI / 2, 0);
+    }
+
+    const sceneParams = { scene: "Laboratorio IZS" };
+    await loadScene(sceneParams.scene);
+
+    // ---- GPU timing (EXT_disjoint_timer_query_webgl2) ------------------------
+    const gl = renderer.getContext();
+    const timerExt = gl.getExtension("EXT_disjoint_timer_query_webgl2");
+
+    // Pool di query per non bloccare mai sul risultato (poll nei frame successivi)
+    const gpuQueryPool = timerExt
+      ? Array.from({ length: 4 }, () => ({ query: gl.createQuery(), inUse: false }))
+      : [];
+    let gpuMsAccum = 0;
+    let gpuMsCount = 0;
+    let gpuAvgStart = performance.now();
+
+    function beginGpuQuery() {
+      if (!timerExt) return null;
+      const slot = gpuQueryPool.find((q) => !q.inUse);
+      if (!slot) return null;
+      slot.inUse = true;
+      gl.beginQuery(timerExt.TIME_ELAPSED_EXT, slot.query);
+      return slot;
+    }
+    function endGpuQuery(slot) {
+      if (slot) gl.endQuery(timerExt.TIME_ELAPSED_EXT);
+    }
+    function pollGpuQueries() {
+      for (const slot of gpuQueryPool) {
+        if (!slot.inUse) continue;
+        if (!gl.getQueryParameter(slot.query, gl.QUERY_RESULT_AVAILABLE)) continue;
+        slot.inUse = false;
+        if (gl.getParameter(timerExt.GPU_DISJOINT_EXT)) continue;
+        gpuMsAccum += Number(gl.getQueryParameter(slot.query, gl.QUERY_RESULT)) / 1e6;
+        gpuMsCount += 1;
+      }
+    }
+
+    const stats = {
+      fps: 0,
+      gpuMs: timerExt ? 0 : "n/a (no timer ext)",
+      active: "-",
+    };
+    const gui = new GUI({ title: "Stochastic" });
+    gui.add(sceneParams, "scene", ["valley", "Laboratorio IZS"]).name("scene").onChange(loadScene);
+    gui.add(spark, "stochastic", ["off", "on", "movement"]).name("stochastic");
+    gui.add(spark, "stochasticSettleMs", 0, 1000, 10).name("settleMs");
+    gui.add(stats, "fps").name("FPS").listen().disable();
+    gui.add(stats, "gpuMs").name("GPU ms").listen().disable();
+    gui.add(stats, "active").name("active").listen().disable();
+
+    const controls = new SparkControls({ canvas: renderer.domElement });
+
+    let fpsFrames = 0;
+    let fpsStart = performance.now();
+
+    renderer.setAnimationLoop(function animate() {
+      controls.update(localFrame);
+
+      const gpuSlot = beginGpuQuery();
+      renderer.render(scene, camera);
+      endGpuQuery(gpuSlot);
+      pollGpuQueries();
+
+      stats.active = spark.stochasticActive ? "stochastic" : "sorted";
+
+      fpsFrames += 1;
+      const now = performance.now();
+      if (now - fpsStart >= 500) {
+        stats.fps = Math.round((fpsFrames * 1000) / (now - fpsStart));
+        fpsFrames = 0;
+        fpsStart = now;
+        if (timerExt && gpuMsCount > 0) {
+          stats.gpuMs = Number((gpuMsAccum / gpuMsCount).toFixed(2));
+        }
+        gpuMsAccum = 0;
+        gpuMsCount = 0;
+      }
+    });
+  </script>
+</body>
+
+</html>

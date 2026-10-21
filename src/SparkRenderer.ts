@@ -30,6 +30,10 @@ import {
 import * as wasm from "./wasm";
 import type { rpcHandlers } from "./worker";
 
+// Tolerance for stochastic pose comparison: absorbs SparkControls' decaying
+// inertia tail (never exactly 0) without mistaking it for real movement.
+const STOCHASTIC_POSE_EPSILON = 1e-5;
+
 export interface SparkRendererOptions {
   /**
    * Pass in your THREE.WebGLRenderer instance so Spark can perform work
@@ -195,6 +199,23 @@ export interface SparkRendererOptions {
    * @default false
    */
   sort16?: boolean;
+  /**
+   * Sort-free stochastic rendering: each splat fragment is kept with
+   * probability alpha and written opaque with depth, drawn front-to-back
+   * from the last sorted order. Noisy but order-independent, so a stale sort
+   * while moving shows no popping. "movement" uses it only while the camera
+   * moves and returns to the sorted render stochasticSettleMs after it stops.
+   * Applied only to renders to the canvas (or the XR framebuffer); renders
+   * to other render targets always use the sorted path.
+   * @default "off"
+   */
+  stochastic?: "off" | "on" | "movement";
+  /**
+   * With stochastic "movement": milliseconds without camera changes before
+   * switching back to the sorted render.
+   * @default 100
+   */
+  stochasticSettleMs?: number;
   /*
    * Flag to control whether LoD is enabled. @default true
    */
@@ -420,6 +441,24 @@ export class SparkRenderer extends THREE.Mesh {
   // sortCullFov of the last generated accumulator, as cos(half angle)
   private sortCullCos = -2;
 
+  stochastic: "off" | "on" | "movement";
+  stochasticSettleMs: number;
+  // camera matrixWorld + projectionMatrix of the last canvas frame
+  // (float64: three's matrix elements are float64, a float32 cache would
+  // round every value and always compare as "moved")
+  private stochasticPose = new Float64Array(32);
+  private stochasticMoveTime = Number.NEGATIVE_INFINITY;
+  private stochasticTimeoutId: ReturnType<typeof setTimeout> | undefined =
+    undefined;
+  // Decided once per canvas frame, reused by XR secondary eyes
+  private stochasticActive = false;
+  // Material state overridden for the current draw, restored in onAfterRender
+  private stochasticSaved: {
+    blending: THREE.Blending;
+    depthWrite: boolean;
+    depthTest: boolean;
+  } | null = null;
+
   readonly timer: THREE.Timer;
   private readonly ownsTimer: boolean;
   lastFrame = -1;
@@ -639,6 +678,8 @@ export class SparkRenderer extends THREE.Mesh {
       );
     this.sortCullFov = options.sortCullFov ?? 0;
     this.sort16 = options.sort16 ?? false;
+    this.stochastic = options.stochastic ?? "off";
+    this.stochasticSettleMs = options.stochasticSettleMs ?? 100;
 
     this.enableLod = options.enableLod ?? true;
     // enableDriveLod defaults to true if enableLod is true, false otherwise
@@ -786,6 +827,10 @@ export class SparkRenderer extends THREE.Mesh {
       deltaTime: { value: 0 },
       // Debug flag that alternates each frame
       debugFlag: { value: false },
+      // Sort-free stochastic rendering (front-to-back, alpha-tested)
+      stochastic: { value: false },
+      // Number of drawn instances, to reverse the ordering when stochastic
+      instanceCount: { value: 0 },
     };
     return uniforms;
   }
@@ -812,6 +857,10 @@ export class SparkRenderer extends THREE.Mesh {
     if (this.sortTimeoutId !== undefined) {
       clearTimeout(this.sortTimeoutId);
       this.sortTimeoutId = undefined;
+    }
+    if (this.stochasticTimeoutId !== undefined) {
+      clearTimeout(this.stochasticTimeoutId);
+      this.stochasticTimeoutId = undefined;
     }
 
     this.geometry.dispose();
@@ -963,6 +1012,34 @@ export class SparkRenderer extends THREE.Mesh {
 
     const geometry = this.geometry as SplatGeometry;
     geometry.instanceCount = spark.activeSplats;
+    this.uniforms.instanceCount.value = spark.activeSplats;
+
+    // Stochastic mode: decided only on canvas/XR frames, never during a pick
+    // pass (this.material is then a pick material) or a render to another
+    // render target (captures, probes), which keep the sorted path.
+    const isCanvasRender =
+      !spark.pickPass && (currentRenderTarget === null || isXRRenderTarget);
+    if (isCanvasRender && isNewFrame) {
+      spark.updateStochastic(camera);
+    }
+    const stochastic = isCanvasRender && spark.stochasticActive;
+    this.uniforms.stochastic.value = stochastic;
+    if (stochastic) {
+      // Blending is GL state only: switching it (and depthWrite/depthTest)
+      // reuses the same program. Toggling `transparent` instead would flip
+      // three's OPAQUE define and switch programs, and move the mesh between
+      // render lists. Restored in onAfterRender so the material keeps its
+      // configured state for every other draw and for pick materials.
+      const material = this.material;
+      this.stochasticSaved = {
+        blending: material.blending,
+        depthWrite: material.depthWrite,
+        depthTest: material.depthTest,
+      };
+      material.blending = THREE.NoBlending;
+      material.depthWrite = true;
+      material.depthTest = true;
+    }
 
     const accumToWorld = new THREE.Matrix4();
     if (!spark.display.extSplats) {
@@ -1022,6 +1099,53 @@ export class SparkRenderer extends THREE.Mesh {
     this.uniforms.debugFlag.value = (performance.now() / 1000.0) % 2.0 < 1.0;
 
     spark.dirty = false;
+  }
+
+  onAfterRender() {
+    const saved = this.stochasticSaved;
+    if (saved) {
+      this.stochasticSaved = null;
+      this.material.blending = saved.blending;
+      this.material.depthWrite = saved.depthWrite;
+      this.material.depthTest = saved.depthTest;
+    }
+  }
+
+  private updateStochastic(camera: THREE.Camera) {
+    const now = performance.now();
+    const pose = this.stochasticPose;
+    const world = camera.matrixWorld.elements;
+    const proj = camera.projectionMatrix.elements;
+    let moved = false;
+    for (let i = 0; i < 16; ++i) {
+      if (
+        Math.abs(pose[i] - world[i]) > STOCHASTIC_POSE_EPSILON ||
+        Math.abs(pose[16 + i] - proj[i]) > STOCHASTIC_POSE_EPSILON
+      ) {
+        moved = true;
+        break;
+      }
+    }
+    if (moved) {
+      pose.set(world, 0);
+      pose.set(proj, 16);
+      this.stochasticMoveTime = now;
+    }
+
+    this.stochasticActive =
+      this.stochastic === "on" ||
+      (this.stochastic === "movement" &&
+        now - this.stochasticMoveTime < this.stochasticSettleMs);
+
+    // Moving in "movement" mode: (re)arm a timer so on-demand renderers
+    // draw the clean sorted frame once the camera has been still long enough.
+    if (this.stochasticActive && this.stochastic === "movement" && moved) {
+      clearTimeout(this.stochasticTimeoutId);
+      this.stochasticTimeoutId = setTimeout(() => {
+        this.stochasticTimeoutId = undefined;
+        this.setDirty();
+      }, this.stochasticSettleMs + 1);
+    }
   }
 
   clearSplats() {
@@ -1091,9 +1215,14 @@ export class SparkRenderer extends THREE.Mesh {
         ? Math.cos((Math.min(this.sortCullFov, 360) * Math.PI) / 360)
         : -2;
 
+    // Compare against the pose of the last generated accumulator, not the
+    // last started sort: while a sort is in flight the camera may already have
+    // stopped at the pose this.current was generated at, so regenerating every
+    // frame would be redundant. sortDirty stays set from that generate, so the
+    // final sort still runs once the in-flight one completes.
     const viewChanged =
-      center.distanceTo(this.sortedCenter) > 0.001 ||
-      dir.dot(this.sortedDir) < 0.999 ||
+      center.distanceTo(this.current.viewOrigin) > 0.001 ||
+      dir.dot(this.current.viewDirection) < 0.999 ||
       sortCullCos !== this.sortCullCos;
 
     const next = this.accumulators.pop();
@@ -1343,11 +1472,13 @@ export class SparkRenderer extends THREE.Mesh {
       if (!renderer.properties.has(this.orderingTexture)) {
         this.orderingTexture.needsUpdate = true;
       } else {
+        // Only rows holding the first activeSplats entries are ever read
+        // (instanceCount = activeSplats, 4096 RGBA texels = 16384 per row).
         uploadU32DataTextureRows(
           renderer,
           this.orderingTexture,
           4096,
-          rows,
+          Math.max(1, Math.ceil(activeSplats / 16384)),
           ordering,
         );
       }
