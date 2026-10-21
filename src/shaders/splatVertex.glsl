@@ -43,6 +43,8 @@ uniform float focalDistance;
 uniform float apertureAngle;
 uniform float clipXY;
 uniform float focalAdjustment;
+uniform bool stochastic;
+uniform int instanceCount;
 
 uniform usampler2D ordering;
 uniform usampler2DArray extSplats;
@@ -59,8 +61,11 @@ void main() {
     // Default to outside the frustum so it's discarded if we return early
     gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
 
-    ivec2 orderingCoord = ivec2((gl_InstanceID >> 2) & 4095, gl_InstanceID >> 14);
-    uint splatIndex = texelFetch(ordering, orderingCoord, 0)[gl_InstanceID & 3];
+    // Stochastic mode draws the back-to-front ordering reversed (front-to-back)
+    // so early depth testing rejects occluded fragments.
+    int instance = stochastic ? instanceCount - 1 - gl_InstanceID : gl_InstanceID;
+    ivec2 orderingCoord = ivec2((instance >> 2) & 4095, instance >> 14);
+    uint splatIndex = texelFetch(ordering, orderingCoord, 0)[instance & 3];
     if (splatIndex == 0xffffffffu) {
         // Special value reserved for "no splat"
         return;
