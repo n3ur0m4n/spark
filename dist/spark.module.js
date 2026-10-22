@@ -8658,9 +8658,19 @@ function evaluatePackedSH({ coord, viewDir, numSh, sh1Texture, sh2Texture, sh3Te
 var PAGE_SPLATS$1 = 65536;
 var LOD_BASE = 5;
 var LN_LOD_MULT = Math.log(3);
-var BEHIND_PENALTY = 1.5;
+var DISTANCE_SHRINK = .75;
+var UNDERFILL_LIMIT = 5;
+var REF_TAN_HALF_FOV = Math.tan(22.5 * Math.PI / 180);
+var TIER_PREFETCH = 0;
+var TIER_SWITCH = 1;
+var TIER_VISIBLE = 2;
+var TIER_SHOWN = 3;
 function isLodMetaUrl(url) {
 	return /lod-meta\.json$/i.test(url.split(/[?#]/)[0]);
+}
+/** Compensazione FOV PC: min(tanHalfV, tanHalfH) / tan(22.5°) */
+function lodMetaFovScale(tanHalfVFov, aspect) {
+	return Math.min(tanHalfVFov, tanHalfVFov * (aspect > 0 && Number.isFinite(aspect) ? aspect : 1)) / REF_TAN_HALF_FOV;
 }
 function parseLodMeta(json, baseUrl) {
 	const numLevels = json.lodLevels;
@@ -8677,28 +8687,28 @@ function parseLodMeta(json, baseUrl) {
 	const file = new Int32Array(numLeaves * numLevels).fill(-1);
 	const offset = new Uint32Array(numLeaves * numLevels);
 	const count = new Uint32Array(numLeaves * numLevels);
+	const fileLevel = new Int32Array(fileUrls.length);
 	for (let i = 0; i < numLeaves; i++) {
 		const { bound, lods } = leaves[i];
 		bounds.set(bound.min, i * 6);
 		bounds.set(bound.max, i * 6 + 3);
 		for (const [level, lod] of Object.entries(lods ?? {})) {
 			const l = Number(level);
-			if (!(l >= 0 && l < numLevels)) continue;
+			if (!(l >= 0 && l < numLevels) || !(lod.count > 0)) continue;
 			if (lod.offset + lod.count > PAGE_SPLATS$1) throw new Error(`lod-meta: range ${lod.offset}+${lod.count} oltre ${PAGE_SPLATS$1} splat in "${json.filenames[lod.file]}" (1 file deve stare in una pagina)`);
 			file[i * numLevels + l] = lod.file;
 			offset[i * numLevels + l] = lod.offset;
 			count[i * numLevels + l] = lod.count;
+			fileLevel[lod.file] = l;
 		}
-		for (let l = 0; l < numLevels; l++) {
-			const k = i * numLevels + l;
-			if (file[k] >= 0) continue;
-			let src = -1;
-			for (let d = 1; d < numLevels && src < 0; d++) if (l + d < numLevels && file[i * numLevels + l + d] >= 0) src = l + d;
-			else if (l - d >= 0 && file[i * numLevels + l - d] >= 0) src = l - d;
-			const s = i * numLevels + src;
-			file[k] = file[s];
-			offset[k] = offset[s];
-			count[k] = count[s];
+	}
+	const excess = new Float32Array(numLeaves * 3);
+	if (numLeaves > 0) {
+		const half = new Float32Array(numLeaves);
+		for (let axis = 0; axis < 3; axis++) {
+			for (let i = 0; i < numLeaves; i++) half[i] = (bounds[i * 6 + 3 + axis] - bounds[i * 6 + axis]) * .5;
+			const typical = half.slice().sort()[numLeaves >> 1];
+			for (let i = 0; i < numLeaves; i++) excess[i * 3 + axis] = Math.max(0, half[i] - typical);
 		}
 	}
 	return {
@@ -8706,44 +8716,102 @@ function parseLodMeta(json, baseUrl) {
 		numLeaves,
 		numLevels,
 		bounds,
+		excess,
 		file,
 		offset,
-		count
+		count,
+		fileLevel,
+		rangeMin: numLevels - 1,
+		current: new Int16Array(numLeaves).fill(-1)
 	};
 }
+function lodTable(data) {
+	const { numLeaves, numLevels: K, rangeMin, file, count } = data;
+	if (data.table?.rangeMin === rangeMin) return data.table;
+	const rangeMax = K - 1;
+	const span = rangeMax - rangeMin + 1;
+	const bandLod = new Int16Array(numLeaves * span).fill(-1);
+	const bandCount = new Uint32Array(numLeaves * span);
+	for (let i = 0; i < numLeaves; i++) {
+		const base = i * K;
+		const row = i * span;
+		let coarsest = -1;
+		for (let l = rangeMax; l >= rangeMin && coarsest < 0; l--) if (file[base + l] >= 0) coarsest = l;
+		if (coarsest < 0) continue;
+		for (let b = 0; b < span; b++) {
+			const band = rangeMin + b;
+			let lod = band;
+			if (band > coarsest) lod = coarsest + 1;
+			else if (file[base + band] < 0) {
+				lod = -1;
+				for (let l = band - 1; l >= rangeMin && lod < 0; l--) if (file[base + l] >= 0) lod = l;
+				for (let l = band + 1; l <= coarsest && lod < 0; l++) if (file[base + l] >= 0) lod = l;
+			}
+			bandLod[row + b] = lod;
+			bandCount[row + b] = lod > coarsest ? 0 : count[base + lod];
+		}
+	}
+	data.table = {
+		rangeMin,
+		bandLod,
+		bandCount
+	};
+	return data.table;
+}
 /**
-* Selezione stile PlayCanvas: livello = floor(1 + log_3(d / (s·b))), d = distanza
-* camera → punto più vicino dell'AABB foglia (×1.5 se dietro la camera).
-* s globale = la più grande che sta nel budget splat (e pagine). Se il file del
-* livello voluto non è residente si mostra il residente più vicino (prima più
-* grossolano, poi più fine), altrimenti niente.
+* Distanza mondo camera → foglia come PC evaluateNodeDistances: punto più vicino
+* dell'AABB ristretto (lodDistanceShrink), penalità dietro camera, × scala mondo
+* del mesh × compensazione FOV.
+*/
+function lodMetaDistances(data, viewToObject, fovScale = 1) {
+	const e = viewToObject.elements;
+	const cx = e[12];
+	const cy = e[13];
+	const cz = e[14];
+	const scale = 1 / Math.hypot(e[0], e[1], e[2]);
+	const fl = Math.hypot(e[8], e[9], e[10]);
+	const fx = -e[8] / fl;
+	const fy = -e[9] / fl;
+	const fz = -e[10] / fl;
+	const penalty = 2;
+	const distanceScale = fovScale * scale;
+	const b = data.bounds;
+	const ex = data.excess;
+	const out = new Float64Array(data.numLeaves);
+	for (let i = 0; i < data.numLeaves; i++) {
+		const j = i * 6;
+		const sx = ex[i * 3] * DISTANCE_SHRINK;
+		const sy = ex[i * 3 + 1] * DISTANCE_SHRINK;
+		const sz = ex[i * 3 + 2] * DISTANCE_SHRINK;
+		const px = Math.min(Math.max(cx, b[j] + sx), b[j + 3] - sx);
+		const py = Math.min(Math.max(cy, b[j + 1] + sy), b[j + 4] - sy);
+		const pz = Math.min(Math.max(cz, b[j + 2] + sz), b[j + 5] - sz);
+		const dx = px - cx;
+		const dy = py - cy;
+		const dz = pz - cz;
+		const dSq = dx * dx + dy * dy + dz * dz;
+		let factor = 1;
+		if (dSq > 1e-4) {
+			const dot = fx * dx + fy * dy + fz * dz;
+			if (dot < 0) factor = 1 + -dot / Math.sqrt(dSq) * penalty;
+		}
+		out[i] = Math.sqrt(dSq) * factor * distanceScale;
+	}
+	return out;
+}
+/**
+* Selezione stile PlayCanvas: banda = floor(1 + log_3(d / (s·b))) clampata al
+* range, livello dalla tabella (buchi/livello vuoto), s globale = la più grande
+* che sta nel budget splat (e pagine). Underfill fino a 5 passi più grossolani
+* già residenti; se il voluto non è pronto resta il livello mostrato prima.
 * `residentPage(splats, file)` = pagina del file già caricata, o -1.
 */
-function selectLodMeta({ instances, maxSplats, maxFiles, residentPage, indicesCache }) {
-	const as = instances.map(({ data, viewToObject, lodScale }) => {
-		const e = viewToObject.elements;
-		const cx = e[12];
-		const cy = e[13];
-		const cz = e[14];
-		const fx = -e[8];
-		const fy = -e[9];
-		const fz = -e[10];
+function selectLodMeta({ instances, maxSplats, maxFiles, residentPage, indicesCache, fovScale = 1 }) {
+	const tables = instances.map(({ data }) => lodTable(data));
+	const dists = instances.map(({ data, viewToObject }) => lodMetaDistances(data, viewToObject, fovScale));
+	const as = instances.map(({ lodScale }, m) => {
 		const bias = Math.log(LOD_BASE * lodScale);
-		const a = new Float64Array(data.numLeaves);
-		const b = data.bounds;
-		for (let i = 0; i < data.numLeaves; i++) {
-			const j = i * 6;
-			const px = Math.min(Math.max(cx, b[j]), b[j + 3]);
-			const py = Math.min(Math.max(cy, b[j + 1]), b[j + 4]);
-			const pz = Math.min(Math.max(cz, b[j + 2]), b[j + 5]);
-			const dx = px - cx;
-			const dy = py - cy;
-			const dz = pz - cz;
-			let d = Math.sqrt(dx * dx + dy * dy + dz * dz);
-			if (dx * fx + dy * fy + dz * fz < 0) d *= BEHIND_PENALTY;
-			a[i] = 1 + (Math.log(Math.max(d, 1e-6)) - bias) / LN_LOD_MULT;
-		}
-		return a;
+		return dists[m].map((d) => 1 + (Math.log(Math.max(d, 1e-6)) - bias) / LN_LOD_MULT);
 	});
 	const stamps = instances.map(({ data }) => new Int32Array(data.fileUrls.length));
 	let stamp = 0;
@@ -8753,15 +8821,19 @@ function selectLodMeta({ instances, maxSplats, maxFiles, residentPage, indicesCa
 		let files = 0;
 		for (let m = 0; m < instances.length; m++) {
 			const { data } = instances[m];
+			const { bandLod, bandCount } = tables[m];
 			const a = as[m];
 			const st = stamps[m];
 			const K = data.numLevels;
+			const rMin = data.rangeMin;
+			const span = K - rMin;
 			for (let i = 0; i < data.numLeaves; i++) {
-				const l = Math.min(Math.max(Math.floor(a[i] - c), 0), K - 1);
-				const k = i * K + l;
-				splats += data.count[k];
-				const f = data.file[k];
-				if (st[f] !== stamp) {
+				const b = i * span + Math.min(Math.max(Math.floor(a[i] - c), rMin), K - 1) - rMin;
+				const lod = bandLod[b];
+				if (lod < 0) continue;
+				splats += bandCount[b];
+				const f = data.file[i * K + lod];
+				if (f >= 0 && st[f] !== stamp) {
 					st[f] = stamp;
 					files++;
 				}
@@ -8801,48 +8873,99 @@ function selectLodMeta({ instances, maxSplats, maxFiles, residentPage, indicesCa
 	const indices = [];
 	const entries = [];
 	const prefetchEntries = [];
+	let rangeChanged = false;
 	for (let m = 0; m < instances.length; m++) {
 		const { splats, data } = instances[m];
+		const { bandLod } = tables[m];
 		const a = as[m];
+		const dist = dists[m];
 		const K = data.numLevels;
+		const rMin = data.rangeMin;
+		const span = K - rMin;
 		const numFiles = data.fileUrls.length;
 		const pageOf = new Int32Array(numFiles).fill(-2);
 		const getPage = (f) => {
 			if (pageOf[f] === -2) pageOf[f] = residentPage(splats, f);
 			return pageOf[f];
 		};
-		const keys = new Float64Array(numFiles).fill(Number.POSITIVE_INFINITY);
-		const prefetchKeys = new Float64Array(numFiles).fill(Number.POSITIVE_INFINITY);
-		const setKey = (arr, f, cat, l, i) => {
-			const key = (cat * 64 + (63 - l)) * 1e9 + Math.min(a[i] + 64, 1e9 - 1);
-			if (key < arr[f]) arr[f] = key;
+		const prios = new Float64Array(numFiles).fill(-1);
+		let pending = 0;
+		const request = (f, tier, rank) => {
+			if (tier !== TIER_SHOWN) {
+				if (getPage(f) >= 0) return;
+				pending++;
+			}
+			const p = tier + (data.fileLevel[f] + rank) / K;
+			if (p > prios[f]) prios[f] = p;
 		};
-		const drawnK = new Int32Array(data.numLeaves).fill(-1);
 		let total = 0;
 		for (let i = 0; i < data.numLeaves; i++) {
-			const want = Math.min(Math.max(Math.floor(a[i] - c), 0), K - 1);
-			let drawn = -1;
-			if (getPage(data.file[i * K + want]) >= 0) drawn = want;
+			const row = i * span;
+			const fileOf = (lod) => lod < 0 ? -1 : data.file[i * K + lod];
+			const coarserOnChain = (lod) => {
+				for (let b = row; b < row + span; b++) if (bandLod[b] > lod) return bandLod[b];
+				return -1;
+			};
+			const finerOnChain = (lod) => {
+				for (let b = row + span - 1; b >= row; b--) if (bandLod[b] >= 0 && bandLod[b] < lod) return bandLod[b];
+				return -1;
+			};
+			const optimal = bandLod[row + Math.min(Math.max(Math.floor(a[i] - c), rMin), K - 1) - rMin];
+			let desired = optimal;
+			if (optimal >= 0) {
+				let loaded = -1;
+				let lod = optimal;
+				for (let step = 0; step <= UNDERFILL_LIMIT && lod >= 0; step++) {
+					const f = fileOf(lod);
+					if (f < 0 || getPage(f) >= 0) {
+						loaded = lod;
+						break;
+					}
+					lod = coarserOnChain(lod);
+				}
+				if (loaded >= 0) desired = loaded;
+				else {
+					let coarsest = -1;
+					lod = optimal;
+					for (let step = 0; step <= UNDERFILL_LIMIT && lod >= 0; step++) {
+						if (fileOf(lod) >= 0) coarsest = lod;
+						lod = coarserOnChain(lod);
+					}
+					if (coarsest >= 0) desired = coarsest;
+				}
+			}
+			const rank = 1 / (1 + Math.max(dist[i] * dist[i], 1e-12));
+			const desiredFile = fileOf(desired);
+			let cur = data.current[i];
+			if (desiredFile < 0) cur = -1;
+			else if (getPage(desiredFile) >= 0) cur = desired;
+			else if (cur >= 0 && getPage(fileOf(cur)) >= 0) request(desiredFile, TIER_SWITCH, rank);
 			else {
-				for (let l = want + 1; l < K && drawn < 0; l++) if (getPage(data.file[i * K + l]) >= 0) drawn = l;
-				for (let l = want - 1; l >= 0 && drawn < 0; l--) if (getPage(data.file[i * K + l]) >= 0) drawn = l;
+				cur = -1;
+				request(desiredFile, TIER_VISIBLE, rank);
 			}
-			if (drawn >= 0) {
-				const k = i * K + drawn;
-				drawnK[i] = k;
-				total += data.count[k];
-				setKey(keys, data.file[k], 0, drawn, i);
+			data.current[i] = cur;
+			if (desired >= 0 && optimal >= 0) {
+				const f = fileOf(desired === optimal ? optimal : finerOnChain(desired));
+				if (f >= 0) request(f, TIER_PREFETCH, rank);
 			}
-			if (drawn !== want) setKey(keys, data.file[i * K + want], drawn < 0 ? 1 : 2, want, i);
-			else if (want > 0) setKey(prefetchKeys, data.file[i * K + want - 1], 3, want - 1, i);
+			if (cur >= 0) {
+				request(fileOf(cur), TIER_SHOWN, rank);
+				total += data.count[i * K + cur];
+			}
+		}
+		if (rMin > 0 && pending === 0) {
+			data.rangeMin = 0;
+			rangeChanged = true;
 		}
 		const capacity = Math.max(1, Math.ceil(total / 16384)) * 16384;
 		let out = indicesCache?.[m];
 		if (!out || out.length < capacity) out = new Uint32Array(Math.ceil(capacity * 1.25 / 16384) * 16384);
 		let n = 0;
 		for (let i = 0; i < data.numLeaves; i++) {
-			const k = drawnK[i];
-			if (k < 0) continue;
+			const cur = data.current[i];
+			if (cur < 0) continue;
+			const k = i * K + cur;
 			const base = getPage(data.file[k]) * PAGE_SPLATS$1 + data.offset[k];
 			const cnt = data.count[k];
 			for (let j = 0; j < cnt; j++) out[n + j] = base + j;
@@ -8850,19 +8973,22 @@ function selectLodMeta({ instances, maxSplats, maxFiles, residentPage, indicesCa
 		}
 		numSplats.push(n);
 		indices.push(out);
-		for (let f = 0; f < numFiles; f++) if (keys[f] !== Number.POSITIVE_INFINITY) entries.push({
-			splats,
-			chunk: f,
-			key: keys[f]
-		});
-		else if (prefetchKeys[f] !== Number.POSITIVE_INFINITY) prefetchEntries.push({
-			splats,
-			chunk: f,
-			key: prefetchKeys[f]
-		});
+		for (let f = 0; f < numFiles; f++) {
+			const prio = prios[f];
+			if (prio >= TIER_SWITCH) entries.push({
+				splats,
+				chunk: f,
+				prio
+			});
+			else if (prio >= 0) prefetchEntries.push({
+				splats,
+				chunk: f,
+				prio
+			});
+		}
 	}
-	entries.sort((x, y) => x.key - y.key);
-	prefetchEntries.sort((x, y) => x.key - y.key);
+	entries.sort((x, y) => y.prio - x.prio);
+	prefetchEntries.sort((x, y) => y.prio - x.prio);
 	const strip = ({ splats, chunk }) => ({
 		splats,
 		chunk
@@ -8871,7 +8997,8 @@ function selectLodMeta({ instances, maxSplats, maxFiles, residentPage, indicesCa
 		numSplats,
 		indices,
 		priority: entries.map(strip),
-		prefetch: prefetchEntries.map(strip)
+		prefetch: prefetchEntries.map(strip),
+		rangeChanged
 	};
 }
 //#endregion
@@ -12748,6 +12875,11 @@ var SparkRenderer = class SparkRenderer extends THREE.Mesh {
 		this.lodInstances = /* @__PURE__ */ new Map();
 		this.lodUpdates = [];
 		this.lastTraverseTime = 0;
+		this.lodMetaDirty = true;
+		this.lodMetaFrames = 0;
+		this.lodMetaFovScale = 1;
+		this.lodMetaPriority = [];
+		this.lodMetaPrefetch = [];
 		this.pagerId = 0;
 		this.superXY = 1;
 		this.pickTargetW = 0;
@@ -13281,8 +13413,12 @@ var SparkRenderer = class SparkRenderer extends THREE.Mesh {
 		const defaultSplatCount = this.defaultSplatTarget();
 		const maxSplats = (this.lodSplatCount ?? defaultSplatCount) * this.lodSplatScale;
 		let pixelScaleLimit = 0;
-		if (camera instanceof THREE.PerspectiveCamera) pixelScaleLimit = 2 * Math.tan(.5 * camera.fov * Math.PI / 180) / this.renderSize.y;
-		else if (camera instanceof THREE.OrthographicCamera) {
+		let fovScale = 1;
+		if (camera instanceof THREE.PerspectiveCamera) {
+			const tanYfov = Math.tan(.5 * camera.fov * Math.PI / 180);
+			pixelScaleLimit = 2 * tanYfov / this.renderSize.y;
+			fovScale = lodMetaFovScale(tanYfov, camera.aspect);
+		} else if (camera instanceof THREE.OrthographicCamera) {
 			const viewHeight = (camera.top - camera.bottom) / camera.zoom;
 			const viewWidth = (camera.right - camera.left) / camera.zoom;
 			const pxY = viewHeight / Math.max(1, this.renderSize.y);
@@ -13295,19 +13431,46 @@ var SparkRenderer = class SparkRenderer extends THREE.Mesh {
 		this.current.viewToWorld.decompose(viewPos, viewQuat, new THREE.Vector3());
 		if (this.lodPosOverride) viewPos.copy(this.lodPosOverride);
 		if (this.lodQuatOverride) viewQuat.copy(this.lodQuatOverride).normalize();
+		let cameraMoved = false;
 		if (this.lastLod) {
 			if (this.lastLod.pixelScaleLimit !== pixelScaleLimit || this.lastLod.maxSplats !== maxSplats) this.lodDirty = true;
+			if (this.lastLod.maxSplats !== maxSplats) this.lodMetaDirty = true;
 			const distance = viewPos.distanceTo(this.lastLod.pos);
 			const distanceRamp = Math.max(0, 1 - distance / 1);
 			const dot = viewQuat.dot(this.lastLod.quat);
-			if (distanceRamp * Math.max(0, 1 - (1 - dot) / .01) < .999) this.lodDirty = true;
+			cameraMoved = distanceRamp * Math.max(0, 1 - (1 - dot) / .01) < .999;
 		}
 		const lodMeshes = !this.enableLod ? [] : visibleGenerators.filter((generator) => {
 			return generator instanceof SplatMesh && (generator.packedSplats?.lodSplats || generator.extSplats?.lodSplats || generator.paged) && generator.enableLod !== false;
 		});
 		const hasPaged = lodMeshes.some((mesh) => mesh.paged);
-		if (this.lodMeshes.length !== lodMeshes.length) this.lodDirty = true;
-		else if (lodMeshes.some((m, i) => m !== this.lodMeshes[i].mesh || m.version > this.lodMeshes[i].version)) this.lodDirty = true;
+		const hasLodMeta = lodMeshes.some((mesh) => mesh.paged?.lodMetaPromise);
+		if (cameraMoved && (!hasLodMeta || lodMeshes.some((mesh) => !mesh.paged?.lodMetaPromise))) this.lodDirty = true;
+		if (hasLodMeta) {
+			this.lodMetaFovScale = fovScale;
+			const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(viewQuat);
+			const last = this.lodMetaLast;
+			const gateMoved = !last || viewPos.distanceTo(last.pos) > .5 || fwd.dot(last.fwd) < Math.cos(Math.PI / 2) || Math.abs(fovScale - last.fovScale) > last.fovScale * .02;
+			if (++this.lodMetaFrames >= 10) {
+				this.lodMetaFrames = 0;
+				if (gateMoved) {
+					this.lodMetaLast = {
+						pos: viewPos.clone(),
+						fwd,
+						fovScale
+					};
+					this.lodMetaDirty = true;
+					this.lodDirty = true;
+				}
+			} else if (gateMoved) this.setDirty();
+		}
+		if (this.lodMeshes.length !== lodMeshes.length) {
+			this.lodDirty = true;
+			this.lodMetaDirty = true;
+		} else if (lodMeshes.some((m, i) => m !== this.lodMeshes[i].mesh || m.version > this.lodMeshes[i].version)) {
+			this.lodDirty = true;
+			this.lodMetaDirty = true;
+		}
 		this.lodMeshes = lodMeshes.map((mesh) => ({
 			mesh,
 			version: mesh.version + 1
@@ -13375,8 +13538,10 @@ var SparkRenderer = class SparkRenderer extends THREE.Mesh {
 			const updates = this.pager.consumeLodTreeUpdates();
 			for (const { splats, page, chunk, numSplats, lodTree } of updates) {
 				const record = this.lodIds.get(splats);
-				if (splats.lodMetaPromise) this.lodDirty = true;
-				else if (record) {
+				if (splats.lodMetaPromise) {
+					this.lodDirty = true;
+					this.lodMetaDirty = true;
+				} else if (record) {
 					if (lodTree && chunk === 0) record.rootPage = page;
 					else if (!lodTree && chunk === 0 && record.rootPage === page) {
 						record.rootPage = void 0;
@@ -13522,10 +13687,17 @@ var SparkRenderer = class SparkRenderer extends THREE.Mesh {
 					});
 				}
 			}
-			if (lodMetaMeshes.length > 0) {
+			if (lodMetaMeshes.length > 0 && !this.lodMetaDirty) {
+				this.pager.fetchPriority.push(...this.lodMetaPriority, ...radChunks);
+				this.pager.fetchPriority.push(...this.lodMetaPrefetch);
+			} else if (lodMetaMeshes.length > 0) {
+				this.lodMetaDirty = false;
 				const pager = this.pager;
 				const ready = lodMetaMeshes.filter((mesh) => mesh.paged?.lodMeta && mesh.paged.pager === pager);
-				if (lodMetaMeshes.some((mesh) => !mesh.paged?.lodMeta && !mesh.paged?.lodMetaError)) this.lodDirty = true;
+				if (lodMetaMeshes.some((mesh) => !mesh.paged?.lodMeta && !mesh.paged?.lodMetaError)) {
+					this.lodDirty = true;
+					this.lodMetaDirty = true;
+				}
 				const radPages = this.pager.fetchPriority.length + radChunks.length;
 				const selection = selectLodMeta({
 					instances: ready.map((mesh) => ({
@@ -13540,14 +13712,21 @@ var SparkRenderer = class SparkRenderer extends THREE.Mesh {
 						const pageLru = pager.getSplatsChunk(splats, file);
 						return pageLru && pager.isPageUploaded(pageLru.page) ? pageLru.page : -1;
 					},
-					indicesCache: ready.map((mesh) => mesh.paged?.lodMetaIndices)
+					indicesCache: ready.map((mesh) => mesh.paged?.lodMetaIndices),
+					fovScale: this.lodMetaFovScale
 				});
+				if (selection.rangeChanged) {
+					this.lodDirty = true;
+					this.lodMetaDirty = true;
+				}
 				ready.forEach((mesh, m) => {
 					const paged = mesh.paged;
 					paged.lodMetaIndices = selection.indices[m];
 					if (selection.numSplats[m] > 0) paged.update(selection.numSplats[m], selection.indices[m]);
 					else paged.clear();
 				});
+				this.lodMetaPriority = selection.priority;
+				this.lodMetaPrefetch = selection.prefetch;
 				this.pager.fetchPriority.push(...selection.priority, ...radChunks);
 				this.pager.fetchPriority.push(...selection.prefetch);
 			} else this.pager.fetchPriority.push(...radChunks);

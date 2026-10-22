@@ -499,6 +499,12 @@ export declare class SparkRenderer extends THREE.Mesh {
     }[];
     lastTraverseTime: number;
     lastPixelLimit?: number;
+    private lodMetaDirty;
+    private lodMetaFrames;
+    private lodMetaFovScale;
+    private lodMetaLast?;
+    private lodMetaPriority;
+    private lodMetaPrefetch;
     pager?: SplatPager;
     pagerId: number;
     target?: THREE.WebGLRenderTarget;

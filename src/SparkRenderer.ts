@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import { ExtSplats } from "./ExtSplats";
-import { type LodMetaData, selectLodMeta } from "./LodMeta";
+import { type LodMetaData, lodMetaFovScale, selectLodMeta } from "./LodMeta";
 import { PackedSplats } from "./PackedSplats";
 import { PagedSplats } from "./PagedSplats";
 import { Readback } from "./Readback";
@@ -572,6 +572,18 @@ export class SparkRenderer extends THREE.Mesh {
   }[] = [];
   lastTraverseTime = 0;
   lastPixelLimit?: number;
+  // lod-meta.json: riselezione con cadenza e soglie PlayCanvas (gsplat-world.js
+  // testCameraMovedForLod): ogni 10 frame, solo se camera >0,5 m, >90° o FOV >2%
+  private lodMetaDirty = true;
+  private lodMetaFrames = 0;
+  private lodMetaFovScale = 1;
+  private lodMetaLast?: {
+    pos: THREE.Vector3;
+    fwd: THREE.Vector3;
+    fovScale: number;
+  };
+  private lodMetaPriority: { splats: PagedSplats; chunk: number }[] = [];
+  private lodMetaPrefetch: { splats: PagedSplats; chunk: number }[] = [];
 
   pager?: SplatPager;
   pagerId = 0;
@@ -1564,9 +1576,11 @@ export class SparkRenderer extends THREE.Mesh {
     const maxSplats = splatCount * this.lodSplatScale;
 
     let pixelScaleLimit = 0.0;
+    let fovScale = 1;
     if (camera instanceof THREE.PerspectiveCamera) {
       const tanYfov = Math.tan((0.5 * camera.fov * Math.PI) / 180);
       pixelScaleLimit = (2.0 * tanYfov) / this.renderSize.y;
+      fovScale = lodMetaFovScale(tanYfov, camera.aspect);
     } else if (camera instanceof THREE.OrthographicCamera) {
       // Effective visible size after zoom
       const viewHeight = (camera.top - camera.bottom) / camera.zoom;
@@ -1590,6 +1604,7 @@ export class SparkRenderer extends THREE.Mesh {
       viewQuat.copy(this.lodQuatOverride).normalize();
     }
 
+    let cameraMoved = false;
     if (this.lastLod) {
       if (
         this.lastLod.pixelScaleLimit !== pixelScaleLimit ||
@@ -1597,15 +1612,16 @@ export class SparkRenderer extends THREE.Mesh {
       ) {
         this.lodDirty = true;
       }
+      if (this.lastLod.maxSplats !== maxSplats) {
+        this.lodMetaDirty = true;
+      }
 
       const distance = viewPos.distanceTo(this.lastLod.pos);
       const distanceRamp = Math.max(0.0, 1.0 - distance / 1.0);
       const dot = viewQuat.dot(this.lastLod.quat);
       const quatRamp = Math.max(0.0, 1.0 - (1.0 - dot) / 0.01);
       const similarity = distanceRamp * quatRamp;
-      if (similarity < 0.999) {
-        this.lodDirty = true;
-      }
+      cameraMoved = similarity < 0.999;
     }
 
     const lodMeshes = !this.enableLod
@@ -1620,9 +1636,42 @@ export class SparkRenderer extends THREE.Mesh {
           );
         }) as SplatMesh[]);
     const hasPaged = lodMeshes.some((mesh) => mesh.paged);
+    const hasLodMeta = lodMeshes.some((mesh) => mesh.paged?.lodMetaPromise);
+
+    // Movimento qualsiasi: come prima per le mesh normali; se ci sono solo mesh
+    // lod-meta decide il gate PlayCanvas sotto
+    if (
+      cameraMoved &&
+      (!hasLodMeta || lodMeshes.some((mesh) => !mesh.paged?.lodMetaPromise))
+    ) {
+      this.lodDirty = true;
+    }
+
+    if (hasLodMeta) {
+      this.lodMetaFovScale = fovScale;
+      const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(viewQuat);
+      const last = this.lodMetaLast;
+      const gateMoved =
+        !last ||
+        viewPos.distanceTo(last.pos) > 0.5 ||
+        fwd.dot(last.fwd) < Math.cos(Math.PI / 2) ||
+        Math.abs(fovScale - last.fovScale) > last.fovScale * 0.02;
+      if (++this.lodMetaFrames >= 10) {
+        this.lodMetaFrames = 0;
+        if (gateMoved) {
+          this.lodMetaLast = { pos: viewPos.clone(), fwd, fovScale };
+          this.lodMetaDirty = true;
+          this.lodDirty = true;
+        }
+      } else if (gateMoved) {
+        // ponytail: render on-demand, assicura il frame del prossimo controllo
+        this.setDirty();
+      }
+    }
 
     if (this.lodMeshes.length !== lodMeshes.length) {
       this.lodDirty = true;
+      this.lodMetaDirty = true;
     } else {
       if (
         lodMeshes.some(
@@ -1632,6 +1681,7 @@ export class SparkRenderer extends THREE.Mesh {
         )
       ) {
         this.lodDirty = true;
+        this.lodMetaDirty = true;
       }
     }
 
@@ -1758,7 +1808,9 @@ export class SparkRenderer extends THREE.Mesh {
         const record = this.lodIds.get(splats);
         if (splats.lodMetaPromise) {
           // lod-meta.json: niente albero Rust, basta rifare la selezione
+          // (file arrivato/rimosso: sempre, fuori dal gate camera)
           this.lodDirty = true;
+          this.lodMetaDirty = true;
         } else if (record) {
           if (lodTree && chunk === 0) {
             record.rootPage = page;
@@ -2015,7 +2067,12 @@ export class SparkRenderer extends THREE.Mesh {
         }
       }
 
-      if (lodMetaMeshes.length > 0) {
+      if (lodMetaMeshes.length > 0 && !this.lodMetaDirty) {
+        // gate PlayCanvas chiuso: selezione invariata, ripropone le stesse priorità
+        this.pager.fetchPriority.push(...this.lodMetaPriority, ...radChunks);
+        this.pager.fetchPriority.push(...this.lodMetaPrefetch);
+      } else if (lodMetaMeshes.length > 0) {
+        this.lodMetaDirty = false;
         const pager = this.pager;
         const ready = lodMetaMeshes.filter(
           (mesh) => mesh.paged?.lodMeta && mesh.paged.pager === pager,
@@ -2027,6 +2084,7 @@ export class SparkRenderer extends THREE.Mesh {
         ) {
           // lod-meta.json ancora in caricamento: riprova al prossimo giro
           this.lodDirty = true;
+          this.lodMetaDirty = true;
         }
         const radPages = this.pager.fetchPriority.length + radChunks.length;
         const selection = selectLodMeta({
@@ -2049,7 +2107,13 @@ export class SparkRenderer extends THREE.Mesh {
               : -1;
           },
           indicesCache: ready.map((mesh) => mesh.paged?.lodMetaIndices),
+          fovScale: this.lodMetaFovScale,
         });
+        if (selection.rangeChanged) {
+          // bootstrap finito (tutto il livello grossolano caricato): range completo
+          this.lodDirty = true;
+          this.lodMetaDirty = true;
+        }
         ready.forEach((mesh, m) => {
           const paged = mesh.paged as PagedSplats;
           paged.lodMetaIndices = selection.indices[m];
@@ -2060,6 +2124,8 @@ export class SparkRenderer extends THREE.Mesh {
           }
         });
         // Ordine: radici .rad, file lodmeta mostrati/voluti, chunk .rad, prefetch
+        this.lodMetaPriority = selection.priority;
+        this.lodMetaPrefetch = selection.prefetch;
         this.pager.fetchPriority.push(...selection.priority, ...radChunks);
         this.pager.fetchPriority.push(...selection.prefetch);
       } else {
