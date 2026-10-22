@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { type LodMetaData } from "./LodMeta";
 import type { SplatSource } from "./SplatMesh";
 import type { SplatPager } from "./SplatPager";
 import { type RadMeta, type SplatEncoding, SplatFileType } from "./defines";
@@ -11,6 +12,8 @@ export interface PagedSplatsOptions {
     fileBytes?: Uint8Array;
     fileType?: SplatFileType;
     maxSh?: number;
+    /** Formato LoD PlayCanvas "streamed SOG" (default: url che finisce con lod-meta.json) */
+    lodMeta?: boolean;
 }
 export declare class PagedSplats implements SplatSource {
     pager?: SplatPager;
@@ -30,6 +33,10 @@ export declare class PagedSplats implements SplatSource {
         meta: RadMeta;
         chunksStart: number;
     }>;
+    lodMeta?: LodMetaData;
+    lodMetaPromise?: Promise<LodMetaData>;
+    lodMetaIndices?: Uint32Array;
+    lodMetaError?: unknown;
     dynoNumSplats: dyno.DynoInt<"numSplats">;
     dynoIndices: dyno.DynoUsampler2D<"indices", THREE.DataTexture>;
     rgbMinMaxLnScaleMinMax: dyno.DynoVec4<THREE.Vector4, "rgbMinMaxLnScaleMinMax">;
@@ -43,6 +50,12 @@ export declare class PagedSplats implements SplatSource {
     getRadMeta(): Promise<{
         meta: RadMeta;
         chunksStart: number;
+    }>;
+    getLodMeta(): Promise<LodMetaData>;
+    fetchSogsFiles(chunk: number): Promise<{
+        meta: Uint8Array<ArrayBufferLike>;
+        names: string[];
+        files: Uint8Array<ArrayBufferLike>[];
     }>;
     chunkUrl(chunk: number): string;
     fetchDecodeChunk(chunk: number): Promise<import("./defines").ExtResult | import("./defines").PackedResult>;

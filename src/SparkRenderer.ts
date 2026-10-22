@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import { ExtSplats } from "./ExtSplats";
+import { type LodMetaData, selectLodMeta } from "./LodMeta";
 import { PackedSplats } from "./PackedSplats";
 import { PagedSplats } from "./PagedSplats";
 import { Readback } from "./Readback";
@@ -1755,7 +1756,10 @@ export class SparkRenderer extends THREE.Mesh {
 
       for (const { splats, page, chunk, numSplats, lodTree } of updates) {
         const record = this.lodIds.get(splats);
-        if (record) {
+        if (splats.lodMetaPromise) {
+          // lod-meta.json: niente albero Rust, basta rifare la selezione
+          this.lodDirty = true;
+        } else if (record) {
           if (lodTree && chunk === 0) {
             record.rootPage = page;
           } else if (!lodTree && chunk === 0 && record.rootPage === page) {
@@ -1880,6 +1884,17 @@ export class SparkRenderer extends THREE.Mesh {
       new THREE.Vector3().setScalar(1),
     );
 
+    // lod-meta.json (PlayCanvas streamed SOG): selezione per foglia in JS
+    // (LodMeta.selectLodMeta), fuori dal traversal Rust. Budget splat diviso per
+    // numero di mesh: le lodmeta prendono la loro quota, il traversal il resto.
+    const lodMetaMeshes = lodMeshes.filter(
+      (mesh) => mesh.paged?.lodMetaPromise,
+    );
+    const lodMetaBudget = lodMeshes.length
+      ? Math.floor((maxSplats * lodMetaMeshes.length) / lodMeshes.length)
+      : 0;
+    const radMaxSplats = maxSplats - lodMetaBudget;
+
     const instances = lodMeshes.reduce(
       (instances, mesh) => {
         uuidToMesh.set(mesh.uuid, mesh);
@@ -1900,7 +1915,11 @@ export class SparkRenderer extends THREE.Mesh {
           return instances;
         }
 
-        if (this.pager && mesh.paged && record.rootPage === undefined) {
+        if (
+          this.pager &&
+          mesh.paged &&
+          (record.rootPage === undefined || mesh.paged.lodMetaPromise)
+        ) {
           return instances;
         }
 
@@ -1935,7 +1954,7 @@ export class SparkRenderer extends THREE.Mesh {
 
     const traverseStart = performance.now();
     const result = await worker.call("traverseLodTrees", {
-      maxSplats,
+      maxSplats: radMaxSplats,
       pixelScaleLimit,
       lastPixelLimit: this.lastPixelLimit,
       instances,
@@ -1961,7 +1980,7 @@ export class SparkRenderer extends THREE.Mesh {
 
       const pagedMeshes = lodMeshes
         .map((mesh) => {
-          if (!mesh.paged || !this.pager) {
+          if (!mesh.paged || !this.pager || mesh.paged.lodMetaPromise) {
             return null;
           }
           const meshPosition = mesh.getWorldPosition(new THREE.Vector3());
@@ -1986,13 +2005,65 @@ export class SparkRenderer extends THREE.Mesh {
         chunk: 0,
       }));
 
+      const radChunks: { splats: PagedSplats; chunk: number }[] = [];
       for (const [lodId, chunk] of chunks) {
         const splats = this.lodIdToSplats.get(lodId);
         if (splats instanceof PagedSplats) {
           if (chunk !== 0) {
-            this.pager.fetchPriority.push({ splats, chunk });
+            radChunks.push({ splats, chunk });
           }
         }
+      }
+
+      if (lodMetaMeshes.length > 0) {
+        const pager = this.pager;
+        const ready = lodMetaMeshes.filter(
+          (mesh) => mesh.paged?.lodMeta && mesh.paged.pager === pager,
+        );
+        if (
+          lodMetaMeshes.some(
+            (mesh) => !mesh.paged?.lodMeta && !mesh.paged?.lodMetaError,
+          )
+        ) {
+          // lod-meta.json ancora in caricamento: riprova al prossimo giro
+          this.lodDirty = true;
+        }
+        const radPages = this.pager.fetchPriority.length + radChunks.length;
+        const selection = selectLodMeta({
+          instances: ready.map((mesh) => ({
+            splats: mesh.paged as PagedSplats,
+            data: mesh.paged?.lodMeta as LodMetaData,
+            viewToObject: mesh.matrixWorld
+              .clone()
+              .invert()
+              .multiply(cameraToWorld),
+            lodScale: mesh.lodScale,
+          })),
+          maxSplats: lodMetaBudget,
+          // ponytail: 3/4 delle pagine libere ai file voluti, il resto a fallback/prefetch
+          maxFiles: Math.max(1, Math.floor(0.75 * (pager.maxPages - radPages))),
+          residentPage: (splats, file) => {
+            const pageLru = pager.getSplatsChunk(splats, file);
+            return pageLru && pager.isPageUploaded(pageLru.page)
+              ? pageLru.page
+              : -1;
+          },
+          indicesCache: ready.map((mesh) => mesh.paged?.lodMetaIndices),
+        });
+        ready.forEach((mesh, m) => {
+          const paged = mesh.paged as PagedSplats;
+          paged.lodMetaIndices = selection.indices[m];
+          if (selection.numSplats[m] > 0) {
+            paged.update(selection.numSplats[m], selection.indices[m]);
+          } else {
+            paged.clear();
+          }
+        });
+        // Ordine: radici .rad, file lodmeta mostrati/voluti, chunk .rad, prefetch
+        this.pager.fetchPriority.push(...selection.priority, ...radChunks);
+        this.pager.fetchPriority.push(...selection.prefetch);
+      } else {
+        this.pager.fetchPriority.push(...radChunks);
       }
 
       this.pager.autoDrive = this.enableLodFetching;

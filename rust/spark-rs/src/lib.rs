@@ -273,6 +273,42 @@ pub fn decode_to_extsplats(
 }
 stub_fn!(feature = "gsplat", decode_to_extsplats);
 
+// SOG NON zippato (file di lod-meta.json): meta.json + webp passati per nome.
+#[cfg(feature = "sogs")]
+fn sogs_file_map(names: &Array, files: &Array) -> std::collections::HashMap<String, Vec<u8>> {
+    (0..names.length())
+        .map(|i| (
+            names.get(i).as_string().unwrap_or_default(),
+            Uint8Array::new(&files.get(i)).to_vec(),
+        ))
+        .collect()
+}
+
+#[wasm_bindgen]
+#[cfg(all(feature = "csplat", feature = "sogs"))]
+pub fn decode_sogs_files_to_packedsplats(meta: Uint8Array, names: Array, files: Array, encoding: JsValue) -> Result<Object, JsValue> {
+    let encoding = if encoding.is_falsy() {
+        SplatEncoding::default()
+    } else {
+        serde_wasm_bindgen::from_value(encoding)?
+    };
+    let mut splats = PackedSplatsData::new(encoding);
+    spark_lib::sogs::decode_sogs_files(&meta.to_vec(), &sogs_file_map(&names, &files), &mut splats)
+        .map_err(|e| JsValue::from(e.to_string()))?;
+    Ok(splats.into_splat_object())
+}
+stub_fn!(all(feature = "csplat", feature = "sogs"), decode_sogs_files_to_packedsplats);
+
+#[wasm_bindgen]
+#[cfg(all(feature = "gsplat", feature = "sogs"))]
+pub fn decode_sogs_files_to_extsplats(meta: Uint8Array, names: Array, files: Array) -> Result<Object, JsValue> {
+    let mut splats = ExtSplatsData::new();
+    spark_lib::sogs::decode_sogs_files(&meta.to_vec(), &sogs_file_map(&names, &files), &mut splats)
+        .map_err(|e| JsValue::from(e.to_string()))?;
+    Ok(splats.into_splat_object())
+}
+stub_fn!(all(feature = "gsplat", feature = "sogs"), decode_sogs_files_to_extsplats);
+
 #[wasm_bindgen]
 #[allow(non_snake_case)]
 #[cfg(feature = "gsplat")]
