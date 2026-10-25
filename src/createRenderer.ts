@@ -13,7 +13,6 @@ import { getSparkRendererCapabilities } from "./RendererCapabilities";
 export const WEBGPU_UNSUPPORTED_FEATURES = [
   "xr",
   "modifiers",
-  "editing",
   "skinning",
   "specializedTargets",
   "covarianceSplats",

@@ -27,6 +27,8 @@ export type NativeMeshGeneration = {
   recolor: number[];
   /** Paged source: read the pager's page textures; primary/secondary/sh are unused. */
   pager?: SplatPager;
+  /** SplatEdits.editData (numEdits uvec4) followed by its sdfData (8 uvec4 per SDF). */
+  edits?: { data: Uint32Array; numEdits: number; numSdfs: number };
 };
 
 type PagerTextures = {
@@ -53,7 +55,11 @@ export class WebGPUGeneration {
   private readonly pagers = new Map<SplatPager, PagerTextures>();
   private dummyPages: GPUTexture | null = null;
   private readonly dummy: GPUBuffer;
-  private readonly meshes: { uniform: GPUBuffer; indices: GPUBuffer }[] = [];
+  private readonly meshes: {
+    uniform: GPUBuffer;
+    indices: GPUBuffer;
+    edits: GPUBuffer;
+  }[] = [];
   private disposed = false;
 
   constructor(private readonly device: GPUDevice) {
@@ -297,6 +303,7 @@ export class WebGPUGeneration {
       if (state) {
         state.uniform.destroy();
         if (state.indices !== this.dummy) state.indices.destroy();
+        if (state.edits !== this.dummy) state.edits.destroy();
       }
     }
     for (let i = 0; i < args.meshes.length; i++) {
@@ -308,11 +315,12 @@ export class WebGPUGeneration {
       if (!state) {
         state = {
           uniform: this.buffer(
-            176,
+            192,
             GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
             "native-mesh-uniform",
           ),
           indices: this.dummy,
+          edits: this.dummy,
         };
         this.meshes[i] = state;
       }
@@ -334,7 +342,26 @@ export class WebGPUGeneration {
           mesh.count * 4,
         );
       }
-      const data = new ArrayBuffer(176);
+      const edits = mesh.edits?.numEdits ? mesh.edits : undefined;
+      if (edits) {
+        const bytes = edits.data.byteLength;
+        if (state.edits === this.dummy || state.edits.size < bytes) {
+          if (state.edits !== this.dummy) state.edits.destroy();
+          state.edits = this.buffer(
+            bytes,
+            GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            "native-edits",
+          );
+        }
+        this.device.queue.writeBuffer(
+          state.edits,
+          0,
+          edits.data.buffer,
+          edits.data.byteOffset,
+          bytes,
+        );
+      }
+      const data = new ArrayBuffer(192);
       const u32 = new Uint32Array(data);
       const f32 = new Float32Array(data);
       u32.set([
@@ -356,22 +383,31 @@ export class WebGPUGeneration {
       f32.set(mesh.shMaxOpacity, 32);
       if (source) u32.set(source.shOffsets, 36);
       f32.set(mesh.recolor, 40);
+      if (edits) u32.set([edits.numEdits, edits.numSdfs], 44);
       this.device.queue.writeBuffer(state.uniform, 0, data);
       const pipeline = paged ? this.getPagedPipeline() : this.pipeline;
-      const resources: (GPUBuffer | GPUTextureView)[] = [
-        state.uniform,
+      // Sparse binding numbers: paged textures occupy 8-10 only when paged.
+      const resources: [number, GPUBuffer | GPUTextureView][] = [
+        [0, state.uniform],
         ...(source
           ? [source.primary, source.secondary, source.sh]
-          : (paged as GPUTextureView[]).slice(0, 3)),
-        mesh.indices ? state.indices : this.dummy,
-        args.output,
-        args.output2,
-        args.depths,
-        ...(paged ? paged.slice(3, 6) : []),
+          : (paged as GPUTextureView[]).slice(0, 3)
+        ).map((resource, i): [number, GPUBuffer | GPUTextureView] => [
+          i + 1,
+          resource,
+        ]),
+        [4, mesh.indices ? state.indices : this.dummy],
+        [5, args.output],
+        [6, args.output2],
+        [7, args.depths],
+        ...(paged ? paged.slice(3, 6) : []).map(
+          (view, i): [number, GPUTextureView] => [i + 8, view],
+        ),
+        [11, edits ? state.edits : this.dummy],
       ];
       const group = this.device.createBindGroup({
         layout: pipeline.getBindGroupLayout(0),
-        entries: resources.map((resource, binding) => ({
+        entries: resources.map(([binding, resource]) => ({
           binding,
           resource:
             resource instanceof GPUBuffer ? { buffer: resource } : resource,

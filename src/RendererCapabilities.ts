@@ -60,7 +60,7 @@ export function getSparkRendererCapabilities(
       paging: webgl || !!device,
       xr: webgl,
       modifiers: webgl,
-      editing: webgl,
+      editing: webgl || !!device,
       skinning: webgl,
       specializedTargets: webgl,
       covarianceSplats: webgl,

@@ -83,8 +83,9 @@ describe("createRenderer", () => {
   test("keeps WebGPU for supported needs", async () => {
     stubGpu({});
     expect(WEBGPU_UNSUPPORTED_FEATURES).not.toContain("paging");
+    expect(WEBGPU_UNSUPPORTED_FEATURES).not.toContain("editing");
     const { backend } = await createRenderer({
-      needs: ["multipleSplatMeshes", "paging"],
+      needs: ["multipleSplatMeshes", "paging", "editing"],
     });
     expect(backend).toBe("webgpu");
   });

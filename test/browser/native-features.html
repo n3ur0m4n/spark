@@ -18,7 +18,7 @@ try{
   ['manual clearing',field(renderer,'autoClearColor',false)],
   ['manual clearing',field(renderer,'autoClearDepth',false)],
   ['modifiers',field(mesh,'objectModifiers',[{}])],
-  ['skinning',field(mesh,'skinning',{})],['editing',field(mesh,'edits',[{}])],
+  ['skinning',field(mesh,'skinning',{})],['baked splat RGBA',field(mesh,'splatRgba',{})],
   ['custom view-dependent generation',field(mesh,'enableViewToObject',true)],
   ['covariance splats',field(mesh,'covSplats',true)],
   ['custom splat generators',field(mesh,'generator',{})],
@@ -48,7 +48,7 @@ try{
   check('reject native MSAA before generation',msaaRenderer.samples===4&&rejection?.includes('native MSAA')&&rejection.includes('WebGLRenderer')&&!generated,{rejection});
  }finally{msaaSpark?.dispose();msaaRenderer.dispose();}
  await spark.renderAsync(scene,camera);check('non-MSAA host remains usable',spark.activeSplats===1);
- const caps=spark.getCapabilities();check('native paging is declared supported',caps.features.paging===true,{capabilities:caps});check('unsupported features are declared before rendering',['xr','modifiers','editing','skinning','specializedTargets','covarianceSplats','transparentMeshes','msaa','customViewport','scissorTest','manualClear','nonuniformSplatTransforms'].every(key=>caps.features[key]===false),{capabilities:caps});
+ const caps=spark.getCapabilities();check('native paging and editing are declared supported',caps.features.paging===true&&caps.features.editing===true,{capabilities:caps});check('unsupported features are declared before rendering',['xr','modifiers','skinning','specializedTargets','covarianceSplats','transparentMeshes','msaa','customViewport','scissorTest','manualClear','nonuniformSplatTransforms'].every(key=>caps.features[key]===false),{capabilities:caps});
  const classic=new THREE.WebGLRenderer({antialias:false});const fallback=new SparkRenderer({renderer:classic,enableLod:false});
  const fallbackScene=new THREE.Scene();fallbackScene.add(fallback);
  const fallbackMesh=new SplatMesh({constructSplats:data=>data.pushSplat(new THREE.Vector3(),new THREE.Vector3(.2,.2,.2),new THREE.Quaternion(),1,new THREE.Color(1,0,0))});await fallbackMesh.initialized;fallbackScene.add(fallbackMesh);

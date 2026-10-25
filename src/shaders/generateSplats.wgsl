@@ -13,6 +13,8 @@ struct GenerateUniforms {
     shMaxOpacity: vec4f,
     shOffsets: vec4u,
     recolor: vec4f,
+// x: SplatEdits.numEdits, y: SplatEdits.numSdfs (sdfData follows editData).
+editCounts: vec4u,
 };
 @group(0) @binding(0) var<uniform> frame: GenerateUniforms;
 // Bindings 1-3 (and 8-10 for paged sources) and the load*() accessors come
@@ -21,6 +23,114 @@ struct GenerateUniforms {
 @group(0) @binding(5) var<storage, read_write> output: array<vec4u>;
 @group(0) @binding(6) var<storage, read_write> output2: array<vec4u>;
 @group(0) @binding(7) var<storage, read_write> depths: array<u32>;
+
+// Native counterpart of SplatEdit.ts defineSdfArray/defineEdit: world-space
+// SDF RGBA/displace layers. editData holds frame.editCounts.x packed edits
+// (SplatEdits.editData) followed by 8 vec4u per SDF (SplatEdits.sdfData).
+@group(0) @binding(11) var<storage, read> editData: array<vec4u>;
+// WGSL rejects infinite constants; FLT_MAX stands in for GLSL 1.0 / 0.0.
+const EDIT_INFINITY: f32 = 0x1.fffffep+127f;
+
+fn sdfRow(sdf: u32, row: u32) -> vec4f {
+    return bitcast<vec4f>(editData[frame.editCounts.x + sdf * 8u + row]);
+}
+
+fn evaluateSdfs(first: u32, count: u32, pos: vec3f, smoothK: f32,
+                values: ptr<function, array<vec4f, 2>>) -> f32 {
+    var accum = select(0.0, EDIT_INFINITY, smoothK == 0.0);
+    var maxExp = -EDIT_INFINITY;
+    (*values)[0] = vec4f(0.0);
+    (*values)[1] = vec4f(0.0);
+    let last = min(first + count, frame.editCounts.y);
+    for (var index = first; index < last; index++) {
+        let row0 = editData[frame.editCounts.x + index * 8u];
+        let flags = row0.w;
+        let sizes = sdfRow(index, 3u);
+        let sdfValues = array<vec4f, 2>(sdfRow(index, 4u), sdfRow(index, 5u));
+        var p = quatVec(sdfRow(index, 1u), pos * sdfRow(index, 2u).xyz) + bitcast<vec3f>(row0.xyz);
+        var distance = -EDIT_INFINITY;
+        switch (flags & 0xffu) {
+            case 1u: { distance = p.z; }
+            case 2u: { distance = length(p) - sizes.w; }
+            case 3u: {
+                let q = abs(p) - sizes.xyz + sizes.w;
+                distance = length(max(q, vec3f(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0) - sizes.w;
+            }
+            case 4u: {
+                let k0 = length(p / sizes.xyz);
+                let k1 = length(p / dot(sizes.xyz, sizes.xyz));
+                distance = k0 * (k0 - 1.0) / k1;
+            }
+            case 5u: {
+                let d = abs(vec2f(length(p.xz), p.y)) - sizes.wy;
+                distance = min(max(d.x, d.y), 0.0) + length(max(d, vec2f(0.0)));
+            }
+            case 6u: {
+                p.y -= clamp(p.y, -0.5 * sizes.y, 0.5 * sizes.y);
+                distance = length(p) - sizes.w;
+            }
+            case 7u: {
+                let angle = 0.25 * PI * sizes.w;
+                let c = vec2f(sin(angle), cos(angle));
+                let q = vec2f(length(p.xy), -p.z);
+                let d = length(q - c * max(dot(q, c), 0.0));
+                distance = d * select(1.0, -1.0, (q.x * c.y - q.y * c.x) < 0.0);
+            }
+            default: {}
+        }
+        if ((flags & 0x100u) != 0u) { distance = -distance; }
+        if (smoothK == 0.0) {
+            if (distance < accum) {
+                accum = distance;
+                *values = sdfValues;
+            }
+        } else {
+            let scaled = -distance / smoothK;
+            if (scaled > maxExp) {
+                let s = exp(maxExp - scaled);
+                accum *= s;
+                (*values)[0] *= s;
+                (*values)[1] *= s;
+                maxExp = scaled;
+            }
+            let weight = exp(scaled - maxExp);
+            accum += weight;
+            (*values)[0] += weight * sdfValues[0];
+            (*values)[1] += weight * sdfValues[1];
+        }
+    }
+    if (smoothK == 0.0) { return accum; }
+    // Very distant SDFs may result in 0 accumulation.
+    if (accum == 0.0) { return EDIT_INFINITY; }
+    (*values)[0] /= accum;
+    (*values)[1] /= accum;
+    return (-log(accum) - maxExp) * smoothK;
+}
+
+fn applyEdits(center: ptr<function, vec3f>, rgba: ptr<function, vec4f>) {
+    for (var e = 0u; e < frame.editCounts.x; e++) {
+        let packed = editData[e];
+        let softEdge = bitcast<f32>(packed.z);
+        var values: array<vec4f, 2>;
+        var distance = evaluateSdfs(packed.y & 0xffffu, packed.y >> 16u, *center, bitcast<f32>(packed.w), &values);
+        if ((packed.x & 0x100u) != 0u) { distance = -distance; }
+        var modulate: f32;
+        if (softEdge == 0.0) {
+            modulate = select(0.0, 1.0, distance < 0.0);
+        } else {
+            modulate = clamp(-distance / softEdge + 0.5, 0.0, 1.0);
+        }
+        var blended: vec4f;
+        switch (packed.x & 0xffu) {
+            case 0u: { blended = *rgba * values[0]; }
+            case 1u: { blended = vec4f(values[0].rgb, (*rgba).a * values[0].a); }
+            case 2u: { blended = *rgba + values[0]; }
+            default: { blended = vec4f(fract(*center), 1.0); }
+        }
+        *rgba = mix(*rgba, blended, modulate);
+        *center += values[1].xyz * modulate;
+    }
+}
 
 @compute @workgroup_size(256)
 fn generate(@builtin(workgroup_id) group: vec3u,
@@ -72,7 +182,9 @@ fn generate(@builtin(workgroup_id) group: vec3u,
         splat.rgba = vec4f(splat.rgba.rgb + rgb, splat.rgba.a);
     }
     splat.rgba *= frame.recolor;
-    let center = quatVec(frame.rotation, splat.center * frame.translationScale.w) + frame.translationScale.xyz;
+    var center = quatVec(frame.rotation, splat.center * frame.translationScale.w) + frame.translationScale.xyz;
+    // SplatMesh applies RGBA/displace edits in world space after recoloring.
+    applyEdits(&center, &splat.rgba);
     let delta = center - frame.viewOrigin.xyz;
     var metric = dot(delta, frame.viewDirection.xyz) + 100.0;
     if (frame.sortRadial != 0u) { metric = length(delta); }

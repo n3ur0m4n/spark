@@ -167,7 +167,6 @@ export class SparkNativeRenderer {
           requireWebGL("transparent or transmissive Three.js objects");
         }
       }
-      if (node instanceof SplatEdit) requireWebGL("editing");
       if (!(node instanceof SplatGenerator)) return;
       if (!(node instanceof SplatMesh) || !node.hasNativeSourceGenerator())
         requireWebGL("custom splat generators");
@@ -181,8 +180,7 @@ export class SparkNativeRenderer {
       )
         requireWebGL("modifiers");
       if (node.skinning) requireWebGL("skinning");
-      if (node.edits?.length || node.rgbaDisplaceEdits || node.splatRgba)
-        requireWebGL("editing");
+      if (node.splatRgba) requireWebGL("baked splat RGBA");
       if (
         node.enableViewToObject ||
         node.enableViewToWorld ||
@@ -364,6 +362,16 @@ export class SparkNativeRenderer {
     next.viewToWorld.copy(camera.matrixWorld);
     camera.getWorldPosition(next.viewOrigin);
     camera.getWorldDirection(next.viewDirection);
+    // Same global edit set as SplatAccumulator: visible SplatEdits outside
+    // any SplatMesh apply to every editable mesh.
+    const globalEdits = new Set<SplatEdit>();
+    scene.traverseVisible((node) => {
+      if (!(node instanceof SplatEdit)) return;
+      let ancestor = node.parent;
+      while (ancestor && !(ancestor instanceof SplatMesh))
+        ancestor = ancestor.parent;
+      if (!ancestor) globalEdits.add(node);
+    });
     const all: SplatMesh[] = [];
     scene.traverse((node) => {
       if (node instanceof SplatMesh && camera.layers.test(node.layers))
@@ -377,7 +385,7 @@ export class SparkNativeRenderer {
         viewToWorld: next.viewToWorld,
         camera,
         renderSize: owner.renderSize,
-        globalEdits: [],
+        globalEdits: Array.from(globalEdits),
         lodIndices: owner.enableLod ? owner.lodInstances.get(node) : undefined,
       });
     }
@@ -486,6 +494,7 @@ export class SparkNativeRenderer {
         ],
         numSh,
         recolor: node.context.recolor.value.toArray(),
+        edits: this.meshEdits(node),
       });
       next.mapping.push({
         node,
@@ -672,7 +681,19 @@ export class SparkNativeRenderer {
       ),
       recolor: node.context.recolor.value.toArray(),
       pager,
+      edits: this.meshEdits(node),
     };
+  }
+
+  /** Snapshot of the compiled SplatEdits that SplatMesh.update() just encoded. */
+  private meshEdits(node: SplatMesh): NativeMeshGeneration["edits"] {
+    const edits = node.rgbaDisplaceEdits;
+    if (!edits?.numEdits) return undefined;
+    const editWords = edits.numEdits * 4;
+    const data = new Uint32Array(editWords + edits.numSdfs * 32);
+    data.set(edits.editData.subarray(0, editWords));
+    data.set(edits.sdfData.subarray(0, edits.numSdfs * 32), editWords);
+    return { data, numEdits: edits.numEdits, numSdfs: edits.numSdfs };
   }
 
   dispose() {

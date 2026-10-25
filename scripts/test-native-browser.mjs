@@ -53,6 +53,7 @@ try {
     "native-sh-generation",
     "native-radix-fallback",
     "native-paged",
+    "native-edits",
   ]) {
     const page = await browser.newPage();
     const pageErrors = [];
