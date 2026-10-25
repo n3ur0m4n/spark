@@ -14,9 +14,10 @@ const PAGE_SPLATS = PAGE_WIDTH * PAGE_HEIGHT; // 65536
 
 export interface SplatPagerOptions {
   /**
-   * THREE.WebGLRenderer instance to upload texture data
+   * THREE.WebGLRenderer instance to upload texture data. Null for the native
+   * WebGPU path, which mirrors the CPU page layers itself.
    */
-  renderer: THREE.WebGLRenderer;
+  renderer: THREE.WebGLRenderer | null;
   /**
    * Whether to use extended Gsplat encoding for paged splats.
    * @default false
@@ -58,7 +59,9 @@ interface PageUpload {
 }
 
 export class SplatPager {
-  readonly renderer: THREE.WebGLRenderer;
+  readonly renderer: THREE.WebGLRenderer | null;
+  /** Incremented whenever page data changes. */
+  uploadVersion = 0;
 
   readonly extSplats: boolean;
   readonly maxPages: number;
@@ -545,6 +548,7 @@ export class SplatPager {
     extArray?: Uint32Array,
   ) {
     const pageBase = page * PAGE_SPLATS;
+    this.uploadVersion++;
 
     uploadTextureLayer(this.packedTexture, page, pageBase * 4, packedArray);
 
@@ -588,7 +592,7 @@ export class SplatPager {
     texture.needsUpdate = true;
     // Avoid initial upload of empty/null data
     texture.source.dataReady = false;
-    this.renderer.initTexture(texture);
+    this.renderer?.initTexture(texture);
     return texture;
   }
 

@@ -1,0 +1,123 @@
+<!doctype html><html><head><meta charset="utf-8"><link rel="icon" href="data:,"><title>Native paged LoD parity</title></head><body>
+<script type="module">
+// Streams the chunked RAD fixture with `paged: true` through WebGL and both
+// native WebGPU orderings, then compares the LoD budget, the generated splat
+// attributes (as a multiset: page placement may differ between runs) and the
+// rendered pixels.
+import * as THREE from 'three';
+import {FullScreenQuad} from 'three/addons/postprocessing/Pass.js';
+import {WebGPURenderer} from 'three/webgpu';
+import {SparkRenderer,SplatMesh,utils} from '/src/index.ts';
+const errors=[],checks=[];
+window.addEventListener('unhandledrejection',e=>errors.push(String(e.reason)));
+window.addEventListener('error',e=>errors.push(e.message));
+const check=(name,ok,data={})=>{checks.push({name,ok,...data});if(!ok)throw Error(`${name}: ${JSON.stringify(data)}`);};
+const url='/test/browser/fixtures/chunked/furry-logo-pedestal-lod.rad';
+const W=160,H=120;
+
+async function readBuffer(device,source,bytes){
+ const destination=device.createBuffer({size:Math.max(4,bytes),usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
+ try{const encoder=device.createCommandEncoder();encoder.copyBufferToBuffer(source,0,destination,0,bytes);
+  device.queue.submit([encoder.finish()]);await destination.mapAsync(GPUMapMode.READ);
+  const result=new Uint32Array(destination.getMappedRange().slice(0,bytes));destination.unmap();return result;}
+ finally{destination.destroy();}
+}
+
+async function runPagedCase(config){
+ const native=config.engine!=='webgl';
+ const renderer=native?new WebGPURenderer({antialias:false,alpha:true}):new THREE.WebGLRenderer({antialias:false,alpha:true,preserveDrawingBuffer:true});
+ if(native)await renderer.init();
+ renderer.setPixelRatio(1);renderer.setSize(W,H);document.body.append(renderer.domElement);
+ if(native)renderer.backend.device.addEventListener('uncapturederror',e=>errors.push(e.error.message));
+ const scene=new THREE.Scene();scene.background=new THREE.Color(0,0,0);
+ const camera=new THREE.PerspectiveCamera(60,W/H,.1,1000);camera.position.set(0,0,7);camera.updateMatrixWorld();
+ const spark=new SparkRenderer({renderer,autoUpdate:native,lodSplatCount:config.lodSplatCount,pagedExtSplats:!!config.pagedExt,
+  accumExtSplats:!!config.outputExt,webgpuSort:config.engine==='gpu-sort'?'radix':'readback',minSortIntervalMs:0});
+ scene.add(spark);
+ const mesh=new SplatMesh({url,paged:true});mesh.quaternion.set(1,0,0,0);mesh.maxSh=config.sh??3;scene.add(mesh);
+ const target=native?null:new THREE.WebGLRenderTarget(W,H,{type:THREE.HalfFloatType});
+ const quad=target?new FullScreenQuad(new THREE.ShaderMaterial({
+  uniforms:{source:{value:target.texture}},depthTest:false,depthWrite:false,blending:THREE.NoBlending,
+  vertexShader:'varying vec2 vUv; void main(){vUv=uv;gl_Position=vec4(position.xy,0.0,1.0);}',
+  fragmentShader:`uniform sampler2D source;varying vec2 vUv;
+   void main(){vec4 c=texture2D(source,vUv);vec3 s=c.rgb/max(c.a,1e-6);
+    s=mix(12.92*s,1.055*pow(s,vec3(1.0/2.4))-0.055,step(vec3(0.0031308),s));gl_FragColor=vec4(s*c.a,c.a);}`
+ })):null;
+ const draw=async()=>{
+  if(native)await spark.renderAsync(scene,camera);
+  else{renderer.setRenderTarget(target);renderer.getDrawingBufferSize(spark.renderSize);await spark.update({scene,camera});
+   const until=performance.now()+5000;while(spark.sorting||spark.sortDirty){if(performance.now()>until)throw Error('Sort did not settle');await new Promise(r=>setTimeout(r,1));}
+   renderer.render(scene,camera);renderer.setRenderTarget(null);quad.render(renderer);}
+ };
+ try{
+  await mesh.initialized;
+  const deadline=performance.now()+60000;let quiet=0;
+  while(quiet<3){
+   if(performance.now()>deadline)throw Error(`${config.engine}: paged LoD did not settle`);
+   await draw();await new Promise(r=>setTimeout(r,16));
+   const pager=spark.pager;
+   const settled=pager&&mesh.paged.numSplats>0&&!spark.lodDirty&&!pager.isPending()&&spark.lodWorker?.queue==null;
+   quiet=settled?quiet+1:0;
+  }
+  await draw();await draw();
+  // A WebGPU canvas is only readable in the task that presented it.
+  const canvas=document.createElement('canvas');canvas.width=W;canvas.height=H;
+  const context=canvas.getContext('2d');context.drawImage(renderer.domElement,0,0);
+  const pixels=Array.from(context.getImageData(0,0,W,H).data);
+  const current=spark.current;
+  const selected=current.mapping.reduce((sum,m)=>sum+m.count,0);
+  const words=current.numSplats*4;let generated;
+  if(native){const b=spark.webgpuBackend,d=renderer.backend.device;
+   generated=[await readBuffer(d,b.generatedOutputBuffer,words*4)];
+   if(current.extSplats)generated.push(await readBuffer(d,b.generatedOutputBuffer2,words*4));}
+  else{const gl=renderer.getContext(),fb=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,fb);generated=[];
+   const rows=Math.ceil(current.numSplats/2048);
+   for(let attachment=0;attachment<(current.extSplats?2:1);attachment++){
+    const tex=renderer.properties.get(current.target.textures[attachment]).__webglTexture;
+    gl.framebufferTextureLayer(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,tex,0,0);
+    const data=new Uint32Array(2048*rows*4);gl.readPixels(0,0,2048,rows,gl.RGBA_INTEGER,gl.UNSIGNED_INT,data);generated.push(data.slice(0,words));}
+   gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.deleteFramebuffer(fb);}
+  // One decoded row per generated splat, keyed by (chunk, splat in chunk):
+  // chunk-to-page placement depends on fetch completion order.
+  const splatRows=[],indices=mesh.paged.dynoIndices.value.image.data,pager=spark.pager;
+  for(const {base,count} of current.mapping)for(let i=base;i<base+count;i++){
+   const index=indices[i-base],key=pager.pageToSplatsChunk[index>>>16].chunk*65536+(index&65535);
+   const s=current.extSplats?utils.decodeExtSplat(generated,i):utils.unpackSplat(generated[0],i);
+   splatRows.push({key,raw:generated.map(a=>Array.from(a.slice(i*4,i*4+4)).join(',')).join('|'),
+    v:[...s.center.toArray(),s.opacity,s.color.r,s.color.g,s.color.b,...s.scales.toArray()],q:s.quaternion.toArray()});
+  }
+  splatRows.sort((a,b)=>a.key-b.key);
+  return {selected,activeSplats:spark.activeSplats,rows:splatRows,pixels,pages:spark.pager.pageToSplatsChunk.filter(Boolean).length};
+ }finally{
+  if(native)await renderer.backend.device.queue.onSubmittedWorkDone();
+  target?.dispose();quad?.material.dispose();quad?.dispose();mesh.dispose();spark.dispose();renderer.dispose();renderer.domElement.remove();
+ }
+}
+
+const pixelDiff=(a,b)=>{let sum=0,max=0;for(let i=0;i<a.length;i++){const d=Math.abs(a[i]-b[i]);sum+=d;if(d>max)max=d;}return {mean:sum/a.length,max};};
+try{
+ const stats=[];
+ for(const config of [
+  {lodSplatCount:10000,outputExt:true},
+  {lodSplatCount:100000,outputExt:true},
+  {lodSplatCount:30000,outputExt:false},
+  {lodSplatCount:30000,outputExt:true,pagedExt:true},
+ ]){
+  const label=`paged ${config.pagedExt?'ext':'packed'} budget ${config.lodSplatCount} out${config.outputExt?'Ext':'Packed'}`;
+  const [webgl,reference,radix]=[await runPagedCase({...config,engine:'webgl'}),await runPagedCase({...config,engine:'webgpu-readback'}),await runPagedCase({...config,engine:'gpu-sort'})];
+  check(`${label}: same LoD budget selection`,webgl.selected>0&&webgl.selected<=config.lodSplatCount&&reference.selected===webgl.selected&&radix.selected===webgl.selected,{webgl:webgl.selected,reference:reference.selected,radix:radix.selected});
+  // GLSL and WGSL transcendental functions (log, acos, sin) differ in the
+  // last bit, so attributes are compared decoded with quantization tolerance.
+  const close=(a,b)=>a.v.every((x,j)=>Math.abs(x-b.v[j])<=(j<3?1e-3*Math.max(1,Math.abs(x)):j<7?2/255:1e-2*Math.max(1e-6,x)))&&Math.abs(a.q.reduce((s,x,j)=>s+x*b.q[j],0))>=0.999;
+  const mismatch=webgl.rows.findIndex((row,i)=>row.key!==reference.rows[i]?.key||!close(row,reference.rows[i]));
+  const exact=webgl.rows.filter((row,i)=>row.raw===reference.rows[i]?.raw).length;
+  check(`${label}: generated attributes match WebGL`,mismatch<0&&reference.rows.length===webgl.rows.length&&radix.rows.every((row,i)=>row.raw===reference.rows[i].raw),{mismatch,exact,lengths:[webgl,reference,radix].map(r=>r.rows.length),webgl:webgl.rows[mismatch],native:reference.rows[mismatch]});
+  check(`${label}: native orderings render identically`,pixelDiff(reference.pixels,radix.pixels).max===0);
+  const diff=pixelDiff(webgl.pixels,reference.pixels);
+  stats.push({label,selected:webgl.selected,pages:[webgl.pages,reference.pages],bitExact:exact/webgl.rows.length,diff});
+  // Same splats; blending order and half-float precision differ by backend.
+  check(`${label}: WebGPU renders like WebGL`,diff.mean<1,{diff});
+ }
+ window.lifecycleResult={passed:errors.length===0,checks,errors,stats};
+}catch(error){window.lifecycleResult={passed:false,checks,errors,error:String(error)};}
+</script></body></html>

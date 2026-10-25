@@ -57,7 +57,7 @@ export function getSparkRendererCapabilities(
           : "uninitialized",
     nativeStatus: device ? "reference-preview" : null,
     features: {
-      paging: webgl,
+      paging: webgl || !!device,
       xr: webgl,
       modifiers: webgl,
       editing: webgl,

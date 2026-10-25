@@ -17,7 +17,8 @@ const shader = (name) =>
   readFileSync(new URL(`../src/shaders/${name}.wgsl`, import.meta.url), "utf8");
 try {
   for (const name of [
-    "generateSplats",
+    "generateSourceBuffers",
+    "generateSourcePaged",
     "splatVertex",
     "splatFragment",
     "nativeSort",
@@ -26,10 +27,12 @@ try {
     "radixSortReorder",
     "prefixSum",
   ]) {
-    const text =
-      (["generateSplats", "splatVertex", "splatFragment"].includes(name)
-        ? `${shader("splatDefines")}\n`
-        : "") + shader(name);
+    // Generation is validated once per source accessor variant.
+    const text = name.startsWith("generateSource")
+      ? `${shader("splatDefines")}\n${shader(name)}\n${shader("generateSplats")}`
+      : (["splatVertex", "splatFragment"].includes(name)
+          ? `${shader("splatDefines")}\n`
+          : "") + shader(name);
     const file = join(directory, `${name}.wgsl`);
     writeFileSync(file, text);
     execFileSync(naga, [file], { stdio: "inherit" });

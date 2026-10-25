@@ -1,5 +1,9 @@
+import * as THREE from "three";
+import { SplatPager } from "./SplatPager";
 import { calcDispatchSize } from "./WebGPUUtils";
 import { splatDefinesWgsl } from "./shaders-wgsl";
+import generateSourceBuffers from "./shaders/generateSourceBuffers.wgsl?raw";
+import generateSourcePaged from "./shaders/generateSourcePaged.wgsl?raw";
 import generateSplats from "./shaders/generateSplats.wgsl?raw";
 
 /** Immutable CPU description of one ordinary mesh in an accumulator generation. */
@@ -21,6 +25,14 @@ export type NativeMeshGeneration = {
   shMaxOpacity: number[];
   numSh: number;
   recolor: number[];
+  /** Paged source: read the pager's page textures; primary/secondary/sh are unused. */
+  pager?: SplatPager;
+};
+
+type PagerTextures = {
+  textures: (THREE.DataArrayTexture | undefined)[];
+  gpu: (GPUTexture | undefined)[];
+  views: GPUTextureView[];
 };
 
 type SourceBuffers = {
@@ -37,6 +49,9 @@ type SourceBuffers = {
 export class WebGPUGeneration {
   private readonly sources = new Map<object, SourceBuffers>();
   private readonly pipeline: GPUComputePipeline;
+  private pagedPipeline: GPUComputePipeline | null = null;
+  private readonly pagers = new Map<SplatPager, PagerTextures>();
+  private dummyPages: GPUTexture | null = null;
   private readonly dummy: GPUBuffer;
   private readonly meshes: { uniform: GPUBuffer; indices: GPUBuffer }[] = [];
   private disposed = false;
@@ -48,11 +63,103 @@ export class WebGPUGeneration {
       layout: "auto",
       compute: {
         module: device.createShaderModule({
-          code: `${splatDefinesWgsl}\n${generateSplats}`,
+          code: `${splatDefinesWgsl}\n${generateSourceBuffers}\n${generateSplats}`,
         }),
         entryPoint: "generate",
       },
     });
+  }
+
+  private getPagedPipeline() {
+    this.pagedPipeline ??= this.device.createComputePipeline({
+      label: "spark-native-generate-paged",
+      layout: "auto",
+      compute: {
+        module: this.device.createShaderModule({
+          code: `${splatDefinesWgsl}\n${generateSourcePaged}\n${generateSplats}`,
+        }),
+        entryPoint: "generate",
+      },
+    });
+    return this.pagedPipeline;
+  }
+
+  private destroyPager(state: PagerTextures) {
+    for (const texture of state.gpu) texture?.destroy();
+  }
+
+  /**
+   * Mirror SplatPager's page textures. The pager fills CPU layers and marks
+   * them with addLayerUpdate() exactly as for WebGL; only those layers are
+   * copied here, then the marks are cleared.
+   */
+  private syncPager(pager: SplatPager): GPUTextureView[] {
+    const maxLayers = this.device.limits.maxTextureArrayLayers;
+    if (pager.maxPages > maxLayers)
+      throw new Error(
+        `Spark: ${pager.maxPages} splat pages exceed maxTextureArrayLayers ${maxLayers}; lower maxPagedSplats or use THREE.WebGLRenderer.`,
+      );
+    let state = this.pagers.get(pager);
+    if (!state) {
+      state = { textures: [], gpu: [], views: [] };
+      this.pagers.set(pager, state);
+    }
+    this.dummyPages ??= this.device.createTexture({
+      label: "spark-native-empty-pages",
+      size: [1, 1, 1],
+      format: "rgba32uint",
+      usage: GPUTextureUsage.TEXTURE_BINDING,
+    });
+    const dummy = this.dummyPages;
+    // Packed pagers have three SH slots, extended ones four.
+    const slots = [pager.packedTexture, pager.extTexture, ...pager.shTextures];
+    for (let i = 0; i < 6; i++) {
+      const texture = slots[i]?.value;
+      if (
+        !texture ||
+        texture === SplatPager.emptyUint32x4 ||
+        texture === SplatPager.emptyUint32x2
+      ) {
+        state.gpu[i]?.destroy();
+        state.gpu[i] = undefined;
+        state.textures[i] = undefined;
+        state.views[i] = dummy.createView({ dimension: "2d-array" });
+        continue;
+      }
+      const words = texture.format === THREE.RGIntegerFormat ? 2 : 4;
+      const { width, height } = texture.image;
+      let gpu = state.gpu[i];
+      const layers = new Set(texture.layerUpdates);
+      if (!gpu || state.textures[i] !== texture) {
+        // A new GPU mirror (first use, or after release while the scene had
+        // no paged mesh) needs every resident page, not only dirty ones.
+        pager.pageToSplatsChunk.forEach((resident, page) => {
+          if (resident) layers.add(page);
+        });
+        gpu?.destroy();
+        gpu = this.device.createTexture({
+          label: "spark-native-pages",
+          size: [width, height, pager.maxPages],
+          format: words === 2 ? "rg32uint" : "rgba32uint",
+          usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+        });
+        state.gpu[i] = gpu;
+        state.textures[i] = texture;
+        state.views[i] = gpu.createView({ dimension: "2d-array" });
+      }
+      const layerWords = width * height * words;
+      const data = texture.image.data as Uint32Array;
+      for (const layer of layers) {
+        this.device.queue.writeTexture(
+          { texture: gpu, origin: [0, 0, layer] },
+          data.subarray(layer * layerWords, (layer + 1) * layerWords),
+          { bytesPerRow: width * words * 4, rowsPerImage: height },
+          [width, height, 1],
+        );
+      }
+      texture.layerUpdates.clear();
+    }
+    return state.views;
   }
 
   private buffer(size: number, usage: GPUBufferUsageFlags, label: string) {
@@ -178,6 +285,13 @@ export class WebGPUGeneration {
         this.sources.delete(source);
       }
     }
+    const livePagers = new Set(args.meshes.map((mesh) => mesh.pager));
+    for (const [pager, state] of this.pagers) {
+      if (!livePagers.has(pager)) {
+        this.destroyPager(state);
+        this.pagers.delete(pager);
+      }
+    }
     while (this.meshes.length > args.meshes.length) {
       const state = this.meshes.pop();
       if (state) {
@@ -188,7 +302,8 @@ export class WebGPUGeneration {
     for (let i = 0; i < args.meshes.length; i++) {
       const mesh = args.meshes[i];
       if (!mesh.count) continue;
-      const source = this.uploadSource(mesh);
+      const paged = mesh.pager ? this.syncPager(mesh.pager) : null;
+      const source = paged ? null : this.uploadSource(mesh);
       let state = this.meshes[i];
       if (!state) {
         state = {
@@ -239,31 +354,34 @@ export class WebGPUGeneration {
       f32.set(mesh.localViewOrigin, 24);
       f32.set(mesh.encoding, 28);
       f32.set(mesh.shMaxOpacity, 32);
-      u32.set(source.shOffsets, 36);
+      if (source) u32.set(source.shOffsets, 36);
       f32.set(mesh.recolor, 40);
       this.device.queue.writeBuffer(state.uniform, 0, data);
-      const buffers = [
+      const pipeline = paged ? this.getPagedPipeline() : this.pipeline;
+      const resources: (GPUBuffer | GPUTextureView)[] = [
         state.uniform,
-        source.primary,
-        source.secondary,
-        source.sh,
+        ...(source
+          ? [source.primary, source.secondary, source.sh]
+          : (paged as GPUTextureView[]).slice(0, 3)),
         mesh.indices ? state.indices : this.dummy,
         args.output,
         args.output2,
         args.depths,
+        ...(paged ? paged.slice(3, 6) : []),
       ];
       const group = this.device.createBindGroup({
-        layout: this.pipeline.getBindGroupLayout(0),
-        entries: buffers.map((buffer, binding) => ({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: resources.map((resource, binding) => ({
           binding,
-          resource: { buffer },
+          resource:
+            resource instanceof GPUBuffer ? { buffer: resource } : resource,
         })),
       });
       const pass = encoder.beginComputePass({
         label: "spark-native-generate",
         timestampWrites: args.timestampWrites?.(),
       });
-      pass.setPipeline(this.pipeline);
+      pass.setPipeline(pipeline);
       pass.setBindGroup(0, group);
       const [x, y] = calcDispatchSize(
         Math.ceil(mesh.count / 256),
@@ -278,6 +396,8 @@ export class WebGPUGeneration {
   clearSources() {
     for (const source of this.sources.values()) this.destroySource(source);
     this.sources.clear();
+    for (const state of this.pagers.values()) this.destroyPager(state);
+    this.pagers.clear();
     for (const mesh of this.meshes) {
       mesh.uniform.destroy();
       if (mesh.indices !== this.dummy) mesh.indices.destroy();
@@ -289,5 +409,6 @@ export class WebGPUGeneration {
     this.disposed = true;
     this.clearSources();
     this.dummy.destroy();
+    this.dummyPages?.destroy();
   }
 }

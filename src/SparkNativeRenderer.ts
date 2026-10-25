@@ -2,6 +2,7 @@ import * as THREE from "three";
 import type { WebGPURenderer } from "three/webgpu";
 import { ExtSplats } from "./ExtSplats";
 import { PackedSplats } from "./PackedSplats";
+import { PagedSplats } from "./PagedSplats";
 import type { SparkHostRenderer } from "./RendererAdapter";
 import type { SparkRenderStats } from "./SparkRenderStats";
 import type { SparkRenderer } from "./SparkRenderer";
@@ -171,7 +172,6 @@ export class SparkNativeRenderer {
       if (!(node instanceof SplatMesh) || !node.hasNativeSourceGenerator())
         requireWebGL("custom splat generators");
       if (!(node instanceof SplatMesh)) return;
-      if (node.paged) requireWebGL("paging");
       if (node.covSplats) requireWebGL("covariance splats");
       if (
         node.objectModifiers?.length ||
@@ -403,6 +403,19 @@ export class SparkNativeRenderer {
       const { base, count } = layout.mapping[i];
       if (!count) continue;
       const source = node.context.splats;
+      if (source instanceof PagedSplats) {
+        meshes.push(this.pagedGeneration(node, source, base, count));
+        next.mapping.push({
+          node,
+          base,
+          count,
+          version: node.version,
+          mappingVersion: node.mappingVersion,
+          generator: node.generator,
+        });
+        next.numSplats = Math.max(next.numSplats, base + count);
+        continue;
+      }
       if (!(source instanceof PackedSplats || source instanceof ExtSplats))
         throw new Error(
           "Spark: native source requires PackedSplats or ExtSplats",
@@ -491,7 +504,12 @@ export class SparkNativeRenderer {
       next.viewToWorld.toArray(),
       next.viewOrigin.toArray(),
       next.viewDirection.toArray(),
-      visible.map((node, i) => [node.uuid, node.version, counts[i]]),
+      visible.map((node, i) => [
+        node.uuid,
+        node.version,
+        node.mappingVersion,
+        counts[i],
+      ]),
       meshes.map((mesh) => [
         this.identity(mesh.source),
         this.identity(mesh.primary),
@@ -600,6 +618,61 @@ export class SparkNativeRenderer {
     } finally {
       owner.sorting = false;
     }
+  }
+
+  /** Paged meshes read SplatPager's page pool through their LoD selection. */
+  private pagedGeneration(
+    node: SplatMesh,
+    source: PagedSplats,
+    base: number,
+    count: number,
+  ): NativeMeshGeneration {
+    const pager = source.pager;
+    const indices = source.dynoIndices.value.image.data as Uint32Array;
+    if (!pager || indices.length < count)
+      throw new Error("Spark: incomplete native paged selection");
+    const extended = pager.extSplats;
+    const enc = extended ? undefined : source.splatEncoding;
+    const transform = node.context.transform;
+    return {
+      source,
+      revision: pager.uploadVersion,
+      primary: pager.packedTexture.value.image.data as Uint32Array,
+      sh: [],
+      sourceCount: pager.maxSplats,
+      sourceExt: extended,
+      base,
+      count,
+      indices,
+      rotation: transform.rotate.value.toArray(),
+      translationScale: [
+        ...transform.translate.value.toArray(),
+        transform.scale.value,
+      ],
+      localViewOrigin: node.context.viewToObject.translate.value.toArray(),
+      encoding: [
+        enc?.rgbMin ?? 0,
+        enc?.rgbMax ?? 1,
+        enc?.lnScaleMin ?? -12,
+        enc?.lnScaleMax ?? 9,
+      ],
+      shMaxOpacity: [
+        enc?.sh1Max ?? 1,
+        enc?.sh2Max ?? 1,
+        enc?.sh3Max ?? 1,
+        enc?.lodOpacity ? 2 : 1,
+      ],
+      // Same clamp as PagedSplats.fetchSplat(); curSh guards empty textures.
+      numSh: Math.min(
+        node.maxSh,
+        source.numSh,
+        source.maxSh,
+        pager.maxSh,
+        pager.curSh,
+      ),
+      recolor: node.context.recolor.value.toArray(),
+      pager,
+    };
   }
 
   dispose() {

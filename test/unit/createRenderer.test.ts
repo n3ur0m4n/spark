@@ -74,16 +74,17 @@ describe("createRenderer", () => {
 
   test("falls back to WebGL when a need is unsupported", async () => {
     const requestAdapter = stubGpu({});
-    expect(WEBGPU_UNSUPPORTED_FEATURES).toContain("paging");
-    const { backend } = await createRenderer({ needs: ["paging"] });
+    expect(WEBGPU_UNSUPPORTED_FEATURES).toContain("xr");
+    const { backend } = await createRenderer({ needs: ["xr"] });
     expect(backend).toBe("webgl");
     expect(requestAdapter).not.toHaveBeenCalled();
   });
 
   test("keeps WebGPU for supported needs", async () => {
     stubGpu({});
+    expect(WEBGPU_UNSUPPORTED_FEATURES).not.toContain("paging");
     const { backend } = await createRenderer({
-      needs: ["multipleSplatMeshes"],
+      needs: ["multipleSplatMeshes", "paging"],
     });
     expect(backend).toBe("webgpu");
   });

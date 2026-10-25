@@ -52,6 +52,7 @@ try {
     "native-encoding",
     "native-sh-generation",
     "native-radix-fallback",
+    "native-paged",
   ]) {
     const page = await browser.newPage();
     const pageErrors = [];

@@ -1915,7 +1915,7 @@ export class SparkRenderer<
   ) {
     if (hasPaged && !this.pager) {
       this.pager = new SplatPager({
-        renderer: this.requireWebGLRenderer(),
+        renderer: this.native ? null : this.requireWebGLRenderer(),
         extSplats: this.pagedExtSplats,
         maxSplats: this.maxPagedSplats,
         numFetchers: this.numLodFetchers,

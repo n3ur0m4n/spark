@@ -348,19 +348,21 @@ export class PagedSplats implements SplatSource {
       );
       indicesTexture.internalFormat = "RGBA32UI";
       indicesTexture.needsUpdate = true;
-      renderer.initTexture(indicesTexture);
+      renderer?.initTexture(indicesTexture);
       this.dynoIndices.value = indicesTexture;
     } else {
       const textureIndices = indicesTexture.image.data as Uint32Array;
       textureIndices.set(indices.subarray(0, numSplats));
 
-      uploadU32DataTextureRows(
-        renderer,
-        indicesTexture,
-        4096,
-        rows,
-        textureIndices,
-      );
+      // The native WebGPU path reads the CPU indices directly.
+      if (renderer)
+        uploadU32DataTextureRows(
+          renderer,
+          indicesTexture,
+          4096,
+          rows,
+          textureIndices,
+        );
     }
   }
 

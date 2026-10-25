@@ -11,7 +11,6 @@ import { getSparkRendererCapabilities } from "./RendererCapabilities";
  * does not implement.
  */
 export const WEBGPU_UNSUPPORTED_FEATURES = [
-  "paging",
   "xr",
   "modifiers",
   "editing",
