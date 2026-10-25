@@ -103,8 +103,7 @@ export declare class WebGPUSplatBackend {
     /** The draw mode belongs to the same committed slot as its ordering/count. */
     get useIndirectDraw(): boolean;
     set useIndirectDraw(value: boolean);
-    private generatedOutputBuffer;
-    private generatedOutputBuffer2;
+    private generatedOutputDummy;
     private nativeGeneration;
     private nativeFillPipeline;
     private nativeKeysPipeline;
@@ -333,11 +332,28 @@ export declare class WebGPUSplatBackend {
         /** cos(sortCullFov / 2), or -2 when cone culling is off. */
         sortCullCos: number;
     }): void;
+    /**
+     * Test hook: a COPY_SRC buffer holding the generated splat texels in
+     * linear splat order (the caller destroys it).
+     */
+    copyGeneratedOutput(second?: boolean): GPUBuffer;
     readNativeDepths(count: number): Promise<Uint32Array<ArrayBuffer>>;
     /** Explicit diagnostic readback; never inserted into the normal radix loop. */
     readNativeDrawCount(): Promise<number>;
     private ensureNativeSortPipelines;
     private prepareNativeKeys;
+    private createDrawArgs;
+    /**
+     * True from a radix sort's submit until the GPU has executed it. Like the
+     * WebGL worker sort, the next sort of an unchanged mapping waits for it.
+     */
+    sortInFlight: boolean;
+    /**
+     * Give the working slot the committed radix ordering and draw count: a new
+     * generation of the same splat mapping draws with the previous order, as
+     * WebGL displays a regenerated accumulator before its sort completes.
+     */
+    reuseActiveOrdering(orderingRows: number): boolean;
     private countNativeDraw;
     /**
      * Execute a separate render pass that composites splats onto the
@@ -399,6 +415,7 @@ export declare class WebGPUSplatBackend {
      * No mapAsync. Returns false if the GPU sort path cannot run.
      */
     private nativeKeysBuffer;
+    private sortSequence;
     gpuDepthSortAndPack(params: {
         numSplats: number;
         viewOrigin: {

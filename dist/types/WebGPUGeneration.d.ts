@@ -11,6 +11,8 @@ export type NativeMeshGeneration = {
     base: number;
     count: number;
     indices?: Uint32Array;
+    /** Changes whenever the contents of indices change (same array reused). */
+    indicesVersion?: number;
     rotation: number[];
     translationScale: number[];
     localViewOrigin: number[];
@@ -52,8 +54,8 @@ export declare class WebGPUGeneration {
     private uploadSource;
     encode(encoder: GPUCommandEncoder, args: {
         meshes: NativeMeshGeneration[];
-        output: GPUBuffer;
-        output2: GPUBuffer;
+        output: GPUTextureView;
+        output2: GPUTextureView;
         depths: GPUBuffer;
         outputExt: boolean;
         viewOrigin: number[];

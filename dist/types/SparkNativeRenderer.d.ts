@@ -18,6 +18,12 @@ export declare class SparkNativeRenderer {
     private readonly hostViewport;
     private sequence;
     private currentSignature;
+    /** Mapping (signature without the view) of the last radix-sorted ordering. */
+    private sortedMapping;
+    private lastSortTime;
+    /** The committed ordering was sorted for an earlier view. */
+    private orderingStale;
+    private staleTimeout;
     private updateQueue;
     private worker;
     private ordering;
@@ -52,6 +58,8 @@ export declare class SparkNativeRenderer {
     /** Runs ordinary mesh callbacks, then snapshots and commits one complete generation. */
     update(scene: THREE.Scene, camera: THREE.Camera): Promise<SplatMesh[]>;
     private updateFrame;
+    /** On-demand apps re-render (and so sort) once the next sort may run. */
+    private scheduleFinalSort;
     /** Paged meshes read SplatPager's page pool through their LoD selection. */
     private pagedGeneration;
     /** Snapshot of the compiled SplatEdits that SplatMesh.update() just encoded. */

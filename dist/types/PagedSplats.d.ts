@@ -58,6 +58,8 @@ export declare class PagedSplats implements SplatSource {
     sh2Codes?: Uint32Array;
     sh3Codes?: Uint32Array | [Uint32Array, Uint32Array];
     numSplats: number;
+    /** Bumped by update(): the native path re-uploads indices only on change. */
+    indicesVersion: number;
     splatEncoding?: SplatEncoding;
     radMetaPromise?: Promise<{
         meta: RadMeta;

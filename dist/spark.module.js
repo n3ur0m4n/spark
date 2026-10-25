@@ -8805,6 +8805,7 @@ var UrlPagedSplatsFetcher = class {
 //#region src/PagedSplats.ts
 var PagedSplats = class PagedSplats {
 	constructor(options) {
+		this.indicesVersion = 0;
 		this.abortController = new AbortController();
 		this.pager = options.pager;
 		this.numSh = 0;
@@ -8927,6 +8928,7 @@ var PagedSplats = class PagedSplats {
 		if (!this.pager) throw new Error("PagedSplats.pager not set");
 		const renderer = this.pager.renderer;
 		this.numSplats = numSplats;
+		this.indicesVersion++;
 		this.dynoNumSplats.value = this.numSplats;
 		const rows = Math.ceil(numSplats / 16384);
 		let indicesTexture = this.dynoIndices.value === PagedSplats.emptyIndicesTexture ? void 0 : this.dynoIndices.value;
@@ -12764,7 +12766,7 @@ var generateSourceBuffers_default = "// Ordinary sources: one storage buffer per
 var generateSourcePaged_default = "// Paged sources: SplatPager's 256x256 page layers, indexed like the WebGL\n// pagedSplatTexCoord(). Selection indices are global pool indices.\n// SplatPager readers also treat zero alpha as inactive.\nconst ZERO_ALPHA_INACTIVE = true;\n@group(0) @binding(1) var primaryPages: texture_2d_array<u32>;\n@group(0) @binding(2) var secondaryPages: texture_2d_array<u32>;\n@group(0) @binding(3) var sh1Pages: texture_2d_array<u32>;\n@group(0) @binding(8) var sh2Pages: texture_2d_array<u32>;\n@group(0) @binding(9) var sh3Pages: texture_2d_array<u32>;\n@group(0) @binding(10) var sh3bPages: texture_2d_array<u32>;\n\nfn pageTexel(t: texture_2d_array<u32>, src: u32) -> vec4u {\n    return textureLoad(t, vec2u(src & 255u, (src >> 8u) & 255u), src >> 16u, 0);\n}\nfn loadPrimary(src: u32) -> vec4u { return pageTexel(primaryPages, src); }\nfn loadSecondary(src: u32) -> vec4u { return pageTexel(secondaryPages, src); }\nfn loadSh(band: u32, src: u32) -> vec4u {\n    switch band {\n        case 0u: { return pageTexel(sh1Pages, src); }\n        case 1u: { return pageTexel(sh2Pages, src); }\n        case 2u: { return pageTexel(sh3Pages, src); }\n        default: { return pageTexel(sh3bPages, src); }\n    }\n}\nfn loadPackedSh1(src: u32) -> vec2u { return pageTexel(sh1Pages, src).xy; }\n";
 //#endregion
 //#region src/shaders/generateSplats.wgsl?raw
-var generateSplats_default = "// Native counterpart of SplatAccumulator's ordinary SplatMesh generation.\n// One dispatch per mesh writes its upstream row-aligned destination range.\n// Depth is evaluated before output quantization, just like the WebGL MRT.\nstruct GenerateUniforms {\n    base: u32, count: u32, sourceCount: u32, indexed: u32,\n    sourceExt: u32, outputExt: u32, sortRadial: u32, numSh: u32,\n    rotation: vec4f,\n    translationScale: vec4f,\n    viewOrigin: vec4f,\n    viewDirection: vec4f, // w: sort cone cos(sortCullFov / 2), -2 when off\n    localViewOrigin: vec4f,\n    encoding: vec4f,\n    shMaxOpacity: vec4f,\n    shOffsets: vec4u,\n    recolor: vec4f,\n// x: SplatEdits.numEdits, y: SplatEdits.numSdfs (sdfData follows editData).\neditCounts: vec4u,\n};\n@group(0) @binding(0) var<uniform> frame: GenerateUniforms;\n// Bindings 1-3 (and 8-10 for paged sources) and the load*() accessors come\n// from generateSourceBuffers.wgsl or generateSourcePaged.wgsl.\n@group(0) @binding(4) var<storage, read> indices: array<u32>;\n@group(0) @binding(5) var<storage, read_write> output: array<vec4u>;\n@group(0) @binding(6) var<storage, read_write> output2: array<vec4u>;\n@group(0) @binding(7) var<storage, read_write> depths: array<u32>;\n\n// Native counterpart of SplatEdit.ts defineSdfArray/defineEdit: world-space\n// SDF RGBA/displace layers. editData holds frame.editCounts.x packed edits\n// (SplatEdits.editData) followed by 8 vec4u per SDF (SplatEdits.sdfData).\n@group(0) @binding(11) var<storage, read> editData: array<vec4u>;\n// WGSL rejects infinite constants; FLT_MAX stands in for GLSL 1.0 / 0.0.\nconst EDIT_INFINITY: f32 = 0x1.fffffep+127f;\n\nfn sdfRow(sdf: u32, row: u32) -> vec4f {\n    return bitcast<vec4f>(editData[frame.editCounts.x + sdf * 8u + row]);\n}\n\nfn evaluateSdfs(first: u32, count: u32, pos: vec3f, smoothK: f32,\n                values: ptr<function, array<vec4f, 2>>) -> f32 {\n    var accum = select(0.0, EDIT_INFINITY, smoothK == 0.0);\n    var maxExp = -EDIT_INFINITY;\n    (*values)[0] = vec4f(0.0);\n    (*values)[1] = vec4f(0.0);\n    let last = min(first + count, frame.editCounts.y);\n    for (var index = first; index < last; index++) {\n        let row0 = editData[frame.editCounts.x + index * 8u];\n        let flags = row0.w;\n        let sizes = sdfRow(index, 3u);\n        let sdfValues = array<vec4f, 2>(sdfRow(index, 4u), sdfRow(index, 5u));\n        var p = quatVec(sdfRow(index, 1u), pos * sdfRow(index, 2u).xyz) + bitcast<vec3f>(row0.xyz);\n        var distance = -EDIT_INFINITY;\n        switch (flags & 0xffu) {\n            case 1u: { distance = p.z; }\n            case 2u: { distance = length(p) - sizes.w; }\n            case 3u: {\n                let q = abs(p) - sizes.xyz + sizes.w;\n                distance = length(max(q, vec3f(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0) - sizes.w;\n            }\n            case 4u: {\n                let k0 = length(p / sizes.xyz);\n                let k1 = length(p / dot(sizes.xyz, sizes.xyz));\n                distance = k0 * (k0 - 1.0) / k1;\n            }\n            case 5u: {\n                let d = abs(vec2f(length(p.xz), p.y)) - sizes.wy;\n                distance = min(max(d.x, d.y), 0.0) + length(max(d, vec2f(0.0)));\n            }\n            case 6u: {\n                p.y -= clamp(p.y, -0.5 * sizes.y, 0.5 * sizes.y);\n                distance = length(p) - sizes.w;\n            }\n            case 7u: {\n                let angle = 0.25 * PI * sizes.w;\n                let c = vec2f(sin(angle), cos(angle));\n                let q = vec2f(length(p.xy), -p.z);\n                let d = length(q - c * max(dot(q, c), 0.0));\n                distance = d * select(1.0, -1.0, (q.x * c.y - q.y * c.x) < 0.0);\n            }\n            default: {}\n        }\n        if ((flags & 0x100u) != 0u) { distance = -distance; }\n        if (smoothK == 0.0) {\n            if (distance < accum) {\n                accum = distance;\n                *values = sdfValues;\n            }\n        } else {\n            let scaled = -distance / smoothK;\n            if (scaled > maxExp) {\n                let s = exp(maxExp - scaled);\n                accum *= s;\n                (*values)[0] *= s;\n                (*values)[1] *= s;\n                maxExp = scaled;\n            }\n            let weight = exp(scaled - maxExp);\n            accum += weight;\n            (*values)[0] += weight * sdfValues[0];\n            (*values)[1] += weight * sdfValues[1];\n        }\n    }\n    if (smoothK == 0.0) { return accum; }\n    // Very distant SDFs may result in 0 accumulation.\n    if (accum == 0.0) { return EDIT_INFINITY; }\n    (*values)[0] /= accum;\n    (*values)[1] /= accum;\n    return (-log(accum) - maxExp) * smoothK;\n}\n\nfn applyEdits(center: ptr<function, vec3f>, rgba: ptr<function, vec4f>) {\n    for (var e = 0u; e < frame.editCounts.x; e++) {\n        let packed = editData[e];\n        let softEdge = bitcast<f32>(packed.z);\n        var values: array<vec4f, 2>;\n        var distance = evaluateSdfs(packed.y & 0xffffu, packed.y >> 16u, *center, bitcast<f32>(packed.w), &values);\n        if ((packed.x & 0x100u) != 0u) { distance = -distance; }\n        var modulate: f32;\n        if (softEdge == 0.0) {\n            modulate = select(0.0, 1.0, distance < 0.0);\n        } else {\n            modulate = clamp(-distance / softEdge + 0.5, 0.0, 1.0);\n        }\n        var blended: vec4f;\n        switch (packed.x & 0xffu) {\n            case 0u: { blended = *rgba * values[0]; }\n            case 1u: { blended = vec4f(values[0].rgb, (*rgba).a * values[0].a); }\n            case 2u: { blended = *rgba + values[0]; }\n            default: { blended = vec4f(fract(*center), 1.0); }\n        }\n        *rgba = mix(*rgba, blended, modulate);\n        *center += values[1].xyz * modulate;\n    }\n}\n\n@compute @workgroup_size(256)\nfn generate(@builtin(workgroup_id) group: vec3u,\n            @builtin(local_invocation_id) local: vec3u,\n            @builtin(num_workgroups) groups: vec3u) {\n    let i = (group.y * groups.x + group.x) * 256u + local.x;\n    if (i >= frame.count) { return; }\n    let dst = frame.base + i;\n    var src = i;\n    if (frame.indexed != 0u) { src = indices[i]; }\n    if (src >= frame.sourceCount) { return; }\n    var splat: UnpackedSplat;\n    if (frame.sourceExt != 0u) {\n        splat = unpackSplatExt(loadPrimary(src), loadSecondary(src));\n    } else {\n        splat = unpackSplatEncoding(loadPrimary(src), frame.encoding);\n        splat.rgba.a *= frame.shMaxOpacity.w;\n    }\n    // Upstream marks source activity by nonzero scales, not opacity. Zero\n    // alpha still owns a finite depth/order entry and is discarded at draw,\n    // except for paged sources, whose readers drop it like zero scales.\n    if (all(splat.scales == vec3f(0.0)) || (ZERO_ALPHA_INACTIVE && splat.rgba.a == 0.0)) { return; }\n\n    if (frame.numSh > 0u) {\n        let dir = normalize(splat.center - frame.localViewOrigin.xyz);\n        var rgb = vec3f(0.0);\n        if (frame.sourceExt != 0u) {\n            let a = loadSh(0u, src);\n            if (frame.numSh == 1u) {\n                rgb = evaluateExtSH1(a, dir);\n            } else {\n                rgb = evaluateExtSH12(a, loadSh(1u, src), dir);\n                if (frame.numSh >= 3u) {\n                    rgb += evaluateExtSH3(loadSh(2u, src), loadSh(3u, src), dir);\n                }\n            }\n        } else {\n            rgb = evaluatePackedSH1(loadPackedSh1(src), dir, frame.shMaxOpacity.x);\n            if (frame.numSh >= 2u) {\n                rgb += evaluatePackedSH2(loadSh(1u, src), dir, frame.shMaxOpacity.y);\n            }\n            if (frame.numSh >= 3u) {\n                rgb += evaluatePackedSH3(loadSh(2u, src), dir, frame.shMaxOpacity.z);\n            }\n        }\n        // Match upstream source generation: signed SH colors survive until\n        // output encoding. Extended output preserves negative half floats;\n        // packed output performs its own format-specific clamping.\n        splat.rgba = vec4f(splat.rgba.rgb + rgb, splat.rgba.a);\n    }\n    splat.rgba *= frame.recolor;\n    var center = quatVec(frame.rotation, splat.center * frame.translationScale.w) + frame.translationScale.xyz;\n    // SplatMesh applies RGBA/displace edits in world space after recoloring.\n    applyEdits(&center, &splat.rgba);\n    let delta = center - frame.viewOrigin.xyz;\n    let dist = length(delta);\n    var metric = dot(delta, frame.viewDirection.xyz) + 100.0;\n    if (frame.sortRadial != 0u) { metric = dist; }\n    // Negative/NaN/infinite bit patterns are excluded by upstream sort32.\n    depths[dst] = bitcast<u32>(metric);\n    // Outside the sort cone (sortCullFov) the depth stays +inf: not drawn.\n    if (dist > 0.0 && dot(delta, frame.viewDirection.xyz) < frame.viewDirection.w * dist) {\n        depths[dst] = 0x7f800000u;\n    }\n    let scales = splat.scales * frame.translationScale.w;\n    let rotation = quatQuat(frame.rotation, splat.quaternion);\n    if (frame.outputExt != 0u) {\n        let packed = packSplatExt(center, scales, rotation, splat.rgba);\n        output[dst] = packed.packed;\n        output2[dst] = packed.packed2;\n    } else {\n        // Upstream uses camera-relative half precision and expanded LoD alpha.\n        output[dst] = packSplat(delta, scales, rotation, vec4f(splat.rgba.rgb, splat.rgba.a * 0.5));\n    }\n}\n";
+var generateSplats_default = "// Native counterpart of SplatAccumulator's ordinary SplatMesh generation.\n// One dispatch per mesh writes its upstream row-aligned destination range.\n// Depth is evaluated before output quantization, just like the WebGL MRT.\nstruct GenerateUniforms {\n    base: u32, count: u32, sourceCount: u32, indexed: u32,\n    sourceExt: u32, outputExt: u32, sortRadial: u32, numSh: u32,\n    rotation: vec4f,\n    translationScale: vec4f,\n    viewOrigin: vec4f,\n    viewDirection: vec4f, // w: sort cone cos(sortCullFov / 2), -2 when off\n    localViewOrigin: vec4f,\n    encoding: vec4f,\n    shMaxOpacity: vec4f,\n    shOffsets: vec4u,\n    recolor: vec4f,\n// x: SplatEdits.numEdits, y: SplatEdits.numSdfs (sdfData follows editData).\neditCounts: vec4u,\n};\n@group(0) @binding(0) var<uniform> frame: GenerateUniforms;\n// Bindings 1-3 (and 8-10 for paged sources) and the load*() accessors come\n// from generateSourceBuffers.wgsl or generateSourcePaged.wgsl.\n@group(0) @binding(4) var<storage, read> indices: array<u32>;\n// Written straight into the slot's splat textures (no staging buffer copy).\n@group(0) @binding(5) var output: texture_storage_2d_array<rgba32uint, write>;\n@group(0) @binding(6) var output2: texture_storage_2d_array<rgba32uint, write>;\n\nfn storeOutput(second: bool, dst: u32, value: vec4u) {\n    let size = textureDimensions(output);\n    let coord = vec2u(dst % size.x, (dst / size.x) % size.y);\n    let layer = dst / (size.x * size.y);\n    if (second) { textureStore(output2, coord, layer, value); }\n    else { textureStore(output, coord, layer, value); }\n}\n@group(0) @binding(7) var<storage, read_write> depths: array<u32>;\n\n// Native counterpart of SplatEdit.ts defineSdfArray/defineEdit: world-space\n// SDF RGBA/displace layers. editData holds frame.editCounts.x packed edits\n// (SplatEdits.editData) followed by 8 vec4u per SDF (SplatEdits.sdfData).\n@group(0) @binding(11) var<storage, read> editData: array<vec4u>;\n// WGSL rejects infinite constants; FLT_MAX stands in for GLSL 1.0 / 0.0.\nconst EDIT_INFINITY: f32 = 0x1.fffffep+127f;\n\nfn sdfRow(sdf: u32, row: u32) -> vec4f {\n    return bitcast<vec4f>(editData[frame.editCounts.x + sdf * 8u + row]);\n}\n\nfn evaluateSdfs(first: u32, count: u32, pos: vec3f, smoothK: f32,\n                values: ptr<function, array<vec4f, 2>>) -> f32 {\n    var accum = select(0.0, EDIT_INFINITY, smoothK == 0.0);\n    var maxExp = -EDIT_INFINITY;\n    (*values)[0] = vec4f(0.0);\n    (*values)[1] = vec4f(0.0);\n    let last = min(first + count, frame.editCounts.y);\n    for (var index = first; index < last; index++) {\n        let row0 = editData[frame.editCounts.x + index * 8u];\n        let flags = row0.w;\n        let sizes = sdfRow(index, 3u);\n        let sdfValues = array<vec4f, 2>(sdfRow(index, 4u), sdfRow(index, 5u));\n        var p = quatVec(sdfRow(index, 1u), pos * sdfRow(index, 2u).xyz) + bitcast<vec3f>(row0.xyz);\n        var distance = -EDIT_INFINITY;\n        switch (flags & 0xffu) {\n            case 1u: { distance = p.z; }\n            case 2u: { distance = length(p) - sizes.w; }\n            case 3u: {\n                let q = abs(p) - sizes.xyz + sizes.w;\n                distance = length(max(q, vec3f(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0) - sizes.w;\n            }\n            case 4u: {\n                let k0 = length(p / sizes.xyz);\n                let k1 = length(p / dot(sizes.xyz, sizes.xyz));\n                distance = k0 * (k0 - 1.0) / k1;\n            }\n            case 5u: {\n                let d = abs(vec2f(length(p.xz), p.y)) - sizes.wy;\n                distance = min(max(d.x, d.y), 0.0) + length(max(d, vec2f(0.0)));\n            }\n            case 6u: {\n                p.y -= clamp(p.y, -0.5 * sizes.y, 0.5 * sizes.y);\n                distance = length(p) - sizes.w;\n            }\n            case 7u: {\n                let angle = 0.25 * PI * sizes.w;\n                let c = vec2f(sin(angle), cos(angle));\n                let q = vec2f(length(p.xy), -p.z);\n                let d = length(q - c * max(dot(q, c), 0.0));\n                distance = d * select(1.0, -1.0, (q.x * c.y - q.y * c.x) < 0.0);\n            }\n            default: {}\n        }\n        if ((flags & 0x100u) != 0u) { distance = -distance; }\n        if (smoothK == 0.0) {\n            if (distance < accum) {\n                accum = distance;\n                *values = sdfValues;\n            }\n        } else {\n            let scaled = -distance / smoothK;\n            if (scaled > maxExp) {\n                let s = exp(maxExp - scaled);\n                accum *= s;\n                (*values)[0] *= s;\n                (*values)[1] *= s;\n                maxExp = scaled;\n            }\n            let weight = exp(scaled - maxExp);\n            accum += weight;\n            (*values)[0] += weight * sdfValues[0];\n            (*values)[1] += weight * sdfValues[1];\n        }\n    }\n    if (smoothK == 0.0) { return accum; }\n    // Very distant SDFs may result in 0 accumulation.\n    if (accum == 0.0) { return EDIT_INFINITY; }\n    (*values)[0] /= accum;\n    (*values)[1] /= accum;\n    return (-log(accum) - maxExp) * smoothK;\n}\n\nfn applyEdits(center: ptr<function, vec3f>, rgba: ptr<function, vec4f>) {\n    for (var e = 0u; e < frame.editCounts.x; e++) {\n        let packed = editData[e];\n        let softEdge = bitcast<f32>(packed.z);\n        var values: array<vec4f, 2>;\n        var distance = evaluateSdfs(packed.y & 0xffffu, packed.y >> 16u, *center, bitcast<f32>(packed.w), &values);\n        if ((packed.x & 0x100u) != 0u) { distance = -distance; }\n        var modulate: f32;\n        if (softEdge == 0.0) {\n            modulate = select(0.0, 1.0, distance < 0.0);\n        } else {\n            modulate = clamp(-distance / softEdge + 0.5, 0.0, 1.0);\n        }\n        var blended: vec4f;\n        switch (packed.x & 0xffu) {\n            case 0u: { blended = *rgba * values[0]; }\n            case 1u: { blended = vec4f(values[0].rgb, (*rgba).a * values[0].a); }\n            case 2u: { blended = *rgba + values[0]; }\n            default: { blended = vec4f(fract(*center), 1.0); }\n        }\n        *rgba = mix(*rgba, blended, modulate);\n        *center += values[1].xyz * modulate;\n    }\n}\n\n@compute @workgroup_size(256)\nfn generate(@builtin(workgroup_id) group: vec3u,\n            @builtin(local_invocation_id) local: vec3u,\n            @builtin(num_workgroups) groups: vec3u) {\n    let i = (group.y * groups.x + group.x) * 256u + local.x;\n    if (i >= frame.count) { return; }\n    let dst = frame.base + i;\n    var src = i;\n    if (frame.indexed != 0u) { src = indices[i]; }\n    if (src >= frame.sourceCount) { return; }\n    var splat: UnpackedSplat;\n    if (frame.sourceExt != 0u) {\n        splat = unpackSplatExt(loadPrimary(src), loadSecondary(src));\n    } else {\n        splat = unpackSplatEncoding(loadPrimary(src), frame.encoding);\n        splat.rgba.a *= frame.shMaxOpacity.w;\n    }\n    // Upstream marks source activity by nonzero scales, not opacity. Zero\n    // alpha still owns a finite depth/order entry and is discarded at draw,\n    // except for paged sources, whose readers drop it like zero scales.\n    if (all(splat.scales == vec3f(0.0)) || (ZERO_ALPHA_INACTIVE && splat.rgba.a == 0.0)) { return; }\n\n    if (frame.numSh > 0u) {\n        let dir = normalize(splat.center - frame.localViewOrigin.xyz);\n        var rgb = vec3f(0.0);\n        if (frame.sourceExt != 0u) {\n            let a = loadSh(0u, src);\n            if (frame.numSh == 1u) {\n                rgb = evaluateExtSH1(a, dir);\n            } else {\n                rgb = evaluateExtSH12(a, loadSh(1u, src), dir);\n                if (frame.numSh >= 3u) {\n                    rgb += evaluateExtSH3(loadSh(2u, src), loadSh(3u, src), dir);\n                }\n            }\n        } else {\n            rgb = evaluatePackedSH1(loadPackedSh1(src), dir, frame.shMaxOpacity.x);\n            if (frame.numSh >= 2u) {\n                rgb += evaluatePackedSH2(loadSh(1u, src), dir, frame.shMaxOpacity.y);\n            }\n            if (frame.numSh >= 3u) {\n                rgb += evaluatePackedSH3(loadSh(2u, src), dir, frame.shMaxOpacity.z);\n            }\n        }\n        // Match upstream source generation: signed SH colors survive until\n        // output encoding. Extended output preserves negative half floats;\n        // packed output performs its own format-specific clamping.\n        splat.rgba = vec4f(splat.rgba.rgb + rgb, splat.rgba.a);\n    }\n    splat.rgba *= frame.recolor;\n    var center = quatVec(frame.rotation, splat.center * frame.translationScale.w) + frame.translationScale.xyz;\n    // SplatMesh applies RGBA/displace edits in world space after recoloring.\n    applyEdits(&center, &splat.rgba);\n    let delta = center - frame.viewOrigin.xyz;\n    let dist = length(delta);\n    var metric = dot(delta, frame.viewDirection.xyz) + 100.0;\n    if (frame.sortRadial != 0u) { metric = dist; }\n    // Negative/NaN/infinite bit patterns are excluded by upstream sort32.\n    depths[dst] = bitcast<u32>(metric);\n    // Outside the sort cone (sortCullFov) the depth stays +inf: not drawn.\n    if (dist > 0.0 && dot(delta, frame.viewDirection.xyz) < frame.viewDirection.w * dist) {\n        depths[dst] = 0x7f800000u;\n    }\n    let scales = splat.scales * frame.translationScale.w;\n    let rotation = quatQuat(frame.rotation, splat.quaternion);\n    if (frame.outputExt != 0u) {\n        let packed = packSplatExt(center, scales, rotation, splat.rgba);\n        storeOutput(false, dst, packed.packed);\n        storeOutput(true, dst, packed.packed2);\n    } else {\n        // Upstream uses camera-relative half precision and expanded LoD alpha.\n        storeOutput(false, dst, packSplat(delta, scales, rotation, vec4f(splat.rgba.rgb, splat.rgba.a * 0.5)));\n    }\n}\n";
 //#endregion
 //#region src/WebGPUGeneration.ts
 /** Source uploads are shared across instances; output ownership stays with the backend slot. */
@@ -12990,8 +12992,17 @@ var WebGPUGeneration = class {
 				if (state.indices === this.dummy || state.indices.size < bytes) {
 					if (state.indices !== this.dummy) state.indices.destroy();
 					state.indices = this.buffer(bytes, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, "native-selection");
+					state.indicesKey = void 0;
 				}
-				this.device.queue.writeBuffer(state.indices, 0, mesh.indices.buffer, mesh.indices.byteOffset, mesh.count * 4);
+				const key = state.indicesKey;
+				if (mesh.indicesVersion === void 0 || !key || key[0] !== mesh.indices || key[1] !== mesh.indicesVersion || key[2] < mesh.count) {
+					this.device.queue.writeBuffer(state.indices, 0, mesh.indices.buffer, mesh.indices.byteOffset, mesh.count * 4);
+					state.indicesKey = [
+						mesh.indices,
+						mesh.indicesVersion,
+						mesh.count
+					];
+				}
 			}
 			const edits = mesh.edits?.numEdits ? mesh.edits : void 0;
 			if (edits) {
@@ -13688,8 +13699,7 @@ var WebGPUSplatBackend = class WebGPUSplatBackend {
 		this.packOrderingPipeline = null;
 		this.packOrderingLayout = null;
 		this.packOrderingUniform = null;
-		this.generatedOutputBuffer = null;
-		this.generatedOutputBuffer2 = null;
+		this.generatedOutputDummy = null;
 		this.nativeGeneration = null;
 		this.nativeFillPipeline = null;
 		this.nativeKeysPipeline = null;
@@ -13717,11 +13727,13 @@ var WebGPUSplatBackend = class WebGPUSplatBackend {
 		this.lastGpuFrameMs = null;
 		this.gpuTimingSequence = 0;
 		this.gpuTimingGeneration = null;
+		this.sortInFlight = false;
 		this.pickUniforms = null;
 		this.pickLayout = null;
 		this.pickPipelines = /* @__PURE__ */ new Map();
 		this.pickTargets = [];
 		this.nativeKeysBuffer = null;
+		this.sortSequence = 0;
 		this.device = device;
 		this.sparkUniformBuffer = device.createBuffer({
 			label: "spark-uniforms",
@@ -14352,28 +14364,19 @@ var WebGPUSplatBackend = class WebGPUSplatBackend {
 			return;
 		}
 		const size = getTextureSize(args.numSplats);
-		const bytes = size.width * size.height * size.depth * 16;
-		this.assertStorageBufferFits(bytes, "native generated splats");
 		if (size.width > device.limits.maxTextureDimension2D || size.height > device.limits.maxTextureDimension2D || size.depth > device.limits.maxTextureArrayLayers) throw new Error("Spark: native output exceeds device texture limits; use THREE.WebGLRenderer.");
 		this.ensureSplatTexture(args.numSplats);
-		if (!this.generatedOutputBuffer || this.generatedOutputBuffer.size < bytes) {
-			this.generatedOutputBuffer?.destroy();
-			this.generatedOutputBuffer = device.createBuffer({
-				label: "spark-native-output",
-				size: bytes,
-				usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
-			});
-		}
 		if (args.outputExt) this.ensureSplatTexture2(args.numSplats);
-		const secondaryBytes = args.outputExt ? bytes : 16;
-		if (!this.generatedOutputBuffer2 || this.generatedOutputBuffer2.size < secondaryBytes) {
-			this.generatedOutputBuffer2?.destroy();
-			this.generatedOutputBuffer2 = device.createBuffer({
-				label: "spark-native-output2",
-				size: secondaryBytes,
-				usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
-			});
-		}
+		this.generatedOutputDummy ??= device.createTexture({
+			label: "spark-native-output2-dummy",
+			size: [
+				1,
+				1,
+				1
+			],
+			format: "rgba32uint",
+			usage: GPUTextureUsage.STORAGE_BINDING
+		});
 		const depthBytes = Math.ceil(args.numSplats / 256) * 256 * 4;
 		this.assertStorageBufferFits(depthBytes, "native generated depths");
 		if (!slot.nativeDepths || slot.nativeDepths.size < depthBytes) {
@@ -14398,8 +14401,6 @@ var WebGPUSplatBackend = class WebGPUSplatBackend {
 			}
 		});
 		const encoder = device.createCommandEncoder({ label: "spark-native-generation" });
-		encoder.clearBuffer(this.generatedOutputBuffer, 0, bytes);
-		if (args.outputExt) encoder.clearBuffer(this.generatedOutputBuffer2, 0, bytes);
 		const fill = encoder.beginComputePass({
 			label: "spark-native-depth-fill",
 			...this.timestampWritesFor("depth-fill")
@@ -14417,59 +14418,22 @@ var WebGPUSplatBackend = class WebGPUSplatBackend {
 		}));
 		fill.dispatchWorkgroups(...this.computeDispatchSize(Math.ceil(args.numSplats / 256)));
 		fill.end();
+		if (!slot.splatTextureView || args.outputExt && !slot.splatTextureView2) {
+			encoder.finish();
+			throw new Error("Spark: native generation textures are unavailable");
+		}
 		try {
 			this.nativeGeneration ??= new WebGPUGeneration(device);
 			this.nativeGeneration.encode(encoder, {
 				...args,
-				output: this.generatedOutputBuffer,
-				output2: this.generatedOutputBuffer2,
+				output: slot.splatTextureView,
+				output2: args.outputExt && slot.splatTextureView2 || this.generatedOutputDummy.createView({ dimension: "2d-array" }),
 				depths: slot.nativeDepths,
 				timestampWrites: this.gpuTimingAvailable ? () => this.timestampWritesFor("generation")?.timestampWrites : void 0
 			});
 		} catch (error) {
 			encoder.finish();
 			throw error;
-		}
-		const texture = slot.splatTexture;
-		const texture2 = slot.splatTexture2;
-		if (!texture || args.outputExt && !texture2) {
-			encoder.finish();
-			throw new Error("Spark: native generation textures are unavailable");
-		}
-		for (let layer = 0; layer < size.depth; layer++) {
-			const source = {
-				buffer: this.generatedOutputBuffer,
-				offset: layer * size.width * size.height * 16,
-				bytesPerRow: size.width * 16,
-				rowsPerImage: size.height
-			};
-			encoder.copyBufferToTexture(source, {
-				texture,
-				origin: [
-					0,
-					0,
-					layer
-				]
-			}, [
-				size.width,
-				size.height,
-				1
-			]);
-			if (args.outputExt && texture2) encoder.copyBufferToTexture({
-				...source,
-				buffer: this.generatedOutputBuffer2
-			}, {
-				texture: texture2,
-				origin: [
-					0,
-					0,
-					layer
-				]
-			}, [
-				size.width,
-				size.height,
-				1
-			]);
 		}
 		device.queue.submit([encoder.finish()]);
 		slot.generatedSpan = args.numSplats;
@@ -14481,6 +14445,33 @@ var WebGPUSplatBackend = class WebGPUSplatBackend {
 			9
 		];
 		this.syncLegacyFields(slot);
+	}
+	/**
+	* Test hook: a COPY_SRC buffer holding the generated splat texels in
+	* linear splat order (the caller destroys it).
+	*/
+	copyGeneratedOutput(second = false) {
+		const slot = this.depthRenderSlot();
+		const texture = second ? slot.splatTexture2 : slot.splatTexture;
+		if (!texture) throw new Error("Spark: no generated native splats");
+		const { width, height, depthOrArrayLayers } = texture;
+		const buffer = this.device.createBuffer({
+			label: "spark-native-output-copy",
+			size: width * height * depthOrArrayLayers * 16,
+			usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+		});
+		const encoder = this.device.createCommandEncoder();
+		encoder.copyTextureToBuffer({ texture }, {
+			buffer,
+			bytesPerRow: width * 16,
+			rowsPerImage: height
+		}, [
+			width,
+			height,
+			depthOrArrayLayers
+		]);
+		this.device.queue.submit([encoder.finish()]);
+		return buffer;
 	}
 	async readNativeDepths(count) {
 		if (this.disposed || this.deviceLost) throw new Error("Spark: native backend is disposed or its device is lost");
@@ -14594,15 +14585,38 @@ var WebGPUSplatBackend = class WebGPUSplatBackend {
 		pass.dispatchWorkgroups(...this.computeDispatchSize(Math.ceil(count / 256)));
 		pass.end();
 	}
+	createDrawArgs() {
+		return this.device.createBuffer({
+			label: "spark-native-draw-count",
+			size: 32,
+			usage: GPUBufferUsage.INDIRECT | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+		});
+	}
+	/**
+	* Give the working slot the committed radix ordering and draw count: a new
+	* generation of the same splat mapping draws with the previous order, as
+	* WebGL displays a regenerated accumulator before its sort completes.
+	*/
+	reuseActiveOrdering(orderingRows) {
+		const active = this.activeRenderSlot();
+		const slot = this.orderingRenderSlot("working");
+		if (!this.pendingRenderSlot || active === slot || !active.indirect || !active.orderingTexture || !active.nativeDrawArgs || active.orderingRows < orderingRows || (active.orderingTexture.usage & GPUTextureUsage.COPY_SRC) === 0) return false;
+		const texture = this.ensureGpuOrderingTexture(slot, 4096, orderingRows);
+		slot.nativeDrawArgs ??= this.createDrawArgs();
+		const encoder = this.device.createCommandEncoder({ label: "spark-reuse-ordering" });
+		encoder.copyTextureToTexture({ texture: active.orderingTexture }, { texture }, [4096, orderingRows]);
+		encoder.copyBufferToBuffer(active.nativeDrawArgs, 0, slot.nativeDrawArgs, 0, 32);
+		this.device.queue.submit([encoder.finish()]);
+		slot.indirect = true;
+		slot.orderingGeneration = slot.generation;
+		this.syncLegacyFields(slot);
+		return true;
+	}
 	countNativeDraw(encoder, slot, depths, sorted) {
 		const pipeline = this.nativeCountPipeline;
 		const uniform = this.nativeSortUniform;
 		if (!pipeline || !uniform) throw new Error("Spark: native draw count pipeline is unavailable");
-		slot.nativeDrawArgs ??= this.device.createBuffer({
-			label: "spark-native-draw-count",
-			size: 32,
-			usage: GPUBufferUsage.INDIRECT | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
-		});
+		slot.nativeDrawArgs ??= this.createDrawArgs();
 		const pass = encoder.beginComputePass({ label: "spark-native-draw-count" });
 		pass.setPipeline(pipeline);
 		pass.setBindGroup(0, this.device.createBindGroup({
@@ -14973,7 +14987,7 @@ var WebGPUSplatBackend = class WebGPUSplatBackend {
 					depth
 				],
 				format: "rgba32uint",
-				usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+				usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST | GPUTextureUsage.STORAGE_BINDING,
 				dimension: "2d"
 			});
 			slot.splatTextureView = slot.splatTexture.createView({ dimension: "2d-array" });
@@ -15007,7 +15021,7 @@ var WebGPUSplatBackend = class WebGPUSplatBackend {
 					depth
 				],
 				format: "rgba32uint",
-				usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+				usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST | GPUTextureUsage.STORAGE_BINDING,
 				dimension: "2d"
 			});
 			slot.splatTextureView2 = slot.splatTexture2.createView({ dimension: "2d-array" });
@@ -15112,7 +15126,7 @@ var WebGPUSplatBackend = class WebGPUSplatBackend {
 		});
 	}
 	ensureGpuOrderingTexture(slot, width, rows) {
-		const usage = GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_DST;
+		const usage = GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST;
 		if (slot.orderingTexture && slot.orderingRows >= rows && (slot.orderingTexture.usage & GPUTextureUsage.STORAGE_BINDING) !== 0) return slot.orderingTexture;
 		slot.orderingTexture?.destroy();
 		slot.orderingTexture = this.device.createTexture({
@@ -15190,6 +15204,11 @@ var WebGPUSplatBackend = class WebGPUSplatBackend {
 		this.countNativeDraw(encoder, orderSlot, depths, sorted);
 		this.useIndirectDraw = true;
 		device.queue.submit([encoder.finish()]);
+		this.sortInFlight = true;
+		const sequence = ++this.sortSequence;
+		device.queue.onSubmittedWorkDone().then(() => {
+			if (sequence === this.sortSequence) this.sortInFlight = false;
+		}, () => {});
 		orderSlot.orderingGeneration = orderSlot.generation;
 		this.syncLegacyFields(orderSlot);
 		return true;
@@ -15249,10 +15268,8 @@ var WebGPUSplatBackend = class WebGPUSplatBackend {
 		this.nativeGeneration?.dispose();
 		this.nativeGeneration = null;
 		this.nativeSortUniform?.destroy();
-		this.generatedOutputBuffer?.destroy();
-		this.generatedOutputBuffer = null;
-		this.generatedOutputBuffer2?.destroy();
-		this.generatedOutputBuffer2 = null;
+		this.generatedOutputDummy?.destroy();
+		this.generatedOutputDummy = null;
 		this.sparkUniformBuffer.destroy();
 		this.projMatrixBuffer.destroy();
 		this.fragUniformBuffer.destroy();
@@ -15330,6 +15347,9 @@ var SparkNativeRenderer = class {
 		this.hostViewport = new THREE.Vector4();
 		this.sequence = 0;
 		this.currentSignature = "";
+		this.sortedMapping = "";
+		this.lastSortTime = Number.NEGATIVE_INFINITY;
+		this.orderingStale = false;
 		this.updateQueue = Promise.resolve([]);
 		this.worker = null;
 		this.ordering = /* @__PURE__ */ new Uint32Array(0);
@@ -15626,14 +15646,16 @@ var SparkNativeRenderer = class {
 			});
 			next.numSplats = Math.max(next.numSplats, base + count);
 		}
-		const signature = JSON.stringify([
+		const view = JSON.stringify([
+			next.viewToWorld.toArray(),
+			next.viewOrigin.toArray(),
+			next.viewDirection.toArray()
+		]);
+		const mapping = JSON.stringify([
 			sortMode,
 			sortRadial,
 			sortCullCos,
 			owner.accumExtSplats,
-			next.viewToWorld.toArray(),
-			next.viewOrigin.toArray(),
-			next.viewDirection.toArray(),
 			visible.map((node, i) => [
 				node.uuid,
 				node.version,
@@ -15646,6 +15668,7 @@ var SparkNativeRenderer = class {
 				this.identity(mesh.secondary),
 				...mesh.sh.map((array) => this.identity(array)),
 				this.identity(mesh.indices),
+				mesh.indicesVersion,
 				mesh.base,
 				mesh.count,
 				mesh.revision,
@@ -15658,7 +15681,8 @@ var SparkNativeRenderer = class {
 				mesh.shMaxOpacity
 			])
 		]);
-		if (signature === this.currentSignature) {
+		const signature = view + mapping;
+		if (signature === this.currentSignature && !this.orderingStale) {
 			next.dispose();
 			return visible;
 		}
@@ -15681,7 +15705,12 @@ var SparkNativeRenderer = class {
 				sortCullCos
 			});
 			const rows = Math.max(1, Math.ceil(next.numSplats / 16384));
-			if (sortMode === "radix" && next.numSplats > 0 && await this.backend.gpuDepthSortAndPack({
+			const now = performance.now();
+			const reuse = sortMode === "radix" && next.numSplats > 0 && sortCullCos === -2 && mapping === this.sortedMapping && signature !== this.currentSignature && (this.backend.sortInFlight || now < this.lastSortTime + owner.minSortIntervalMs) && this.backend.reuseActiveOrdering(rows);
+			if (reuse) {
+				indirect = true;
+				activeSplats = meshes.reduce((sum, mesh) => sum + mesh.count, 0);
+			} else if (sortMode === "radix" && next.numSplats > 0 && await this.backend.gpuDepthSortAndPack({
 				numSplats: next.numSplats,
 				viewOrigin: next.viewOrigin,
 				viewDir: next.viewDirection,
@@ -15692,7 +15721,10 @@ var SparkNativeRenderer = class {
 			})) {
 				indirect = true;
 				activeSplats = meshes.reduce((sum, mesh) => sum + mesh.count, 0);
+				this.sortedMapping = mapping;
+				this.lastSortTime = now;
 			} else {
+				this.sortedMapping = "";
 				const readback = await this.backend.readNativeDepths(next.numSplats);
 				if (this.disposed || sequence !== this.sequence) throw new Error("SparkRenderer is disposed or native generation was superseded");
 				if (this.ordering.length < rows * 16384) this.ordering = new Uint32Array(rows * 16384);
@@ -15725,14 +15757,32 @@ var SparkNativeRenderer = class {
 			owner.sortedDir.copy(next.viewDirection);
 			owner.setDirty();
 			this.currentSignature = signature;
+			this.orderingStale = reuse;
+			if (reuse) this.scheduleFinalSort();
 			return visible;
 		} catch (error) {
+			this.sortedMapping = "";
 			this.backend.cancelRenderSlotUpdate(generation);
 			next.dispose();
 			throw error;
 		} finally {
 			owner.sorting = false;
 		}
+	}
+	/** On-demand apps re-render (and so sort) once the next sort may run. */
+	scheduleFinalSort() {
+		clearTimeout(this.staleTimeout);
+		const poll = () => {
+			this.staleTimeout = void 0;
+			if (this.disposed || !this.orderingStale) return;
+			const wait = this.lastSortTime + this.owner.minSortIntervalMs - performance.now();
+			if (this.backend.sortInFlight || wait > 0) {
+				this.staleTimeout = setTimeout(poll, Math.max(1, wait));
+				return;
+			}
+			this.owner.setDirty();
+		};
+		this.staleTimeout = setTimeout(poll, 1);
 	}
 	/** Paged meshes read SplatPager's page pool through their LoD selection. */
 	pagedGeneration(node, source, base, count) {
@@ -15752,6 +15802,7 @@ var SparkNativeRenderer = class {
 			base,
 			count,
 			indices,
+			indicesVersion: source.indicesVersion,
 			rotation: transform.rotate.value.toArray(),
 			translationScale: [...transform.translate.value.toArray(), transform.scale.value],
 			localViewOrigin: node.context.viewToObject.translate.value.toArray(),
@@ -15791,6 +15842,7 @@ var SparkNativeRenderer = class {
 		if (this.disposed) return;
 		this.disposed = true;
 		this.sequence++;
+		clearTimeout(this.staleTimeout);
 		this.worker?.dispose();
 		this.worker = null;
 		this.composite?.dispose();
