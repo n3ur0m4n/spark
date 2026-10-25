@@ -1,4 +1,4 @@
-export { SparkRenderer, type SparkRendererOptions, } from "./SparkRenderer";
+export { SparkRenderer, type SparkRendererOptions, type SparkPickResult, } from "./SparkRenderer";
 export { SplatAccumulator, type GeneratorMapping } from "./SplatAccumulator";
 export * as dyno from "./dyno";
 export { RgbaArray, readRgbaArray } from "./RgbaArray";

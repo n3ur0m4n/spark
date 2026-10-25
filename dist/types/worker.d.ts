@@ -1,7 +1,14 @@
 import type { ExtResult, PackedResult, SplatEncoding } from "./defines";
+import { sortPar16ScatterJs, sortParScatterJs } from "./sortParallel";
 declare const rpcHandlers: {
     sortSplats16: typeof sortSplats16;
     sortSplats32: typeof sortSplats32;
+    sortParHist: typeof sortParHist;
+    sortParScatter: typeof sortParScatterJs;
+    sortParRegion: typeof sortParRegion;
+    sortSplats32as16: typeof sortSplats32as16;
+    sortPar16Hist: typeof sortPar16Hist;
+    sortPar16Scatter: typeof sortPar16ScatterJs;
     loadPackedSplats: typeof loadPackedSplats;
     loadExtSplats: typeof loadExtSplats;
     tinyLodPackedSplats: typeof tinyLodPackedSplats;
@@ -15,6 +22,8 @@ declare const rpcHandlers: {
     updateLodTrees: typeof updateLodTrees;
     traverseLodTrees: typeof traverseLodTrees;
     getLodTreeLevel: typeof getLodTreeLevel;
+    raycastLodTree: typeof raycastLodTree;
+    setLodRadii: typeof setLodRadii;
     nextChunk: typeof nextChunk;
 };
 export type rpcHandlers = typeof rpcHandlers;
@@ -36,6 +45,30 @@ declare function sortSplats32({ numSplats, readback, ordering, }: {
     readback: Uint32Array<ArrayBuffer>;
     ordering: Uint32Array<ArrayBuffer>;
 };
+declare function sortSplats32as16({ numSplats, readback, ordering, }: {
+    numSplats: number;
+    readback: Uint32Array<ArrayBuffer>;
+    ordering: Uint32Array<ArrayBuffer>;
+}): {
+    activeSplats: number;
+    readback: Uint32Array<ArrayBuffer>;
+    ordering: Uint32Array<ArrayBuffer>;
+};
+declare function sortPar16Hist({ keys, keys16, hist, }: {
+    keys: Uint32Array;
+    keys16: Uint16Array;
+    hist: Uint32Array;
+}): void;
+declare function sortParHist({ keys, start, end, hist, }: {
+    keys: Uint32Array;
+    start: number;
+    end: number;
+    hist: Uint32Array;
+}): void;
+declare function sortParRegion({ pairs, ordering, }: {
+    pairs: Uint32Array;
+    ordering: Uint32Array;
+}): void;
 declare function loadPackedSplats({ url, requestHeader, withCredentials, fileBytes, fileType, pathName, chunked, chunkedLength, encoding, lod, lodBase, lodAbove, nonLod, sh1Codes, sh2Codes, sh3Codes, }: {
     url?: string;
     requestHeader?: Record<string, string>;
@@ -128,6 +161,9 @@ declare function initLodTree({ numSplats, lodTree, }: {
     lodId: number;
     chunkToPage: Uint32Array<ArrayBufferLike>;
 };
+declare function setLodRadii({ enabled }: {
+    enabled: boolean;
+}): void;
 declare function disposeLodTree({ lodId }: {
     lodId: number;
 }): void;
@@ -170,6 +206,18 @@ declare function getLodTreeLevel({ lodId, level, }: {
     level: number;
 }): {
     indices: Uint32Array;
+};
+declare function raycastLodTree({ lodId, rootPage, origin, direction, near, far, maxCandidates, }: {
+    lodId: number;
+    rootPage?: number;
+    origin: number[];
+    direction: number[];
+    near: number;
+    far: number;
+    maxCandidates: number;
+}): {
+    nodes: Uint32Array;
+    nextDistance: number;
 };
 declare function nextChunk({ chunk }: {
     chunk: Uint8Array;

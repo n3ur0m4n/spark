@@ -141,6 +141,47 @@ export interface SparkRendererOptions {
      * @default 0
      */
     minSortIntervalMs?: number;
+    /**
+     * Number of workers for the depth sort. Above 1 the sort is split across
+     * that many workers via SharedArrayBuffer, used only when the page is
+     * crossOriginIsolated and there are at least 1M splats; otherwise a single
+     * worker sorts.
+     * @default max(1, min(4, hardwareConcurrency - 1))
+     */
+    sortThreads?: number;
+    /**
+     * Sort only splats whose center lies inside a cone around the view
+     * direction, with this full angle in degrees; the others are not drawn.
+     * Use a value larger than the camera's diagonal FOV (splats are culled by
+     * center, and the sort runs behind the camera motion). Ignored for
+     * orthographic cameras. 0 disables it.
+     * @default 0
+     */
+    sortCullFov?: number;
+    /**
+     * Sort by the depth rounded to 16-bit float (one counting pass instead of
+     * two radix passes). Same splats are drawn, ordering precision is ~1/2048
+     * of the distance.
+     * @default false
+     */
+    sort16?: boolean;
+    /**
+     * Sort-free stochastic rendering: each splat fragment is kept with
+     * probability alpha and written opaque with depth, drawn front-to-back
+     * from the last sorted order. Noisy but order-independent, so a stale sort
+     * while moving shows no popping. "movement" uses it only while the camera
+     * moves and returns to the sorted render stochasticSettleMs after it stops.
+     * Applied only to renders to the canvas (or the XR framebuffer); renders
+     * to other render targets always use the sorted path.
+     * @default "off"
+     */
+    stochastic?: "off" | "on" | "movement";
+    /**
+     * With stochastic "movement": milliseconds without camera changes before
+     * switching back to the sorted render.
+     * @default 100
+     */
+    stochasticSettleMs?: number;
     enableLod?: boolean;
     /**
      * Whether to drive LOD updates (compute lodInstances, update pager, etc.).
@@ -306,6 +347,27 @@ export interface SparkRendererOptions {
      */
     depthWrite?: boolean;
 }
+/**
+ * Result of {@link SparkRenderer.pickAsync}. Depths/distances are linear
+ * view-space depth (world units along the camera's forward axis), not
+ * Euclidean distance from the camera.
+ */
+export interface SparkPickResult {
+    /** Best point: always pointMedia (pointSolida is extra info only). */
+    point: THREE.Vector3;
+    /** World point reconstructed from the alpha-weighted average depth. */
+    pointMedia: THREE.Vector3;
+    /** World point reconstructed from the first "solid" splat's depth, if any
+     *  (always null unless pickAsync() was called with solid: true). */
+    pointSolida: THREE.Vector3 | null;
+    distanceMedia: number;
+    distanceSolida: number | null;
+    /** Sum of alpha coverage (G channel) at the chosen pixel. */
+    copertura: number;
+    floatType: "float" | "half";
+    /** Wall-clock time for the whole pickAsync() call, in ms. */
+    ms: number;
+}
 export declare class SparkRenderer extends THREE.Mesh {
     readonly renderer: THREE.WebGLRenderer;
     readonly material: THREE.ShaderMaterial;
@@ -330,6 +392,17 @@ export declare class SparkRenderer extends THREE.Mesh {
     focalAdjustment: number;
     sortRadial: boolean;
     minSortIntervalMs: number;
+    sortThreads: number;
+    sortCullFov: number;
+    sort16: boolean;
+    private sortCullCos;
+    stochastic: "off" | "on" | "movement";
+    stochasticSettleMs: number;
+    private stochasticPose;
+    private stochasticMoveTime;
+    private stochasticTimeoutId;
+    private stochasticActive;
+    private stochasticSaved;
     readonly timer: THREE.Timer;
     private readonly ownsTimer;
     lastFrame: number;
@@ -352,6 +425,9 @@ export declare class SparkRenderer extends THREE.Mesh {
     sortedCenter: THREE.Vector3;
     sortedDir: THREE.Vector3;
     readback32: Uint32Array<ArrayBuffer>;
+    sortPool: SplatWorker[];
+    private parallelSortBuffers?;
+    private orderingUpload;
     private readonly initWatched;
     enableLod: boolean;
     enableDriveLod: boolean;
@@ -373,6 +449,12 @@ export declare class SparkRenderer extends THREE.Mesh {
     lodRaycastIntervalMs: number;
     lastLodRaycastTime: number;
     lodWorker: SplatWorker | null;
+    pickWorker: SplatWorker | null;
+    private pickBusy;
+    private pickQueue;
+    private pickCounter;
+    private pickLatest;
+    private disposed;
     lodMeshes: {
         mesh: SplatMesh;
         version: number;
@@ -424,6 +506,14 @@ export declare class SparkRenderer extends THREE.Mesh {
     superPixels?: Uint8Array;
     targetPixels?: Uint8Array;
     superXY: number;
+    private pickMaterialMedia?;
+    private pickMaterialSolid?;
+    private pickTargetMedia?;
+    private pickTargetSolid?;
+    private pickTargetW;
+    private pickTargetH;
+    private pickTargetIsFloat;
+    private pickPass;
     flushAfterGenerate: boolean;
     flushAfterRead: boolean;
     readPause: number;
@@ -521,11 +611,19 @@ export declare class SparkRenderer extends THREE.Mesh {
         debugFlag: {
             value: boolean;
         };
+        stochastic: {
+            value: boolean;
+        };
+        instanceCount: {
+            value: number;
+        };
     };
     dispose(): void;
     private dropErrorIfDisposed;
     setDirty(): void;
     onBeforeRender(renderer: THREE.WebGLRenderer, scene: THREE.Scene, camera: THREE.Camera): void;
+    onAfterRender(): void;
+    private updateStochastic;
     clearSplats(): void;
     update({ scene, camera, }: {
         scene: THREE.Scene;
@@ -534,6 +632,12 @@ export declare class SparkRenderer extends THREE.Mesh {
     private updateInternal;
     private driveSort;
     private ensureLodWorker;
+    /**
+     * Mirror a LoD tree message to the pick worker. Call it right before the
+     * matching lodWorker call, in the same tick, with copies of any buffers
+     * (lodWorker takes ownership of its own), so the two FIFOs stay in step.
+     */
+    private callPickWorker;
     defaultSplatTarget(): 500000 | 750000 | 1000000 | 1500000 | 2500000;
     private driveLod;
     /** Body of the LoD update, run with exclusive access to the LoD worker. */
@@ -581,6 +685,98 @@ export declare class SparkRenderer extends THREE.Mesh {
     }): Promise<THREE.Texture>;
     recurseSetEnvMap(root: THREE.Object3D, envMap: THREE.Texture): void;
     getLodTreeLevel(splats: SplatMesh, level: number, pageColoring?: boolean): Promise<SplatMesh | null>;
+    /**
+     * Raycast a SplatMesh against its LoD tree, down to the finest level that is
+     * currently resident, instead of the coarse cut tested by SplatMesh.raycast().
+     * Resolves to the closest intersection (all of them with closestOnly: false),
+     * using a precision-safe ellipsoid test with semi-axes scaled by `sigma`
+     * (default 1, the SplatMesh.raycast() criterion; at most 2).
+     * With closestOnly: false the walk is capped at 65536 candidate nodes.
+     * Falls back to SplatMesh.raycast() for meshes without a LoD tree here.
+     * Requests are never dropped unless `coalesce` is set: then a newer request
+     * with the same key (the string, or mesh.uuid for true) supersedes this one,
+     * which rejects with an AbortError DOMException. Rejects likewise after
+     * dispose().
+     */
+    raycastAsync(mesh: SplatMesh, liveRaycaster: THREE.Raycaster, { closestOnly, sigma, signal, coalesce, }?: {
+        closestOnly?: boolean;
+        sigma?: number;
+        signal?: AbortSignal;
+        coalesce?: string | boolean;
+    }): Promise<THREE.Intersection[]>;
+    /**
+     * GPU pick prototype: renders a tiny (size x size) crop of the current
+     * frame (same camera position/orientation, same splat ordering/LoD
+     * selection already computed this frame) in two passes into two offscreen
+     * float targets, then reconstructs the picked 3D point from the readback.
+     * Resolves to null if the pick window had no coverage at all.
+     *
+     * Pass "media" composites splats back-to-front with standard premultiplied
+     * "over" blending (the same blend the main splat shader uses), so R/A end
+     * up holding a true visibility-weighted average depth (R = sum(w*d),
+     * A = sum(w), w_i = a_i * product(1 - a_j) for every splat j in front of
+     * i) - NOT a naive alpha-weighted sum, which would let splats behind an
+     * opaque surface pull the average through/behind it.
+     * Pass "solid" uses MIN blending to find the depth of the frontmost splat
+     * with alpha > alphaThreshold, independent of the first pass. It runs only
+     * with `solid: true` (default false = single "media" pass).
+     *
+     * x, y are CSS pixels relative to renderer.domElement (same convention as
+     * mouse/pointer events), not canvas backing-store pixels.
+     *
+     * Prototype scope: only this SparkRenderer's splats are considered (every
+     * other direct child of its parent scene is temporarily hidden for the
+     * two synchronous render calls), and occlusion by non-splat opaque
+     * geometry is not handled.
+     */
+    pickAsync({ camera, x, y, size, alphaThreshold, solid, }: {
+        camera: THREE.PerspectiveCamera | THREE.OrthographicCamera;
+        x: number;
+        y: number;
+        size?: number;
+        alphaThreshold?: number;
+        /** Also run the "solid" (first hit > alphaThreshold) pass. Default false:
+         *  one pass only, pointSolida/distanceSolida are null. */
+        solid?: boolean;
+    }): Promise<SparkPickResult | null>;
+    /**
+     * Batched variant of pickAsync() for several screen points at once: ONE
+     * "media" render + ONE readback of the window covering every point's
+     * size x size pick window, then per point exactly the pixel selection and
+     * depth -> world reconstruction pickAsync() does on its own window.
+     * x, y are CSS pixels relative to renderer.domElement, as in pickAsync().
+     * Results are in input order; null = no coverage, or the point's pick
+     * window is not entirely inside the canvas. No "solid" pass
+     * (pointSolida/distanceSolida are always null). `ms` is the whole call
+     * time, the same for every result.
+     * Pixel grid: every window is aligned to the first in-canvas point's
+     * sub-pixel offset; points at integer offsets from it (the usual case,
+     * e.g. integer CSS coordinates) see exactly the pixels pickAsync() would,
+     * others are rounded to the nearest pixel.
+     */
+    pickPointsAsync({ camera, points, size, alphaThreshold, }: {
+        camera: THREE.PerspectiveCamera | THREE.OrthographicCamera;
+        points: {
+            x: number;
+            y: number;
+        }[];
+        size?: number;
+        alphaThreshold?: number;
+    }): Promise<(SparkPickResult | null)[]>;
+    private pickRender;
+    /**
+     * One raycastLodTree on the pick worker, at most one in flight, the others
+     * waiting in FIFO order. A request with a coalesce `key` replaces the waiting
+     * request with the same key (latest wins), so a burst of hovers never piles
+     * up, and requests of a superseded raycastAsync() `generation` stop at their
+     * next round trip: both reject with an AbortError, as do waiting requests on
+     * dispose(). Requests without a key are never dropped.
+     * No lock needed for the tree state: record (rootPage) is
+     * read and the message posted in the same tick, and every tree update or
+     * disposal is mirrored to the pick worker in the same tick it changes lodIds,
+     * so its FIFO always holds the tree state this record describes.
+     */
+    private raycastPickWorker;
     get premultipliedAlpha(): boolean;
     set premultipliedAlpha(value: boolean);
 }

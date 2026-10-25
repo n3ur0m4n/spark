@@ -160,6 +160,7 @@ export declare class SplatMesh extends SplatGenerator {
         point: THREE.Vector3;
         object: THREE.Object3D;
     }[]): void;
+    raycastLodNodes(raycaster: THREE.Raycaster, nodes: Uint32Array, sigma: number): number[];
     static raycastBuffer: Float32Array<ArrayBuffer>;
     private appendRaycastBuffer;
     createLodSplats({ rgbaArray, quality, }?: {
