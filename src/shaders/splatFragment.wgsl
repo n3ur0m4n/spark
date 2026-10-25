@@ -25,6 +25,8 @@ struct FragmentUniforms {
     minAlpha: f32,
     disableFalloff: u32,    // bool as u32 for uniform buffer
     falloff: f32,
+    stochastic: u32,        // bool as u32 for uniform buffer
+    renderHeight: u32,
 }
 
 @group(0) @binding(5) var<uniform> fragUniforms: FragmentUniforms;
@@ -34,6 +36,7 @@ struct FragmentUniforms {
 // ============================================================================
 
 struct FragmentInput {
+    @builtin(position) fragCoord: vec4f,
     @location(0) vRgba: vec4f,
     @location(1) vSplatUv: vec2f,
     @location(2) vNdc: vec3f,
@@ -71,6 +74,20 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4f {
         rgba = vec4f(srgbToLinear(rgba.rgb), rgba.a);
     }
 
+    if (fragUniforms.stochastic != 0u) {
+        // Keep the fragment with probability alpha, written opaque. Same
+        // PCG-style hash and GL window coordinates as splatFragment.glsl.
+        let coord = vec2u(u32(input.fragCoord.x), fragUniforms.renderHeight - 1u - u32(input.fragCoord.y));
+        var state = 0x9e3779b9u * coord.x + 0x85ebca6bu * coord.y + 0xc2b2ae35u * input.vSplatIndex;
+        state = state * 747796405u + 2891336453u;
+        var hash = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+        hash = (hash >> 22u) ^ hash;
+        let rnd = f32(hash) / 4294967296.0;
+        if (rnd >= rgba.a) {
+            discard;
+        }
+        return vec4f(rgba.rgb, 1.0);
+    }
     if (PREMULTIPLIED_ALPHA) {
         return vec4f(rgba.rgb * rgba.a, rgba.a);
     } else {

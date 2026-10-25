@@ -515,7 +515,8 @@ export class SparkRenderer<
   private stochasticTimeoutId: ReturnType<typeof setTimeout> | undefined =
     undefined;
   // Decided once per canvas frame, reused by XR secondary eyes
-  private stochasticActive = false;
+  /** @internal Also read by the native WebGPU renderer. */
+  stochasticActive = false;
   // Material state overridden for the current draw, restored in onAfterRender
   private stochasticSaved: {
     blending: THREE.Blending;
@@ -1255,7 +1256,8 @@ export class SparkRenderer<
     }
   }
 
-  private updateStochastic(camera: THREE.Camera) {
+  /** @internal Also called by the native WebGPU renderer per canvas frame. */
+  updateStochastic(camera: THREE.Camera) {
     const now = performance.now();
     const pose = this.stochasticPose;
     const world = camera.matrixWorld.elements;

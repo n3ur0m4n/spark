@@ -55,6 +55,7 @@ try {
     "native-paged",
     "native-edits",
     "native-sortcull",
+    "native-stochastic",
   ]) {
     const page = await browser.newPage();
     const pageErrors = [];

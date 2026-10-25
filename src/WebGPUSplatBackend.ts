@@ -110,6 +110,10 @@ export class WebGPUSplatBackend {
    * composites the same way WebGL does when an app opts out.
    */
   premultipliedAlpha = true;
+  /** Sort-free stochastic draw (SparkRenderer stochasticActive) for the next frame. */
+  stochastic = false;
+  /** Same shaders, opaque output with depth writes (WebGL: NoBlending + depthWrite). */
+  private stochasticPipeline: GPURenderPipeline | null = null;
 
   // Splat encoding: rgbMin, rgbMax, lnScaleMin, lnScaleMax
   // Set from PackedSplats.splatEncoding per frame; defaults match DEFAULT_SPLAT_ENCODING.
@@ -455,8 +459,10 @@ export class WebGPUSplatBackend {
       bindGroupLayouts: [this.bindGroupLayout],
     });
 
-    this.pipeline = device.createRenderPipeline({
-      label: "spark-splat-pipeline",
+    const descriptor = (stochastic: boolean): GPURenderPipelineDescriptor => ({
+      label: stochastic
+        ? "spark-splat-stochastic-pipeline"
+        : "spark-splat-pipeline",
       layout: pipelineLayout,
       vertex: {
         module: vertexShaderModule,
@@ -485,17 +491,19 @@ export class WebGPUSplatBackend {
         targets: [
           {
             format: colorFormat,
-            blend: this.splatBlendState(premultiplied),
+            blend: stochastic ? undefined : this.splatBlendState(premultiplied),
           },
         ],
       },
       primitive: { topology: "triangle-list" },
       depthStencil: {
         format: "depth24plus",
-        depthWriteEnabled: false,
+        depthWriteEnabled: stochastic,
         depthCompare: "less-equal",
       },
     });
+    this.pipeline = device.createRenderPipeline(descriptor(false));
+    this.stochasticPipeline = device.createRenderPipeline(descriptor(true));
 
     this.pipelineFormat = colorFormat;
     this.pipelineHalvedAlphaState = this.halvedAlpha;
@@ -629,6 +637,9 @@ export class WebGPUSplatBackend {
     ff32[6] = uniforms.minAlpha.value;
     fu32[7] = 0; // disableFalloff
     ff32[8] = uniforms.falloff.value;
+    fu32[9] = this.stochastic ? 1 : 0;
+    // The stochastic hash uses GL window coordinates (origin bottom-left).
+    fu32[10] = rs.y;
 
     device.queue.writeBuffer(this.fragUniformBuffer, 0, fbuf);
   }
@@ -1390,7 +1401,9 @@ export class WebGPUSplatBackend {
       ) {
         this.rebuildBindGroup(slot);
       }
-      const pipeline = this.pipeline;
+      const pipeline = this.stochastic
+        ? this.stochasticPipeline
+        : this.pipeline;
       if (!pipeline) {
         throw new Error("Spark: native draw pipeline is unavailable");
       }
@@ -1853,6 +1866,7 @@ export class WebGPUSplatBackend {
     this.indexBuffer.destroy();
 
     this.pipeline = null;
+    this.stochasticPipeline = null;
     this.bindGroupLayout = null;
     this.bindGroup = null;
 

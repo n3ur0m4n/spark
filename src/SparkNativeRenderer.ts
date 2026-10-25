@@ -254,6 +254,9 @@ export class SparkNativeRenderer {
         // pending. Projection uniforms must match the attachments drawn below.
         this.renderer.getDrawingBufferSize(this.owner.renderSize);
         this.renderVisible = visible && this.isVisible(snapshot);
+        // Native frames always target the canvas, like WebGL canvas renders.
+        this.owner.updateStochastic(snapshot);
+        this.backend.stochastic = this.owner.stochasticActive;
         this.updateUniforms(snapshot);
         this.composite.render(
           this.renderer,
