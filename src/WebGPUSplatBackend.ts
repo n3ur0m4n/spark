@@ -1356,6 +1356,66 @@ export class WebGPUSplatBackend {
     pass.end();
   }
 
+  private createDrawArgs(): GPUBuffer {
+    return this.device.createBuffer({
+      label: "spark-native-draw-count",
+      size: 32,
+      usage:
+        GPUBufferUsage.INDIRECT |
+        GPUBufferUsage.STORAGE |
+        GPUBufferUsage.COPY_SRC |
+        GPUBufferUsage.COPY_DST,
+    });
+  }
+
+  /**
+   * True from a radix sort's submit until the GPU has executed it. Like the
+   * WebGL worker sort, the next sort of an unchanged mapping waits for it.
+   */
+  sortInFlight = false;
+
+  /**
+   * Give the working slot the committed radix ordering and draw count: a new
+   * generation of the same splat mapping draws with the previous order, as
+   * WebGL displays a regenerated accumulator before its sort completes.
+   */
+  reuseActiveOrdering(orderingRows: number): boolean {
+    const active = this.activeRenderSlot();
+    const slot = this.orderingRenderSlot("working");
+    if (
+      !this.pendingRenderSlot ||
+      active === slot ||
+      !active.indirect ||
+      !active.orderingTexture ||
+      !active.nativeDrawArgs ||
+      active.orderingRows < orderingRows ||
+      (active.orderingTexture.usage & GPUTextureUsage.COPY_SRC) === 0
+    )
+      return false;
+    const texture = this.ensureGpuOrderingTexture(slot, 4096, orderingRows);
+    slot.nativeDrawArgs ??= this.createDrawArgs();
+    const encoder = this.device.createCommandEncoder({
+      label: "spark-reuse-ordering",
+    });
+    encoder.copyTextureToTexture(
+      { texture: active.orderingTexture },
+      { texture },
+      [4096, orderingRows],
+    );
+    encoder.copyBufferToBuffer(
+      active.nativeDrawArgs,
+      0,
+      slot.nativeDrawArgs,
+      0,
+      32,
+    );
+    this.device.queue.submit([encoder.finish()]);
+    slot.indirect = true;
+    slot.orderingGeneration = slot.generation;
+    this.syncLegacyFields(slot);
+    return true;
+  }
+
   private countNativeDraw(
     encoder: GPUCommandEncoder,
     slot: WebGPURenderSlot,
@@ -1366,14 +1426,7 @@ export class WebGPUSplatBackend {
     const uniform = this.nativeSortUniform;
     if (!pipeline || !uniform)
       throw new Error("Spark: native draw count pipeline is unavailable");
-    slot.nativeDrawArgs ??= this.device.createBuffer({
-      label: "spark-native-draw-count",
-      size: 32,
-      usage:
-        GPUBufferUsage.INDIRECT |
-        GPUBufferUsage.STORAGE |
-        GPUBufferUsage.COPY_SRC,
-    });
+    slot.nativeDrawArgs ??= this.createDrawArgs();
     const pass = encoder.beginComputePass({ label: "spark-native-draw-count" });
     pass.setPipeline(pipeline);
     pass.setBindGroup(
@@ -1937,6 +1990,7 @@ export class WebGPUSplatBackend {
     const usage =
       GPUTextureUsage.TEXTURE_BINDING |
       GPUTextureUsage.STORAGE_BINDING |
+      GPUTextureUsage.COPY_SRC |
       GPUTextureUsage.COPY_DST;
     if (
       slot.orderingTexture &&
@@ -1962,6 +2016,7 @@ export class WebGPUSplatBackend {
    * No mapAsync. Returns false if the GPU sort path cannot run.
    */
   private nativeKeysBuffer: GPUBuffer | null = null;
+  private sortSequence = 0;
 
   async gpuDepthSortAndPack(params: {
     numSplats: number;
@@ -2055,6 +2110,14 @@ export class WebGPUSplatBackend {
     this.countNativeDraw(encoder, orderSlot, depths, sorted);
     this.useIndirectDraw = true;
     device.queue.submit([encoder.finish()]);
+    this.sortInFlight = true;
+    const sequence = ++this.sortSequence;
+    device.queue.onSubmittedWorkDone().then(
+      () => {
+        if (sequence === this.sortSequence) this.sortInFlight = false;
+      },
+      () => {},
+    );
     orderSlot.orderingGeneration = orderSlot.generation;
     this.syncLegacyFields(orderSlot);
     return true;

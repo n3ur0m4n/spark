@@ -29,6 +29,12 @@ export class SparkNativeRenderer {
   private readonly hostViewport = new THREE.Vector4();
   private sequence = 0;
   private currentSignature = "";
+  /** Mapping (signature without the view) of the last radix-sorted ordering. */
+  private sortedMapping = "";
+  private lastSortTime = Number.NEGATIVE_INFINITY;
+  /** The committed ordering was sorted for an earlier view. */
+  private orderingStale = false;
+  private staleTimeout: ReturnType<typeof setTimeout> | undefined;
   private updateQueue: Promise<SplatMesh[]> = Promise.resolve([]);
   private worker: SplatWorker | null = null;
   private ordering = new Uint32Array(0);
@@ -575,14 +581,16 @@ export class SparkNativeRenderer {
       });
       next.numSplats = Math.max(next.numSplats, base + count);
     }
-    const signature = JSON.stringify([
+    const view = JSON.stringify([
+      next.viewToWorld.toArray(),
+      next.viewOrigin.toArray(),
+      next.viewDirection.toArray(),
+    ]);
+    const mapping = JSON.stringify([
       sortMode,
       sortRadial,
       sortCullCos,
       owner.accumExtSplats,
-      next.viewToWorld.toArray(),
-      next.viewOrigin.toArray(),
-      next.viewDirection.toArray(),
       visible.map((node, i) => [
         node.uuid,
         node.version,
@@ -595,6 +603,7 @@ export class SparkNativeRenderer {
         this.identity(mesh.secondary),
         ...mesh.sh.map((array) => this.identity(array)),
         this.identity(mesh.indices),
+        mesh.indicesVersion,
         mesh.base,
         mesh.count,
         mesh.revision,
@@ -607,7 +616,9 @@ export class SparkNativeRenderer {
         mesh.shMaxOpacity,
       ]),
     ]);
-    if (signature === this.currentSignature) {
+    const signature = view + mapping;
+    // A stale ordering still gets its final sort once the view settles.
+    if (signature === this.currentSignature && !this.orderingStale) {
       next.dispose();
       return visible;
     }
@@ -630,7 +641,24 @@ export class SparkNativeRenderer {
         sortCullCos,
       });
       const rows = Math.max(1, Math.ceil(next.numSplats / 16384));
-      if (
+      const now = performance.now();
+      // Like WebGL, which displays a regenerated accumulator with the last
+      // ordering while its worker sort runs: one radix sort at a time (and no
+      // more often than minSortIntervalMs) for a view-only change. Validity
+      // is view-independent only without the sort cone.
+      const reuse =
+        sortMode === "radix" &&
+        next.numSplats > 0 &&
+        sortCullCos === -2 &&
+        mapping === this.sortedMapping &&
+        signature !== this.currentSignature &&
+        (this.backend.sortInFlight ||
+          now < this.lastSortTime + owner.minSortIntervalMs) &&
+        this.backend.reuseActiveOrdering(rows);
+      if (reuse) {
+        indirect = true;
+        activeSplats = meshes.reduce((sum, mesh) => sum + mesh.count, 0);
+      } else if (
         sortMode === "radix" &&
         next.numSplats > 0 &&
         (await this.backend.gpuDepthSortAndPack({
@@ -645,7 +673,10 @@ export class SparkNativeRenderer {
       ) {
         indirect = true;
         activeSplats = meshes.reduce((sum, mesh) => sum + mesh.count, 0);
+        this.sortedMapping = mapping;
+        this.lastSortTime = now;
       } else {
+        this.sortedMapping = "";
         const readback = await this.backend.readNativeDepths(next.numSplats);
         if (this.disposed || sequence !== this.sequence)
           throw new Error(
@@ -690,14 +721,34 @@ export class SparkNativeRenderer {
       owner.sortedDir.copy(next.viewDirection);
       owner.setDirty();
       this.currentSignature = signature;
+      this.orderingStale = reuse;
+      if (reuse) this.scheduleFinalSort();
       return visible;
     } catch (error) {
+      this.sortedMapping = "";
       this.backend.cancelRenderSlotUpdate(generation);
       next.dispose();
       throw error;
     } finally {
       owner.sorting = false;
     }
+  }
+
+  /** On-demand apps re-render (and so sort) once the next sort may run. */
+  private scheduleFinalSort() {
+    clearTimeout(this.staleTimeout);
+    const poll = () => {
+      this.staleTimeout = undefined;
+      if (this.disposed || !this.orderingStale) return;
+      const wait =
+        this.lastSortTime + this.owner.minSortIntervalMs - performance.now();
+      if (this.backend.sortInFlight || wait > 0) {
+        this.staleTimeout = setTimeout(poll, Math.max(1, wait));
+        return;
+      }
+      this.owner.setDirty();
+    };
+    this.staleTimeout = setTimeout(poll, 1);
   }
 
   /** Paged meshes read SplatPager's page pool through their LoD selection. */
@@ -772,6 +823,7 @@ export class SparkNativeRenderer {
     if (this.disposed) return;
     this.disposed = true;
     this.sequence++;
+    clearTimeout(this.staleTimeout);
     this.worker?.dispose();
     this.worker = null;
     this.composite?.dispose();
