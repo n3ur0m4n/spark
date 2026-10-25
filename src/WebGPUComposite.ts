@@ -6,6 +6,7 @@ export type CompositeAttachments = { color: GPUTexture; depth: GPUTexture };
 /** Owns the linear color/depth target shared by Three.js and the splat pass. */
 export class WebGPUComposite {
   private outputKey = "";
+  private hdr = true;
 
   private constructor(
     private readonly target: THREE.RenderTarget,
@@ -64,6 +65,17 @@ export class WebGPUComposite {
       throw new Error(
         "Spark: native composition currently requires the canvas target outside XR; use WebGL for this scene.",
       );
+    }
+    // Without tone mapping the canvas clamps to [0, 1] anyway, so an sRGB
+    // 8-bit target (linear blending, half the bandwidth of half float) is
+    // enough. The splat pass is fill-rate bound: this is its main cost.
+    const hdr = renderer.toneMapping !== THREE.NoToneMapping;
+    if (hdr !== this.hdr) {
+      this.hdr = hdr;
+      const texture = this.target.texture;
+      texture.type = hdr ? THREE.HalfFloatType : THREE.UnsignedByteType;
+      texture.colorSpace = hdr ? THREE.NoColorSpace : THREE.SRGBColorSpace;
+      this.target.dispose();
     }
     const size = renderer.getDrawingBufferSize(new THREE.Vector2());
     this.target.setSize(size.x, size.y);

@@ -30,7 +30,10 @@ try {
   const texture=renderer.backend.get(spark.native.composite.target.texture).texture;
   const buffer=device.createBuffer({size:256,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
   const encoder=device.createCommandEncoder();encoder.copyTextureToBuffer({texture,origin:{x:Math.floor(texture.width/2),y:Math.floor(texture.height/2)}},{buffer,bytesPerRow:256},{width:1,height:1});device.queue.submit([encoder.finish()]);
-  await buffer.mapAsync(GPUMapMode.READ);const values=Array.from(new Uint16Array(buffer.getMappedRange()).slice(0,4));buffer.unmap();buffer.destroy();
+  await buffer.mapAsync(GPUMapMode.READ);
+  // The composite target is rgba8unorm-srgb without tone mapping, rgba16float with it.
+  const u8=texture.format.startsWith('rgba8'),range=buffer.getMappedRange(),values=u8?Array.from(new Uint8Array(range).slice(0,4)):Array.from(new Uint16Array(range).slice(0,4));buffer.unmap();buffer.destroy();
+  if(u8)return values.map((v,i)=>{const c=v/255;return i===3?c:c<=.04045?c/12.92:((c+.055)/1.055)**2.4;});
   return values.map(v=>{const sign=(v&32768)?-1:1;const e=(v>>10)&31;const m=v&1023;return sign*(e===0?m*2**-24:e===31?(m?NaN:Infinity):(1+m/1024)*2**(e-15));});
  };
  const draw=async()=>{for(let i=0;i<30;i++){await spark.renderAsync(scene,camera);await new Promise(requestAnimationFrame);}await renderer.backend.device.queue.onSubmittedWorkDone();};

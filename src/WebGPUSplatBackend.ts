@@ -449,7 +449,7 @@ export class WebGPUSplatBackend {
         // @binding(5) var<uniform> fragUniforms: FragmentUniforms
         {
           binding: 5,
-          visibility: GPUShaderStage.FRAGMENT,
+          visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
           buffer: { type: "uniform" },
         },
       ],

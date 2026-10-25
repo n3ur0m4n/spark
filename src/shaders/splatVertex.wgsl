@@ -49,6 +49,13 @@ struct SparkUniforms {
 @group(0) @binding(2) var ordering: texture_2d<u32>;
 @group(0) @binding(3) var extSplats: texture_2d_array<u32>;
 @group(0) @binding(4) var extSplats2: texture_2d_array<u32>;
+// Leading fields of splatFragment.wgsl's FragmentUniforms (same buffer).
+struct ColorUniforms {
+    near: f32,
+    far: f32,
+    encodeLinear: u32,
+}
+@group(0) @binding(5) var<uniform> colorUniforms: ColorUniforms;
 
 // ============================================================================
 // Vertex input / output structs
@@ -197,6 +204,10 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     }
 
     rgba = vec4f(max(rgba.rgb, vec3f(0.0)), rgba.a);
+    // RGB is constant across the quad: convert once per splat, not per fragment.
+    if (colorUniforms.encodeLinear != 0u) {
+        rgba = vec4f(srgbToLinear(rgba.rgb), rgba.a);
+    }
     var adjustedStdDevLocal = uniforms.maxStdDev;
     if (rgba.a > 1.0) {
         // Stretch 1..2 to 1..5

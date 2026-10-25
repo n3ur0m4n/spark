@@ -22,7 +22,10 @@ async function fixture(renderer,sprite){
   const device=renderer.backend.device,texture=renderer.backend.get(spark.native.composite.target.texture).texture;
   const buffer=device.createBuffer({size:256,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ}),encoder=device.createCommandEncoder();
   encoder.copyTextureToBuffer({texture,origin:{x:32,y:32}},{buffer,bytesPerRow:256},{width:1,height:1});device.queue.submit([encoder.finish()]);
-  await buffer.mapAsync(GPUMapMode.READ);const values=[...new Uint16Array(buffer.getMappedRange()).slice(0,4)];buffer.unmap();buffer.destroy();
+  await buffer.mapAsync(GPUMapMode.READ);
+  // The composite target is rgba8unorm-srgb without tone mapping, rgba16float with it.
+  const u8=texture.format.startsWith('rgba8'),toLinear=v=>{const c=v/255;return c<=.04045?c/12.92:((c+.055)/1.055)**2.4;};const range=buffer.getMappedRange(),values=u8?[...new Uint8Array(range).slice(0,4)]:[...new Uint16Array(range).slice(0,4)];buffer.unmap();buffer.destroy();
+  if(u8)return values.map((v,i)=>Math.round(i<3?255*toLinear(v):v));
   return values.map(v=>{const sign=(v&32768)?-1:1,e=(v>>10)&31,m=v&1023;return Math.round(255*sign*(e===0?m*2**-24:e===31?(m?NaN:Infinity):(1+m/1024)*2**(e-15)));});
  };
  return {scene,camera,spark,host,draw,pixel,dispose(){spark.dispose();splats.dispose();host.geometry?.dispose();host.material.dispose();renderer.dispose();renderer.domElement.remove();}};

@@ -70,9 +70,7 @@ fn fs_main(input: FragmentInput) -> @location(0) vec4f {
         discard;
     }
 
-    if (fragUniforms.encodeLinear != 0u) {
-        rgba = vec4f(srgbToLinear(rgba.rgb), rgba.a);
-    }
+    // encodeLinear is applied per splat in splatVertex.wgsl.
 
     if (fragUniforms.stochastic != 0u) {
         // Keep the fragment with probability alpha, written opaque. Same
