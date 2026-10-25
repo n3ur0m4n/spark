@@ -33,23 +33,16 @@
   <script type="module">
     import * as THREE from "three";
     import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-    import { SparkRenderer, SplatMesh, getSparkRendererCapabilities } from "@sparkjsdev/spark";
+    import { SparkRenderer, SplatMesh, createRenderer } from "@sparkjsdev/spark";
 
     const status = document.querySelector("#status");
     const params = new URLSearchParams(location.search);
     const native = params.get("backend") !== "webgl";
     const sort = params.get("sort") === "radix" ? "radix" : "readback";
     try {
-      let renderer;
-      if (native) {
-        const { WebGPURenderer } = await import("three/webgpu");
-        renderer = new WebGPURenderer({ antialias: false });
-        await renderer.init();
-        if (getSparkRendererCapabilities(renderer).backend !== "webgpu") {
-          throw Error("Native WebGPU is unavailable. Choose Classic WebGL above.");
-        }
-      } else {
-        renderer = new THREE.WebGLRenderer({ antialias: false });
+      const { renderer, backend } = await createRenderer({ antialias: false, forceWebGL: !native });
+      if (native && backend !== "webgpu") {
+        throw Error("Native WebGPU is unavailable. Choose Classic WebGL above.");
       }
       renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
       renderer.setSize(innerWidth, innerHeight);

@@ -31,6 +31,24 @@ instances after invalid depths are excluded. Neither counts visible fragments.
 The reference implementation knows the actual count from its existing WASM
 sorter; `readRenderStatsAsync()` returns the same generation's counts.
 
+## Choosing the backend automatically
+
+`createRenderer(options)` returns `{ renderer, backend }`: an initialized
+`WebGPURenderer` (`backend: "webgpu"`) when `navigator.gpu` yields an adapter,
+otherwise a `THREE.WebGLRenderer` (`backend: "webgl"`). Pass `forceWebGL: true`
+to skip WebGPU, and `needs: [...]` with the features the app relies on: any
+entry of `WEBGPU_UNSUPPORTED_FEATURES` (for example `"paging"`, `"xr"`,
+`"modifiers"`, `"editing"`, `"skinning"`) selects WebGL. Other options go to the
+renderer constructor. With `backend: "webgpu"` render through
+`await spark.renderAsync(scene, camera)`.
+
+```ts
+const { renderer, backend } = await createRenderer({
+  antialias: false,
+  needs: ["paging"],
+});
+```
+
 ## Runnable example
 
 After building, open `/examples/native-webgpu/` on the development server. It uses

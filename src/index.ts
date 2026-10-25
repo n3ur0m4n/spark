@@ -127,3 +127,10 @@ export {
   type SparkRendererCapabilities,
 } from "./RendererCapabilities";
 export type { SparkHostRenderer } from "./RendererAdapter";
+
+export {
+  createRenderer,
+  WEBGPU_UNSUPPORTED_FEATURES,
+  type CreateRendererOptions,
+  type CreateRendererResult,
+} from "./createRenderer";
