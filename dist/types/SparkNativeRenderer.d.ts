@@ -36,5 +36,9 @@ export declare class SparkNativeRenderer {
     /** Runs ordinary mesh callbacks, then snapshots and commits one complete generation. */
     update(scene: THREE.Scene, camera: THREE.Camera): Promise<SplatMesh[]>;
     private updateFrame;
+    /** Paged meshes read SplatPager's page pool through their LoD selection. */
+    private pagedGeneration;
+    /** Snapshot of the compiled SplatEdits that SplatMesh.update() just encoded. */
+    private meshEdits;
     dispose(): void;
 }

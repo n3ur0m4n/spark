@@ -3,9 +3,10 @@ import type { PagedSplats } from "./PagedSplats";
 import * as dyno from "./dyno";
 export interface SplatPagerOptions {
     /**
-     * THREE.WebGLRenderer instance to upload texture data
+     * THREE.WebGLRenderer instance to upload texture data. Null for the native
+     * WebGPU path, which mirrors the CPU page layers itself.
      */
-    renderer: THREE.WebGLRenderer;
+    renderer: THREE.WebGLRenderer | null;
     /**
      * Whether to use extended Gsplat encoding for paged splats.
      * @default false
@@ -38,7 +39,9 @@ export interface SplatPagerOptions {
     onUpdate: () => void;
 }
 export declare class SplatPager {
-    readonly renderer: THREE.WebGLRenderer;
+    readonly renderer: THREE.WebGLRenderer | null;
+    /** Incremented whenever page data changes. */
+    uploadVersion: number;
     readonly extSplats: boolean;
     readonly maxPages: number;
     readonly maxSplats: number;

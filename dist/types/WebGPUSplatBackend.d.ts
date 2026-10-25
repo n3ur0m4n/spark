@@ -47,6 +47,10 @@ export declare class WebGPUSplatBackend {
      * composites the same way WebGL does when an app opts out.
      */
     premultipliedAlpha: boolean;
+    /** Sort-free stochastic draw (SparkRenderer stochasticActive) for the next frame. */
+    stochastic: boolean;
+    /** Same shaders, opaque output with depth writes (WebGL: NoBlending + depthWrite). */
+    private stochasticPipeline;
     splatEncoding: [number, number, number, number];
     sparkUniformBuffer: GPUBuffer;
     projMatrixBuffer: GPUBuffer;
@@ -315,6 +319,8 @@ export declare class WebGPUSplatBackend {
         viewOrigin: number[];
         viewDirection: number[];
         sortRadial: boolean;
+        /** cos(sortCullFov / 2), or -2 when cone culling is off. */
+        sortCullCos: number;
     }): void;
     readNativeDepths(count: number): Promise<Uint32Array<ArrayBuffer>>;
     /** Explicit diagnostic readback; never inserted into the normal radix loop. */

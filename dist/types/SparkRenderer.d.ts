@@ -416,7 +416,8 @@ export declare class SparkRenderer<R extends SparkHostRenderer = THREE.WebGLRend
     private stochasticPose;
     private stochasticMoveTime;
     private stochasticTimeoutId;
-    private stochasticActive;
+    /** @internal Also read by the native WebGPU renderer. */
+    stochasticActive: boolean;
     private stochasticSaved;
     readonly timer: THREE.Timer;
     private readonly ownsTimer;
@@ -643,7 +644,8 @@ export declare class SparkRenderer<R extends SparkHostRenderer = THREE.WebGLRend
     onBeforeRender(renderer: SparkHostRenderer, scene: THREE.Scene, camera: THREE.Camera): void | Promise<void>;
     private readonly orderingTrace;
     onAfterRender(_renderer: SparkHostRenderer, _scene: THREE.Scene, camera: THREE.Camera): void;
-    private updateStochastic;
+    /** @internal Also called by the native WebGPU renderer per canvas frame. */
+    updateStochastic(camera: THREE.Camera): void;
     clearSplats(): void;
     update({ scene, camera, }: {
         scene: THREE.Scene;
