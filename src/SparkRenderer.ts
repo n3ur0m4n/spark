@@ -1539,156 +1539,166 @@ export class SparkRenderer<
     this.sortDirty = false;
     this.lastSortTime = now;
 
-    if (this.readPause > 0) {
-      await new Promise((resolve) => setTimeout(resolve, this.readPause));
-    }
-
-    if (this.isDisposed) {
-      return;
-    }
-
-    const current = this.current;
-    const traceRequest = this.orderingTrace.request(
-      current,
-      this.sortRadial ?? true,
-    );
-
-    this.sortedCenter.copy(current.viewOrigin);
-    this.sortedDir.copy(current.viewDirection);
-
-    const { numSplats, maxSplats } = current;
-    const rows = Math.max(1, Math.ceil(maxSplats / 16384));
-    const orderingMaxSplats = rows * 16384;
-    this.maxSplats = Math.max(this.maxSplats, orderingMaxSplats);
-
-    const readback = Readback.ensureBuffer(maxSplats, this.readback32);
-    this.readback32 = readback;
-
-    await this.readbackDepth({
-      current,
-      renderer: this.requireWebGLRenderer(),
-      numSplats,
-      readback,
-    });
-
-    if (this.sortPause > 0) {
-      await new Promise((resolve) => setTimeout(resolve, this.sortPause));
-    }
-
-    if (this.isDisposed) {
-      return;
-    }
-    const threads = Math.floor(this.sortThreads);
-    let ordering: Uint32Array;
-    let activeSplats: number;
-    if (
-      threads > 1 &&
-      numSplats >= SORT_PARALLEL_MIN_SPLATS &&
-      globalThis.crossOriginIsolated
-    ) {
-      // Read back into the regular buffer (readPixels into shared memory is
-      // not portable), then one copy into the shared keys.
-      const buffers = ensureParallelSortBuffers(
-        this.parallelSortBuffers,
-        this.maxSplats,
-        threads,
-      );
-      this.parallelSortBuffers = buffers;
-      buffers.keys.set(readback.subarray(0, numSplats));
-      while (this.sortPool.length < threads) {
-        this.sortPool.push(new SplatWorker());
+    try {
+      if (this.readPause > 0) {
+        await new Promise((resolve) => setTimeout(resolve, this.readPause));
       }
-      const sortPool = this.sortPool;
-      const parallelSort = this.sort16 ? parallelSort16 : parallelSort32;
-      activeSplats = await parallelSort({
+
+      if (this.isDisposed) {
+        return;
+      }
+
+      const current = this.current;
+      const traceRequest = this.orderingTrace.request(
+        current,
+        this.sortRadial ?? true,
+      );
+
+      this.sortedCenter.copy(current.viewOrigin);
+      this.sortedDir.copy(current.viewDirection);
+
+      const { numSplats, maxSplats } = current;
+      const rows = Math.max(1, Math.ceil(maxSplats / 16384));
+      const orderingMaxSplats = rows * 16384;
+      this.maxSplats = Math.max(this.maxSplats, orderingMaxSplats);
+
+      const readback = Readback.ensureBuffer(maxSplats, this.readback32);
+      this.readback32 = readback;
+
+      await this.readbackDepth({
+        current,
+        renderer: this.requireWebGLRenderer(),
         numSplats,
-        buffers,
-        call: (w, name, args) => sortPool[w].call(name, args as never),
+        readback,
       });
-      // WebGL may reject uploads from shared memory: copy to a regular array
-      ordering = this.orderingBuffers.take(this.maxSplats);
-      ordering.set(buffers.ordering.subarray(0, activeSplats));
-    } else {
-      if (!this.sortWorker) {
-        this.sortWorker = new SplatWorker();
+
+      if (this.sortPause > 0) {
+        await new Promise((resolve) => setTimeout(resolve, this.sortPause));
       }
-      const result = await this.sortWorker.call(
-        this.sort16 ? "sortSplats32as16" : "sortSplats32",
-        {
-          numSplats,
-          readback,
-          ordering: this.orderingBuffers.take(this.maxSplats),
-        },
-      );
-      this.readback32 = result.readback;
-      ordering = result.ordering;
-      activeSplats = result.activeSplats;
-    }
 
-    const traceCompletedAt = this.orderingTrace.complete(traceRequest);
-
-    if (this.sortDelay > 0) {
-      await new Promise((resolve) => setTimeout(resolve, this.sortDelay));
-    }
-
-    if (this.isDisposed) {
-      return;
-    }
-
-    this.activeSplats = activeSplats;
-
-    if (this.orderingTexture) {
-      if (rows > this.orderingTexture.image.height) {
-        this.orderingTexture.dispose();
-        this.orderingTexture = null;
+      if (this.isDisposed) {
+        return;
       }
-    }
-
-    if (!this.orderingTexture) {
-      // console.log(`Allocating orderingTexture: ${4096}x${rows}`);
-      const orderingTexture = new THREE.DataTexture(
-        ordering,
-        4096,
-        rows,
-        THREE.RGBAIntegerFormat,
-        THREE.UnsignedIntType,
-      );
-      orderingTexture.internalFormat = "RGBA32UI";
-      orderingTexture.needsUpdate = true;
-      this.orderingBuffers.attach(orderingTexture, ordering);
-      this.orderingTexture = orderingTexture;
-    } else {
-      this.orderingBuffers.attach(this.orderingTexture, ordering);
-      const renderer = this.requireWebGLRenderer();
-      if (!renderer.properties.has(this.orderingTexture)) {
-        this.orderingTexture.needsUpdate = true;
-      } else {
-        // Only rows holding the first activeSplats entries are ever read
-        // (instanceCount = activeSplats, 4096 RGBA texels = 16384 per row).
-        uploadU32DataTextureRows(
-          renderer,
-          this.orderingTexture,
-          4096,
-          Math.max(1, Math.ceil(activeSplats / 16384)),
-          ordering,
+      const threads = Math.floor(this.sortThreads);
+      let ordering: Uint32Array;
+      let activeSplats: number;
+      if (
+        threads > 1 &&
+        numSplats >= SORT_PARALLEL_MIN_SPLATS &&
+        globalThis.crossOriginIsolated
+      ) {
+        // Read back into the regular buffer (readPixels into shared memory is
+        // not portable), then one copy into the shared keys.
+        const buffers = ensureParallelSortBuffers(
+          this.parallelSortBuffers,
+          this.maxSplats,
+          threads,
         );
+        this.parallelSortBuffers = buffers;
+        buffers.keys.set(readback.subarray(0, numSplats));
+        while (this.sortPool.length < threads) {
+          this.sortPool.push(new SplatWorker());
+        }
+        const sortPool = this.sortPool;
+        const parallelSort = this.sort16 ? parallelSort16 : parallelSort32;
+        activeSplats = await parallelSort({
+          numSplats,
+          buffers,
+          call: (w, name, args) => sortPool[w].call(name, args as never),
+        });
+        // WebGL may reject uploads from shared memory: copy to a regular array
+        ordering = this.orderingBuffers.take(this.maxSplats);
+        ordering.set(buffers.ordering.subarray(0, activeSplats));
+      } else {
+        if (!this.sortWorker) {
+          this.sortWorker = new SplatWorker();
+        }
+        const result = await this.sortWorker.call(
+          this.sort16 ? "sortSplats32as16" : "sortSplats32",
+          {
+            numSplats,
+            readback,
+            ordering: this.orderingBuffers.take(this.maxSplats),
+          },
+        );
+        this.readback32 = result.readback;
+        ordering = result.ordering;
+        activeSplats = result.activeSplats;
       }
-    }
 
-    // console.log(`Sorted (${this.minSortIntervalMs}) ${numSplats} splats in ${(performance.now() - now).toFixed(0)} ms`);
+      const traceCompletedAt = this.orderingTrace.complete(traceRequest);
 
-    this.orderingTrace.commit(traceRequest, traceCompletedAt, activeSplats);
-
-    if (this.current.mappingVersion === current.mappingVersion) {
-      if (this.current.mappingVersion !== this.display.mappingVersion) {
-        this.accumulators.push(this.display);
-        this.display = this.current;
+      if (this.sortDelay > 0) {
+        await new Promise((resolve) => setTimeout(resolve, this.sortDelay));
       }
-    }
-    this.sorting = false;
-    this.setDirty();
 
-    this.driveSort().catch((error) => this.dropErrorIfDisposed(error));
+      if (this.isDisposed) {
+        return;
+      }
+
+      this.activeSplats = activeSplats;
+
+      if (this.orderingTexture) {
+        if (rows > this.orderingTexture.image.height) {
+          this.orderingTexture.dispose();
+          this.orderingTexture = null;
+        }
+      }
+
+      if (!this.orderingTexture) {
+        // console.log(`Allocating orderingTexture: ${4096}x${rows}`);
+        const orderingTexture = new THREE.DataTexture(
+          ordering,
+          4096,
+          rows,
+          THREE.RGBAIntegerFormat,
+          THREE.UnsignedIntType,
+        );
+        orderingTexture.internalFormat = "RGBA32UI";
+        orderingTexture.needsUpdate = true;
+        this.orderingBuffers.attach(orderingTexture, ordering);
+        this.orderingTexture = orderingTexture;
+      } else {
+        this.orderingBuffers.attach(this.orderingTexture, ordering);
+        const renderer = this.requireWebGLRenderer();
+        if (!renderer.properties.has(this.orderingTexture)) {
+          this.orderingTexture.needsUpdate = true;
+        } else {
+          // Only rows holding the first activeSplats entries are ever read
+          // (instanceCount = activeSplats, 4096 RGBA texels = 16384 per row).
+          uploadU32DataTextureRows(
+            renderer,
+            this.orderingTexture,
+            4096,
+            Math.max(1, Math.ceil(activeSplats / 16384)),
+            ordering,
+          );
+        }
+      }
+
+      // console.log(`Sorted (${this.minSortIntervalMs}) ${numSplats} splats in ${(performance.now() - now).toFixed(0)} ms`);
+
+      this.orderingTrace.commit(traceRequest, traceCompletedAt, activeSplats);
+
+      if (this.current.mappingVersion === current.mappingVersion) {
+        if (this.current.mappingVersion !== this.display.mappingVersion) {
+          this.accumulators.push(this.display);
+          this.display = this.current;
+        }
+      }
+      this.setDirty();
+    } catch (error) {
+      // Disposing the worker rejects its outstanding call. That cancellation
+      // must not revive resources or escape a scheduled background sort.
+      if (this.isDisposed) return;
+      this.sortDirty = true;
+      throw error;
+    } finally {
+      this.sorting = false;
+    }
+    if (!this.isDisposed) {
+      this.driveSort().catch((error) => this.dropErrorIfDisposed(error));
+    }
   }
 
   private ensureLodWorker() {
