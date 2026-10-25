@@ -45,7 +45,7 @@ flat in vec2 vPickAux;
 // than alpha also sidesteps any doubt about alpha-clear clamping.
 // Keep this formula in sync with pickAsync()'s farBig in SparkRenderer.ts.
 float farBig() {
-    return min(far * 4.0, 60000.0);
+    return min(max(far * 4.0, 1e4), 60000.0);
 }
 
 void main() {
