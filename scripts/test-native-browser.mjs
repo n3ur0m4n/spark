@@ -54,6 +54,7 @@ try {
     "native-radix-fallback",
     "native-paged",
     "native-edits",
+    "native-sortcull",
   ]) {
     const page = await browser.newPage();
     const pageErrors = [];

@@ -84,8 +84,9 @@ describe("createRenderer", () => {
     stubGpu({});
     expect(WEBGPU_UNSUPPORTED_FEATURES).not.toContain("paging");
     expect(WEBGPU_UNSUPPORTED_FEATURES).not.toContain("editing");
+    expect(WEBGPU_UNSUPPORTED_FEATURES).not.toContain("sortCull");
     const { backend } = await createRenderer({
-      needs: ["multipleSplatMeshes", "paging", "editing"],
+      needs: ["multipleSplatMeshes", "paging", "editing", "sortCull"],
     });
     expect(backend).toBe("webgpu");
   });

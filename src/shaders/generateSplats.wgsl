@@ -7,7 +7,7 @@ struct GenerateUniforms {
     rotation: vec4f,
     translationScale: vec4f,
     viewOrigin: vec4f,
-    viewDirection: vec4f,
+    viewDirection: vec4f, // w: sort cone cos(sortCullFov / 2), -2 when off
     localViewOrigin: vec4f,
     encoding: vec4f,
     shMaxOpacity: vec4f,
@@ -186,10 +186,15 @@ fn generate(@builtin(workgroup_id) group: vec3u,
     // SplatMesh applies RGBA/displace edits in world space after recoloring.
     applyEdits(&center, &splat.rgba);
     let delta = center - frame.viewOrigin.xyz;
+    let dist = length(delta);
     var metric = dot(delta, frame.viewDirection.xyz) + 100.0;
-    if (frame.sortRadial != 0u) { metric = length(delta); }
+    if (frame.sortRadial != 0u) { metric = dist; }
     // Negative/NaN/infinite bit patterns are excluded by upstream sort32.
     depths[dst] = bitcast<u32>(metric);
+    // Outside the sort cone (sortCullFov) the depth stays +inf: not drawn.
+    if (dist > 0.0 && dot(delta, frame.viewDirection.xyz) < frame.viewDirection.w * dist) {
+        depths[dst] = 0x7f800000u;
+    }
     let scales = splat.scales * frame.translationScale.w;
     let rotation = quatQuat(frame.rotation, splat.quaternion);
     if (frame.outputExt != 0u) {

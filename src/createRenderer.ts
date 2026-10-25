@@ -7,7 +7,7 @@ import { getSparkRendererCapabilities } from "./RendererCapabilities";
  * falls back to WebGL when `needs` lists one of them; remove entries as native
  * support lands. The first group mirrors the features SparkNativeRenderer and
  * getSparkRendererCapabilities() reject; the second is fork-only WebGL work
- * (pickAsync, stochastic transparency, sort cone culling) the native path
+ * (pickAsync, stochastic transparency) the native path
  * does not implement.
  */
 export const WEBGPU_UNSUPPORTED_FEATURES = [
@@ -28,7 +28,6 @@ export const WEBGPU_UNSUPPORTED_FEATURES = [
   "arrayCameras",
   "pickAsync",
   "stochastic",
-  "sortCull",
 ] as const;
 
 export type CreateRendererOptions = THREE.WebGLRendererParameters &

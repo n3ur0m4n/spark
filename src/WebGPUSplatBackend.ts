@@ -1041,6 +1041,8 @@ export class WebGPUSplatBackend {
     viewOrigin: number[];
     viewDirection: number[];
     sortRadial: boolean;
+    /** cos(sortCullFov / 2), or -2 when cone culling is off. */
+    sortCullCos: number;
   }): void {
     const { device } = this;
     const slot = this.writeRenderSlot();

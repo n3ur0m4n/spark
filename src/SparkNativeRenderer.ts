@@ -353,6 +353,12 @@ export class SparkNativeRenderer {
     const owner = this.owner;
     const sortRadial = owner.sortRadial;
     const sortMode = owner.webgpuSort;
+    // Same cone as SparkRenderer.updateInternal (sortCullFov).
+    const sortCullCos =
+      owner.sortCullFov > 0 &&
+      !(camera as THREE.OrthographicCamera).isOrthographicCamera
+        ? Math.cos((Math.min(owner.sortCullFov, 360) * Math.PI) / 360)
+        : -2;
     const next = new SplatAccumulator({
       extSplats: owner.accumExtSplats,
       covSplats: false,
@@ -509,6 +515,7 @@ export class SparkNativeRenderer {
     const signature = JSON.stringify([
       sortMode,
       sortRadial,
+      sortCullCos,
       owner.accumExtSplats,
       next.viewToWorld.toArray(),
       next.viewOrigin.toArray(),
@@ -557,6 +564,7 @@ export class SparkNativeRenderer {
         viewOrigin: next.viewOrigin.toArray(),
         viewDirection: next.viewDirection.toArray(),
         sortRadial,
+        sortCullCos,
       });
       const rows = Math.max(1, Math.ceil(next.numSplats / 16384));
       if (

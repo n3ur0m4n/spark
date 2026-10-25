@@ -280,6 +280,7 @@ export class WebGPUGeneration {
       viewOrigin: number[];
       viewDirection: number[];
       sortRadial: boolean;
+      sortCullCos: number;
       timestampWrites?: () => GPUComputePassTimestampWrites | undefined;
     },
   ) {
@@ -378,6 +379,7 @@ export class WebGPUGeneration {
       f32.set(mesh.translationScale, 12);
       f32.set(args.viewOrigin, 16);
       f32.set(args.viewDirection, 20);
+      f32[23] = args.sortCullCos;
       f32.set(mesh.localViewOrigin, 24);
       f32.set(mesh.encoding, 28);
       f32.set(mesh.shMaxOpacity, 32);
