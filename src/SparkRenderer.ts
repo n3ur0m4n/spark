@@ -56,7 +56,11 @@ export interface SparkRendererOptions<
    * rendering and significantly reduces performance.
    */
   renderer: R;
-  /** Native sort implementation. The reference uses GPU-generated depths and WASM sorting. */
+  /**
+   * Native sort implementation. "radix" (default) sorts on the GPU with no
+   * readback; "readback" uses GPU-generated depths and WASM sorting on the CPU,
+   * which stalls every frame while the camera moves.
+   */
   webgpuSort?: "readback" | "radix";
   /**
    * Callback function to be called when SparkRenderer needs to re-render,
@@ -721,7 +725,7 @@ export class SparkRenderer<
 
     super(geometry, material);
     this.adapter = adapter;
-    this.webgpuSort = options.webgpuSort ?? "readback";
+    this.webgpuSort = options.webgpuSort ?? "radix";
     if (adapter.kind === "webgpu") {
       geometry.dispose();
       material.dispose();

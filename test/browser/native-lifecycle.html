@@ -8,7 +8,7 @@ renderer.backend.device.addEventListener('uncapturederror',e=>errors.push(e.erro
 const camera=new THREE.PerspectiveCamera(60,1,.1,100);camera.position.z=4;const scene=new THREE.Scene();
 let spark;
 try{
- spark=new SparkRenderer({renderer,enableLod:false});scene.add(spark);
+ spark=new SparkRenderer({renderer,enableLod:false,webgpuSort:'readback'});scene.add(spark);
  await spark.renderAsync(scene,camera);check('empty scene submits',spark.activeSplats===0);
  const mesh=new SplatMesh({constructSplats:data=>data.pushSplat(new THREE.Vector3(),new THREE.Vector3(.2,.2,.2),new THREE.Quaternion(),0,new THREE.Color(1,0,0))});await mesh.initialized;scene.add(mesh);
  await spark.renderAsync(scene,camera);check('zero opacity retains upstream depth entry',spark.activeSplats===1);
