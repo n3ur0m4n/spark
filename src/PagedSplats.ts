@@ -79,6 +79,8 @@ export class PagedSplats implements SplatSource {
   sh3Codes?: Uint32Array | [Uint32Array, Uint32Array];
 
   numSplats: number;
+  /** Bumped by update(): the native path re-uploads indices only on change. */
+  indicesVersion = 0;
   splatEncoding?: SplatEncoding;
   radMetaPromise?: Promise<{ meta: RadMeta; chunksStart: number }>;
 
@@ -326,6 +328,7 @@ export class PagedSplats implements SplatSource {
 
     const renderer = this.pager.renderer;
     this.numSplats = numSplats;
+    this.indicesVersion++;
     this.dynoNumSplats.value = this.numSplats;
     const rows = Math.ceil(numSplats / 16384);
 

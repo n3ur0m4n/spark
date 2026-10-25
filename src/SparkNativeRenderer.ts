@@ -724,6 +724,7 @@ export class SparkNativeRenderer {
       base,
       count,
       indices,
+      indicesVersion: source.indicesVersion,
       rotation: transform.rotate.value.toArray(),
       translationScale: [
         ...transform.translate.value.toArray(),

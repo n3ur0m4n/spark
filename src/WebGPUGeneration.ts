@@ -18,6 +18,8 @@ export type NativeMeshGeneration = {
   base: number;
   count: number;
   indices?: Uint32Array;
+  /** Changes whenever the contents of indices change (same array reused). */
+  indicesVersion?: number;
   rotation: number[];
   translationScale: number[];
   localViewOrigin: number[];
@@ -58,6 +60,8 @@ export class WebGPUGeneration {
   private readonly meshes: {
     uniform: GPUBuffer;
     indices: GPUBuffer;
+    /** What indices holds, to skip re-uploading an unchanged selection. */
+    indicesKey?: [Uint32Array, number | undefined, number];
     edits: GPUBuffer;
   }[] = [];
   private disposed = false;
@@ -334,14 +338,26 @@ export class WebGPUGeneration {
             GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
             "native-selection",
           );
+          state.indicesKey = undefined;
         }
-        this.device.queue.writeBuffer(
-          state.indices,
-          0,
-          mesh.indices.buffer,
-          mesh.indices.byteOffset,
-          mesh.count * 4,
-        );
+        const key = state.indicesKey;
+        if (
+          // Unversioned indices may be rewritten in place: always upload.
+          mesh.indicesVersion === undefined ||
+          !key ||
+          key[0] !== mesh.indices ||
+          key[1] !== mesh.indicesVersion ||
+          key[2] < mesh.count
+        ) {
+          this.device.queue.writeBuffer(
+            state.indices,
+            0,
+            mesh.indices.buffer,
+            mesh.indices.byteOffset,
+            mesh.count * 4,
+          );
+          state.indicesKey = [mesh.indices, mesh.indicesVersion, mesh.count];
+        }
       }
       const edits = mesh.edits?.numEdits ? mesh.edits : undefined;
       if (edits) {
