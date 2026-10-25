@@ -57,6 +57,11 @@ struct ColorUniforms {
 }
 @group(0) @binding(5) var<uniform> colorUniforms: ColorUniforms;
 
+// Lines starting with "//PICK " are active only in the GPU pick variant
+// (pickVertexWgsl() strips the prefix), mirroring SPARK_PICK_DEPTH in
+// splatVertex.glsl: per-fragment depth of the Gaussian's max-density point
+// along the pixel ray (see splatPickFragment.wgsl).
+
 // ============================================================================
 // Vertex input / output structs
 // ============================================================================
@@ -73,6 +78,11 @@ struct VertexOutput {
     @location(2) vNdc: vec3f,
     @location(3) @interpolate(flat) vSplatIndex: u32,
     @location(4) @interpolate(flat) adjustedStdDev: f32,
+//PICK     @location(5) vPickRay: vec3f,                            // view-space ray dir with z = -1
+//PICK     @location(6) @interpolate(flat) vPickCenter: vec3f,      // view-space splat center
+//PICK     @location(7) @interpolate(flat) vPickSinvDiag: vec3f,    // inverse(cov3D) up to scale: diagonal
+//PICK     @location(8) @interpolate(flat) vPickSinvOff: vec3f,     // ... off-diagonal (xy, xz, yz)
+//PICK     @location(9) @interpolate(flat) vPickAux: vec2f,         // x = regularized sqrt(cov zz), y = 1 -> center/NDC depth
 }
 
 // ============================================================================
@@ -87,6 +97,11 @@ fn discardVertex() -> VertexOutput {
     out.vNdc = vec3f(0.0);
     out.vSplatIndex = 0u;
     out.adjustedStdDev = 0.0;
+//PICK     out.vPickRay = vec3f(0.0, 0.0, -1.0);
+//PICK     out.vPickCenter = vec3f(0.0);
+//PICK     out.vPickSinvDiag = vec3f(0.0);
+//PICK     out.vPickSinvOff = vec3f(0.0);
+//PICK     out.vPickAux = vec2f(0.0, 1.0);
     return out;
 }
 
@@ -105,6 +120,11 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     output.vNdc = vec3f(0.0);
     output.vSplatIndex = 0u;
     output.adjustedStdDev = 0.0;
+//PICK     output.vPickRay = vec3f(0.0, 0.0, -1.0);
+//PICK     output.vPickCenter = vec3f(0.0);
+//PICK     output.vPickSinvDiag = vec3f(0.0);
+//PICK     output.vPickSinvOff = vec3f(0.0);
+//PICK     output.vPickAux = vec2f(0.0, 1.0);
 
     let instanceIndex = input.instanceIndex;
     let orderingCoord = vec2i(i32((instanceIndex >> 2u) & 4095u), i32(instanceIndex >> 14u));
@@ -273,6 +293,8 @@ fn vs_main(input: VertexInput) -> VertexOutput {
             let viewPos = viewCenter + quatVec(viewQuaternion, offset);
             output.position = projectionMatrix * vec4f(viewPos, 1.0);
             output.vNdc = output.position.xyz / output.position.w;
+//PICK             // Real quad geometry: vNdc depth is already exact -> fallback.
+//PICK             output.vPickCenter = viewCenter;
             return output;
         }
 
@@ -291,6 +313,16 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     // Compute the Jacobian of the splat's projection at its center
     let scaledRenderSize = uniforms.renderSize * uniforms.focalAdjustment;
     let focal = 0.5 * scaledRenderSize * vec2f(projectionMatrix[0][0], projectionMatrix[1][1]);
+
+    // NDC center of the splat
+    let ndcCenter = clipCenter.xyz / clipCenter.w;
+
+//PICK     // Cheap pre-test: the pick render covers exactly NDC [-1,1]^2 and a quad
+//PICK     // half-extent is at most sqrt(2) * maxPixelRadius pixels.
+//PICK     let maxExtNdc = (2.0 * 1.4142136 * uniforms.maxPixelRadius) / scaledRenderSize;
+//PICK     if (any(abs(ndcCenter.xy) > vec2f(1.0) + maxExtNdc)) {
+//PICK         return discardVertex();
+//PICK     }
 
     var J: mat3x3f;
     if (uniforms.isOrthographic != 0u) {
@@ -373,16 +405,45 @@ fn vs_main(input: VertexInput) -> VertexOutput {
         return discardVertex();
     }
 
+//PICK     // Exact early-out: bounds of the full quad vs the pick rectangle.
+//PICK     let extNdc = (2.0 / scaledRenderSize) * (abs(eigenVec1) * scale1 + abs(eigenVec2) * scale2);
+//PICK     if (any(ndcCenter.xy - extNdc > vec2f(1.0)) || any(ndcCenter.xy + extNdc < vec2f(-1.0))) {
+//PICK         return discardVertex();
+//PICK     }
+//PICK     {
+//PICK         // Same normalization/regularization as splatVertex.glsl; t* is
+//PICK         // invariant to the uniform scale of S, so it is never undone.
+//PICK         let covMax = max(max(cov3D[0][0], cov3D[1][1]), max(cov3D[2][2], 1e-30));
+//PICK         let epsRel = 1e-6;
+//PICK         let c = cov3D * (1.0 / covMax) + mat3x3f(vec3f(epsRel, 0.0, 0.0), vec3f(0.0, epsRel, 0.0), vec3f(0.0, 0.0, epsRel));
+//PICK         // Symmetric 3x3 inverse via the adjugate (WGSL has no inverse()).
+//PICK         let i00 = c[1][1] * c[2][2] - c[1][2] * c[2][1];
+//PICK         let i01 = c[0][2] * c[2][1] - c[0][1] * c[2][2];
+//PICK         let i02 = c[0][1] * c[1][2] - c[0][2] * c[1][1];
+//PICK         let invDet = 1.0 / (c[0][0] * i00 + c[1][0] * i01 + c[2][0] * i02);
+//PICK         let i11 = c[0][0] * c[2][2] - c[0][2] * c[2][0];
+//PICK         let i12 = c[0][2] * c[1][0] - c[0][0] * c[1][2];
+//PICK         let i22 = c[0][0] * c[1][1] - c[0][1] * c[1][0];
+//PICK         output.vPickSinvDiag = vec3f(i00, i11, i22) * invDet;
+//PICK         output.vPickSinvOff = vec3f(i01, i02, i12) * invDet;
+//PICK         output.vPickCenter = viewCenter;
+//PICK         output.vPickAux = vec2f(sqrt(cov3D[2][2] + epsRel * covMax), select(0.0, 1.0, uniforms.isOrthographic != 0u));
+//PICK     }
+
     // Compute the NDC coordinates for the ellipsoid's diagonal axes.
     let pixelOffset = input.position.x * eigenVec1 * scale1 + input.position.y * eigenVec2 * scale2;
     let ndcOffset = (2.0 / scaledRenderSize) * pixelOffset;
-
-    // Compute NDC center of the splat
-    let ndcCenter = clipCenter.xyz / clipCenter.w;
     let ndc = vec3f(ndcCenter.xy + ndcOffset, ndcCenter.z);
 
     output.vNdc = ndc;
     output.position = vec4f(ndc.xy * clipCenter.w, clipCenter.zw);
+//PICK     // setViewOffset puts its crop offset in P[2][0], P[2][1]; w is constant
+//PICK     // over the quad, so the varying interpolates exactly.
+//PICK     output.vPickRay = vec3f(
+//PICK         (ndc.x + projectionMatrix[2][0]) / projectionMatrix[0][0],
+//PICK         (ndc.y + projectionMatrix[2][1]) / projectionMatrix[1][1],
+//PICK         -1.0,
+//PICK     );
 
     return output;
 }

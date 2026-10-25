@@ -7,12 +7,23 @@ import { WebGPURadixSort } from "./WebGPURadixSort";
 import { calcDispatchSize } from "./WebGPUUtils";
 import {
   packOrderingWgsl,
+  pickVertexWgsl,
   splatDefinesWgsl,
   splatFragmentWgsl,
+  splatPickFragmentWgsl,
   splatVertexWgsl,
 } from "./shaders-wgsl";
 import nativeSortWgsl from "./shaders/nativeSort.wgsl?raw";
 import { getTextureSize } from "./utils";
+
+type UniformBuffers = { spark: GPUBuffer; proj: GPUBuffer; frag: GPUBuffer };
+
+/** Raw pickAsync() readback, laid out like WebGL's (rows bottom to top). */
+export type WebGPUPickPixels = {
+  media: Float32Array;
+  solid: Float32Array | null;
+  floatType: "float" | "half";
+};
 
 type TextureExtent = { width: number; height: number; depth: number };
 
@@ -550,6 +561,11 @@ export class WebGPUSplatBackend {
     },
     projectionMatrix: { elements: number[] },
     isOrthographic: boolean,
+    target: UniformBuffers = {
+      spark: this.sparkUniformBuffer,
+      proj: this.projMatrixBuffer,
+      frag: this.fragUniformBuffer,
+    },
   ): void {
     const { device } = this;
 
@@ -614,14 +630,14 @@ export class WebGPUSplatBackend {
     f32[50] = this.splatEncoding[2]; // lnScaleMin
     f32[51] = this.splatEncoding[3]; // lnScaleMax
 
-    device.queue.writeBuffer(this.sparkUniformBuffer, 0, buf);
+    device.queue.writeBuffer(target.spark, 0, buf);
 
     // --- Projection matrix (64 bytes) ---
     // The camera's projectionMatrix is already in WebGPU coordinate system
     // (Z mapped to [0,1]) because SparkRenderer forces camera.coordinateSystem
     // = WebGPUCoordinateSystem before reading it.
     const projData = new Float32Array(projectionMatrix.elements);
-    device.queue.writeBuffer(this.projMatrixBuffer, 0, projData);
+    device.queue.writeBuffer(target.proj, 0, projData);
 
     // --- FragmentUniforms (48 bytes) ---
     const fbuf = this.fragUniformData;
@@ -641,7 +657,7 @@ export class WebGPUSplatBackend {
     // The stochastic hash uses GL window coordinates (origin bottom-left).
     fu32[10] = rs.y;
 
-    device.queue.writeBuffer(this.fragUniformBuffer, 0, fbuf);
+    device.queue.writeBuffer(target.frag, 0, fbuf);
   }
 
   /**
@@ -1475,6 +1491,254 @@ export class WebGPUSplatBackend {
     this.resolveGpuTiming();
   }
 
+  // GPU pick (pickAsync) resources, created on first use.
+  private pickUniforms: UniformBuffers | null = null;
+  private pickLayout: GPUBindGroupLayout | null = null;
+  private pickPipelines = new Map<string, GPURenderPipeline>();
+  private pickTargets: GPUTexture[] = [];
+
+  /** Separate uniform buffers so a pick never disturbs the frame's uniforms. */
+  pickUniformBuffers(): UniformBuffers {
+    if (!this.pickUniforms) {
+      this.pickUniforms = {
+        spark: this.uniformBuffer("spark-pick-uniforms", 208),
+        proj: this.uniformBuffer("spark-pick-proj-matrix", 64),
+        frag: this.uniformBuffer("spark-pick-frag-uniforms", 48),
+      };
+    }
+    return this.pickUniforms;
+  }
+
+  private uniformBuffer(label: string, size: number): GPUBuffer {
+    return this.device.createBuffer({
+      label,
+      size,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+  }
+
+  private pickPipeline(
+    format: GPUTextureFormat,
+    solid: boolean,
+  ): GPURenderPipeline {
+    const key = `${format}:${solid}:${this.halvedAlpha}`;
+    let pipeline = this.pickPipelines.get(key);
+    if (pipeline) return pipeline;
+    const { device } = this;
+    if (!this.pickLayout) {
+      const vertex = GPUShaderStage.VERTEX;
+      const both = GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT;
+      const array = { sampleType: "uint", viewDimension: "2d-array" } as const;
+      this.pickLayout = device.createBindGroupLayout({
+        label: "spark-pick-layout",
+        entries: [
+          { binding: 0, visibility: vertex, buffer: { type: "uniform" } },
+          { binding: 1, visibility: both, buffer: { type: "uniform" } },
+          { binding: 2, visibility: vertex, texture: { sampleType: "uint" } },
+          { binding: 3, visibility: vertex, texture: array },
+          { binding: 4, visibility: vertex, texture: array },
+          { binding: 5, visibility: both, buffer: { type: "uniform" } },
+          {
+            binding: 6,
+            visibility: GPUShaderStage.FRAGMENT,
+            buffer: { type: "uniform" },
+          },
+        ],
+      });
+    }
+    // Weighted average: premultiplied "over". Solid: MIN keeps the nearest.
+    const min = {
+      srcFactor: "one",
+      dstFactor: "one",
+      operation: "min",
+    } as const;
+    const blend: GPUBlendState = solid
+      ? { color: min, alpha: min }
+      : this.splatBlendState(true);
+    pipeline = device.createRenderPipeline({
+      label: solid ? "spark-pick-solid" : "spark-pick-media",
+      layout: device.createPipelineLayout({
+        bindGroupLayouts: [this.pickLayout],
+      }),
+      vertex: {
+        module: device.createShaderModule({
+          label: "spark-pick-vertex",
+          code: `${splatDefinesWgsl}\n${pickVertexWgsl(splatVertexWgsl)}`,
+        }),
+        entryPoint: "vs_main",
+        constants: {
+          PREMULTIPLIED_ALPHA: 1,
+          HALVED_ALPHA: this.halvedAlpha ? 1 : 0,
+        },
+        buffers: [
+          {
+            arrayStride: 8,
+            attributes: [{ shaderLocation: 0, offset: 0, format: "float32x2" }],
+          },
+        ],
+      },
+      fragment: {
+        module: device.createShaderModule({
+          label: "spark-pick-fragment",
+          code: `${splatDefinesWgsl}\n${splatPickFragmentWgsl}`,
+        }),
+        entryPoint: "fs_pick",
+        targets: [{ format, blend }],
+      },
+      primitive: { topology: "triangle-list" },
+    });
+    this.pickPipelines.set(key, pipeline);
+    return pipeline;
+  }
+
+  /**
+   * Draws the active slot (same ordering and draw count as the last frame)
+   * with the pick shaders into width x height float targets and reads them
+   * back. Uniforms must already be in pickUniformBuffers(). No depth test:
+   * like WebGL's pick pass, only splats are considered.
+   */
+  async readPickPixels({
+    width,
+    height,
+    numInstances,
+    alphaThreshold,
+    farBig,
+    solid,
+  }: {
+    width: number;
+    height: number;
+    numInstances: number;
+    alphaThreshold: number;
+    farBig: number;
+    solid: boolean;
+  }): Promise<WebGPUPickPixels> {
+    const { device } = this;
+    // Blending into rgba32float needs float32-blendable; else half float,
+    // like WebGL without EXT_float_blend.
+    const float = device.features.has("float32-blendable");
+    const format: GPUTextureFormat = float ? "rgba32float" : "rgba16float";
+    const bytesPerRow = Math.ceil((width * (float ? 16 : 8)) / 256) * 256;
+    const uniforms = this.pickUniformBuffers();
+    const slot = this.activeRenderSlot();
+    if (
+      slot.bindGroupDirty ||
+      slot.bindGroupVersion !== this.bindGroupLayoutVersion
+    ) {
+      this.rebuildBindGroup(slot);
+    }
+    const splatView = slot.splatTextureView;
+    const orderingTexture = slot.orderingTexture;
+    const target0 = this.pickTargets[0];
+    if (
+      target0?.width !== width ||
+      target0?.height !== height ||
+      target0?.format !== format
+    ) {
+      for (const texture of this.pickTargets) texture.destroy();
+      this.pickTargets = [0, 1].map(() =>
+        device.createTexture({
+          label: "spark-pick-target",
+          size: [width, height],
+          format,
+          usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+        }),
+      );
+    }
+    const encoder = device.createCommandEncoder({ label: "spark-pick" });
+    const passes = (solid ? [false, true] : [false]).map((solidPass, index) => {
+      // One params buffer per pass: both writes land before the one submit.
+      const params = this.uniformBuffer("spark-pick-params", 16);
+      const data = new ArrayBuffer(16);
+      new Float32Array(data, 0, 1)[0] = alphaThreshold;
+      new Uint32Array(data, 4, 1)[0] = solidPass ? 1 : 0;
+      new Float32Array(data, 8, 1)[0] = farBig;
+      device.queue.writeBuffer(params, 0, data);
+      const target = this.pickTargets[index];
+      // Media clears to 0; solid clears R to the "no hit" sentinel.
+      const clear = solidPass ? farBig : 0;
+      const pass = encoder.beginRenderPass({
+        label: "spark-pick-pass",
+        colorAttachments: [
+          {
+            view: target.createView(),
+            clearValue: [clear, clear, clear, 0],
+            loadOp: "clear",
+            storeOp: "store",
+          },
+        ],
+      });
+      if (numInstances > 0 && splatView && orderingTexture) {
+        const pipeline = this.pickPipeline(format, solidPass);
+        pass.setPipeline(pipeline);
+        pass.setBindGroup(
+          0,
+          device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [
+              { binding: 0, resource: { buffer: uniforms.spark } },
+              { binding: 1, resource: { buffer: uniforms.proj } },
+              { binding: 2, resource: orderingTexture.createView() },
+              { binding: 3, resource: splatView },
+              { binding: 4, resource: slot.splatTextureView2 ?? splatView },
+              { binding: 5, resource: { buffer: uniforms.frag } },
+              { binding: 6, resource: { buffer: params } },
+            ],
+          }),
+        );
+        pass.setVertexBuffer(0, this.vertexBuffer);
+        pass.setIndexBuffer(this.indexBuffer, "uint16");
+        if (slot.nativeDrawArgs && this.useIndirectDraw) {
+          pass.drawIndexedIndirect(slot.nativeDrawArgs, 0);
+        } else {
+          pass.drawIndexed(6, numInstances);
+        }
+      }
+      pass.end();
+      const readback = device.createBuffer({
+        label: "spark-pick-readback",
+        size: bytesPerRow * height,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      });
+      encoder.copyTextureToBuffer(
+        { texture: target },
+        { buffer: readback, bytesPerRow },
+        [width, height],
+      );
+      return { params, readback };
+    });
+    device.queue.submit([encoder.finish()]);
+    const results = await Promise.all(
+      passes.map(async ({ params, readback }) => {
+        try {
+          await readback.mapAsync(GPUMapMode.READ);
+          const raw = readback.getMappedRange();
+          // Rows bottom to top, like WebGL readRenderTargetPixels.
+          const pixels = new Float32Array(width * height * 4);
+          for (let row = 0; row < height; row++) {
+            const src = (height - 1 - row) * bytesPerRow;
+            const dst = row * width * 4;
+            if (float) {
+              pixels.set(new Float32Array(raw, src, width * 4), dst);
+            } else {
+              const half = new Uint16Array(raw, src, width * 4);
+              for (let i = 0; i < width * 4; i++)
+                pixels[dst + i] = halfToFloat(half[i]);
+            }
+          }
+          return pixels;
+        } finally {
+          readback.destroy();
+          params.destroy();
+        }
+      }),
+    );
+    return {
+      media: results[0],
+      solid: solid ? results[1] : null,
+      floatType: float ? "float" : "half",
+    };
+  }
+
   /**
    * Fail early, and actionably, when a buffer would exceed device limits.
    *
@@ -1871,5 +2135,22 @@ export class WebGPUSplatBackend {
     this.bindGroup = null;
 
     this.nativeKeysBuffer?.destroy();
+    for (const texture of this.pickTargets) texture.destroy();
+    this.pickTargets = [];
+    if (this.pickUniforms) {
+      for (const buffer of Object.values(this.pickUniforms)) buffer.destroy();
+      this.pickUniforms = null;
+    }
+    this.pickPipelines.clear();
+    this.pickLayout = null;
   }
+}
+
+function halfToFloat(v: number): number {
+  const sign = v & 0x8000 ? -1 : 1;
+  const e = (v >> 10) & 31;
+  const m = v & 1023;
+  if (e === 0) return sign * m * 2 ** -24;
+  if (e === 31) return m ? Number.NaN : sign * Number.POSITIVE_INFINITY;
+  return sign * (1 + m / 1024) * 2 ** (e - 15);
 }

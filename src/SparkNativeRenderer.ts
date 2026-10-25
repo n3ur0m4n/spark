@@ -13,7 +13,10 @@ import { SplatMesh } from "./SplatMesh";
 import { SplatWorker } from "./SplatWorker";
 import { WebGPUComposite } from "./WebGPUComposite";
 import type { NativeMeshGeneration } from "./WebGPUGeneration";
-import { WebGPUSplatBackend } from "./WebGPUSplatBackend";
+import {
+  type WebGPUPickPixels,
+  WebGPUSplatBackend,
+} from "./WebGPUSplatBackend";
 
 /** The native submission path; the WebGL renderer and LoD traversal stay unchanged. */
 export class SparkNativeRenderer {
@@ -289,13 +292,66 @@ export class SparkNativeRenderer {
     return task;
   }
 
-  private updateUniforms(camera: THREE.Camera) {
+  /**
+   * pickAsync() render: the w x h CSS-pixel crop at (ox, oy) of the
+   * fullW x fullH view, drawn from the last submitted frame's ordering. Queued
+   * after pending renders so it sees the ordering they committed.
+   */
+  pickPixels(
+    camera: THREE.PerspectiveCamera | THREE.OrthographicCamera,
+    crop: {
+      fullW: number;
+      fullH: number;
+      ox: number;
+      oy: number;
+      w: number;
+      h: number;
+      alphaThreshold: number;
+      farBig: number;
+      solid: boolean;
+    },
+  ): Promise<WebGPUPickPixels> {
+    if (this.disposed)
+      return Promise.reject(new Error("SparkRenderer is disposed"));
+    camera.updateWorldMatrix(true, false);
+    const pickCamera = camera.clone();
+    pickCamera.setViewOffset(
+      crop.fullW,
+      crop.fullH,
+      crop.ox,
+      crop.oy,
+      crop.w,
+      crop.h,
+    );
+    const task = this.queue
+      .catch(() => {})
+      .then(() => {
+        if (this.disposed) throw new Error("SparkRenderer is disposed");
+        this.updateUniforms(pickCamera, { width: crop.w, height: crop.h });
+        return this.backend.readPickPixels({
+          width: crop.w,
+          height: crop.h,
+          numInstances: this.renderVisible ? this.owner.activeSplats : 0,
+          alphaThreshold: crop.alphaThreshold,
+          farBig: crop.farBig,
+          solid: crop.solid,
+        });
+      });
+    this.queue = task.then(() => {});
+    return task;
+  }
+
+  private updateUniforms(
+    camera: THREE.Camera,
+    pick?: { width: number; height: number },
+  ) {
     const owner = this.owner;
     const uniforms = owner.uniforms;
     const typed = camera as THREE.PerspectiveCamera | THREE.OrthographicCamera;
     typed.coordinateSystem = THREE.WebGPUCoordinateSystem;
     typed.updateProjectionMatrix();
-    uniforms.renderSize.value.copy(owner.renderSize);
+    if (pick) uniforms.renderSize.value.set(pick.width, pick.height);
+    else uniforms.renderSize.value.copy(owner.renderSize);
     uniforms.near.value = typed.near;
     uniforms.far.value = typed.far;
     const transform = camera.matrixWorld.clone().invert();
@@ -331,10 +387,14 @@ export class SparkNativeRenderer {
     uniforms.enableCovSplats.value = false;
     uniforms.time.value = owner.display.time;
     uniforms.deltaTime.value = owner.display.deltaTime;
+    // A splat whose quad covers the pick window can have its center outside
+    // the tiny crop: no center-based XY clipping while picking.
+    if (pick) uniforms.clipXY.value = 1e6;
     this.backend.updateUniforms(
       uniforms,
       typed.projectionMatrix,
       typed instanceof THREE.OrthographicCamera,
+      pick ? this.backend.pickUniformBuffers() : undefined,
     );
   }
 

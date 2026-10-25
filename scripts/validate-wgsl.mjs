@@ -14,13 +14,21 @@ const naga = process.env.NAGA_BIN || (existsSync(cargo) ? cargo : "naga");
 execFileSync(naga, ["--version"], { stdio: "inherit" });
 const directory = mkdtempSync(join(tmpdir(), "spark-wgsl-"));
 const shader = (name) =>
-  readFileSync(new URL(`../src/shaders/${name}.wgsl`, import.meta.url), "utf8");
+  name === "splatPickVertex"
+    ? // Same transform as pickVertexWgsl() in src/shaders-wgsl.ts.
+      shader("splatVertex").replace(/^\/\/PICK /gm, "")
+    : readFileSync(
+        new URL(`../src/shaders/${name}.wgsl`, import.meta.url),
+        "utf8",
+      );
 try {
   for (const name of [
     "generateSourceBuffers",
     "generateSourcePaged",
     "splatVertex",
     "splatFragment",
+    "splatPickVertex",
+    "splatPickFragment",
     "nativeSort",
     "packOrdering",
     "radixSort4bit",
@@ -30,7 +38,12 @@ try {
     // Generation is validated once per source accessor variant.
     const text = name.startsWith("generateSource")
       ? `${shader("splatDefines")}\n${shader(name)}\n${shader("generateSplats")}`
-      : (["splatVertex", "splatFragment"].includes(name)
+      : ([
+          "splatVertex",
+          "splatFragment",
+          "splatPickVertex",
+          "splatPickFragment",
+        ].includes(name)
           ? `${shader("splatDefines")}\n`
           : "") + shader(name);
     const file = join(directory, `${name}.wgsl`);

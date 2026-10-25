@@ -86,6 +86,7 @@ describe("createRenderer", () => {
     expect(WEBGPU_UNSUPPORTED_FEATURES).not.toContain("editing");
     expect(WEBGPU_UNSUPPORTED_FEATURES).not.toContain("sortCull");
     expect(WEBGPU_UNSUPPORTED_FEATURES).not.toContain("stochastic");
+    expect(WEBGPU_UNSUPPORTED_FEATURES).not.toContain("pickAsync");
     const { backend } = await createRenderer({
       needs: [
         "multipleSplatMeshes",

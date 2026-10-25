@@ -5,3 +5,8 @@ export { default as packOrderingWgsl } from "./shaders/packOrdering.wgsl?raw";
 export { default as prefixSumWgsl } from "./shaders/prefixSum.wgsl?raw";
 export { default as radixSort4bitWgsl } from "./shaders/radixSort4bit.wgsl?raw";
 export { default as radixSortReorderWgsl } from "./shaders/radixSortReorder.wgsl?raw";
+export { default as splatPickFragmentWgsl } from "./shaders/splatPickFragment.wgsl?raw";
+
+/** GPU pick variant of splatVertex.wgsl: activates its "//PICK " lines. */
+export const pickVertexWgsl = (source: string) =>
+  source.replace(/^\/\/PICK /gm, "");

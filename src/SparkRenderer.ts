@@ -2975,13 +2975,12 @@ export class SparkRenderer<
     solid?: boolean;
   }): Promise<SparkPickResult | null> {
     const t0 = performance.now();
-    const renderer = this.requireWebGLRenderer();
-    const canvas = renderer.domElement;
+    const canvas = this.renderer.domElement;
     const fullW = canvas.clientWidth || canvas.width;
     const fullH = canvas.clientHeight || canvas.height;
 
-    const { targetMedia, targetSolid, floatOk, floatTypeName, farBig } =
-      this.pickRender({
+    const { pixelsMedia, pixelsSolid, floatTypeName, farBig } =
+      await this.pickPixels({
         camera,
         fullW,
         fullH,
@@ -2992,15 +2991,6 @@ export class SparkRenderer<
         alphaThreshold,
         solid,
       });
-
-    // Safe to await now: render targets are read directly regardless of
-    // the renderer's currently-bound render target.
-    const [pixelsMedia, pixelsSolid] = await Promise.all([
-      readPickTargetPixels(renderer, targetMedia, size, size, floatOk),
-      solid
-        ? readPickTargetPixels(renderer, targetSolid, size, size, floatOk)
-        : null,
-    ]);
 
     const result = pickResultFromPixels({
       pixelsMedia,
@@ -3047,8 +3037,7 @@ export class SparkRenderer<
     alphaThreshold?: number;
   }): Promise<(SparkPickResult | null)[]> {
     const t0 = performance.now();
-    const renderer = this.requireWebGLRenderer();
-    const canvas = renderer.domElement;
+    const canvas = this.renderer.domElement;
     const fullW = canvas.clientWidth || canvas.width;
     const fullH = canvas.clientHeight || canvas.height;
     const half = size / 2;
@@ -3088,7 +3077,11 @@ export class SparkRenderer<
 
     const w = maxCol - minCol + size;
     const h = maxRow - minRow + size;
-    const { targetMedia, floatOk, floatTypeName, farBig } = this.pickRender({
+    const {
+      pixelsMedia: pixels,
+      floatTypeName,
+      farBig,
+    } = await this.pickPixels({
       camera,
       fullW,
       fullH,
@@ -3099,14 +3092,6 @@ export class SparkRenderer<
       alphaThreshold,
       solid: false,
     });
-
-    const pixels = await readPickTargetPixels(
-      renderer,
-      targetMedia,
-      w,
-      h,
-      floatOk,
-    );
 
     const results = points.map(({ x, y }, index) => {
       const cell = cells[index];
@@ -3139,6 +3124,43 @@ export class SparkRenderer<
       if (result) result.ms = ms;
     }
     return results;
+  }
+
+  // Renders and reads back the pick window on either backend. Pixels are
+  // Float32 RGBA, rows bottom to top (WebGL readRenderTargetPixels layout).
+  private async pickPixels(
+    args: Parameters<SparkRenderer["pickRender"]>[0],
+  ): Promise<{
+    pixelsMedia: Float32Array;
+    pixelsSolid: Float32Array | null;
+    floatTypeName: "float" | "half";
+    farBig: number;
+  }> {
+    const { camera, w, h, solid } = args;
+    const farBig = pickFarBig(camera);
+    if (this.native) {
+      const {
+        media,
+        solid: pixelsSolid,
+        floatType,
+      } = await this.native.pickPixels(camera, { ...args, farBig });
+      return {
+        pixelsMedia: media,
+        pixelsSolid,
+        floatTypeName: floatType,
+        farBig,
+      };
+    }
+    const renderer = this.requireWebGLRenderer();
+    const { targetMedia, targetSolid, floatOk, floatTypeName } =
+      this.pickRender(args);
+    // Safe to await now: render targets are read directly regardless of
+    // the renderer's currently-bound render target.
+    const [pixelsMedia, pixelsSolid] = await Promise.all([
+      readPickTargetPixels(renderer, targetMedia, w, h, floatOk),
+      solid ? readPickTargetPixels(renderer, targetSolid, w, h, floatOk) : null,
+    ]);
+    return { pixelsMedia, pixelsSolid, floatTypeName, farBig };
   }
 
   // Synchronous part shared by pickAsync()/pickPointsAsync(): renders the
@@ -3274,10 +3296,7 @@ export class SparkRenderer<
     pickCamera.setViewOffset(fullW, fullH, ox, oy, w, h);
     pickCamera.updateProjectionMatrix();
 
-    // Keep this in sync with splatPickFragment.glsl's farBig(): both the
-    // clear value and the shader's "no solid hit" sentinel must agree so
-    // readback can tell a real depth from "nothing there".
-    const farBig = Math.min(60000, Math.max(1e4, camera.far * 4));
+    const farBig = pickFarBig(camera);
 
     // Hide every other direct child of the scene for these two render
     // calls: this SparkRenderer already batches every splat found in the
@@ -3475,6 +3494,13 @@ function viewPointAtDepth(
   const viewX = (ndcX + m[8]) / m[0];
   const viewY = (ndcY + m[9]) / m[5];
   return new THREE.Vector3(viewX * d, viewY * d, -d);
+}
+
+// Keep this in sync with splatPickFragment.glsl's farBig(): both the clear
+// value and the shader's "no solid hit" sentinel must agree so readback can
+// tell a real depth from "nothing there". The WGSL pass takes it as a uniform.
+function pickFarBig(camera: THREE.Camera & { far: number }) {
+  return Math.min(60000, Math.max(1e4, camera.far * 4));
 }
 
 // Reads back a pickAsync() render target as a plain Float32Array, regardless
