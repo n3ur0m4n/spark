@@ -659,7 +659,7 @@ fn encodeExtRgb(rgb: vec3f) -> u32 {
     let absRgb = abs(rgb);
     let maxAbs = max(absRgb.r, max(absRgb.g, absRgb.b));
 
-    let base = clamp(i32(floor(log2(maxAbs))) + 15, 0, 31);
+    let base = clamp(i32(ceil(log2(maxAbs))) + 15, 0, 31);
     let divisor = exp2(f32(base - 15)) / 255.0;
 
     let uRgb = vec3u(round(clamp(absRgb / divisor, vec3f(0.0), vec3f(255.0))));

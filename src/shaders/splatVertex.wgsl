@@ -336,15 +336,24 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     output.vRgba.a = rgba.a;
 
     // Compute the eigenvalue and eigenvectors of the 2D covariance matrix
+    // Mirrors splatVertex.glsl: cancellation-free eigen decomposition.
     let eigenAvg = 0.5 * (a + d);
-    let eigenDelta = sqrt(max(0.0, eigenAvg * eigenAvg - det));
+    let halfDiagDiff = 0.5 * (a - d);
+    let eigenDelta = sqrt(sqr(halfDiagDiff) + sqr(b));
     let eigen1 = eigenAvg + eigenDelta;
-    let eigen2 = eigenAvg - eigenDelta;
+    let eigen2 = max(0.0, det / eigen1);
 
-    // Match upstream's diagonal-covariance branch exactly. Replacing b with
-    // 1 here rotates nearly diagonal splats and changes their footprint.
-    var eigenVec1 = select(vec2f(0.0, 1.0), vec2f(1.0, 0.0), a >= d);
-    if (abs(b) > 0.001) { eigenVec1 = normalize(vec2f(b, eigen1 - a)); }
+    let eigenVec1Unnorm = select(
+        vec2f(b, eigenDelta - halfDiagDiff),
+        vec2f(eigenDelta + halfDiagDiff, b),
+        halfDiagDiff >= 0.0,
+    );
+    let eigenVec1Len2 = dot(eigenVec1Unnorm, eigenVec1Unnorm);
+    let eigenVec1 = select(
+        vec2f(1.0, 0.0),
+        eigenVec1Unnorm * inverseSqrt(eigenVec1Len2),
+        eigenVec1Len2 > 0.0,
+    );
     let eigenVec2 = vec2f(eigenVec1.y, -eigenVec1.x);
 
     let scale1 = min(uniforms.maxPixelRadius, adjustedStdDevLocal * sqrt(eigen1));
