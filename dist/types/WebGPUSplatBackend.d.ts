@@ -1,4 +1,15 @@
 import { type NativeMeshGeneration } from "./WebGPUGeneration";
+type UniformBuffers = {
+    spark: GPUBuffer;
+    proj: GPUBuffer;
+    frag: GPUBuffer;
+};
+/** Raw pickAsync() readback, laid out like WebGL's (rows bottom to top). */
+export type WebGPUPickPixels = {
+    media: Float32Array;
+    solid: Float32Array | null;
+    floatType: "float" | "half";
+};
 export type WebGPUOrderingTarget = "active" | "working" | "write";
 /**
  * WebGPU rendering backend for SparkRenderer.
@@ -226,7 +237,7 @@ export declare class WebGPUSplatBackend {
         };
     }, projectionMatrix: {
         elements: number[];
-    }, isOrthographic: boolean): void;
+    }, isOrthographic: boolean, target?: UniformBuffers): void;
     /**
      * Upload the ordering texture from sort worker results.
      */
@@ -333,6 +344,28 @@ export declare class WebGPUSplatBackend {
      * provided color texture, preserving existing content (loadOp: "load").
      */
     renderSeparatePass(colorTexture: GPUTexture, numInstances: number, preloadedDepth?: boolean): void;
+    private pickUniforms;
+    private pickLayout;
+    private pickPipelines;
+    private pickTargets;
+    /** Separate uniform buffers so a pick never disturbs the frame's uniforms. */
+    pickUniformBuffers(): UniformBuffers;
+    private uniformBuffer;
+    private pickPipeline;
+    /**
+     * Draws the active slot (same ordering and draw count as the last frame)
+     * with the pick shaders into width x height float targets and reads them
+     * back. Uniforms must already be in pickUniformBuffers(). No depth test:
+     * like WebGL's pick pass, only splats are considered.
+     */
+    readPickPixels({ width, height, numInstances, alphaThreshold, farBig, solid, }: {
+        width: number;
+        height: number;
+        numInstances: number;
+        alphaThreshold: number;
+        farBig: number;
+        solid: boolean;
+    }): Promise<WebGPUPickPixels>;
     /**
      * Fail early, and actionably, when a buffer would exceed device limits.
      *
@@ -385,3 +418,4 @@ export declare class WebGPUSplatBackend {
     }): Promise<boolean>;
     dispose(): void;
 }
+export {};

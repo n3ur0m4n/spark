@@ -4,7 +4,7 @@ import type { SparkHostRenderer } from "./RendererAdapter";
 import type { SparkRenderStats } from "./SparkRenderStats";
 import type { SparkRenderer } from "./SparkRenderer";
 import { SplatMesh } from "./SplatMesh";
-import { WebGPUSplatBackend } from "./WebGPUSplatBackend";
+import { type WebGPUPickPixels, WebGPUSplatBackend } from "./WebGPUSplatBackend";
 /** The native submission path; the WebGL renderer and LoD traversal stay unchanged. */
 export declare class SparkNativeRenderer {
     private readonly owner;
@@ -32,6 +32,22 @@ export declare class SparkNativeRenderer {
     assertSupported(scene: THREE.Scene, camera: THREE.Camera): void;
     /** Each call keeps its camera snapshot and has its own submission promise. */
     renderAsync(scene: THREE.Scene, camera: THREE.Camera): Promise<void>;
+    /**
+     * pickAsync() render: the w x h CSS-pixel crop at (ox, oy) of the
+     * fullW x fullH view, drawn from the last submitted frame's ordering. Queued
+     * after pending renders so it sees the ordering they committed.
+     */
+    pickPixels(camera: THREE.PerspectiveCamera | THREE.OrthographicCamera, crop: {
+        fullW: number;
+        fullH: number;
+        ox: number;
+        oy: number;
+        w: number;
+        h: number;
+        alphaThreshold: number;
+        farBig: number;
+        solid: boolean;
+    }): Promise<WebGPUPickPixels>;
     private updateUniforms;
     /** Runs ordinary mesh callbacks, then snapshots and commits one complete generation. */
     update(scene: THREE.Scene, camera: THREE.Camera): Promise<SplatMesh[]>;

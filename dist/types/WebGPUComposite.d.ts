@@ -10,6 +10,7 @@ export declare class WebGPUComposite {
     private readonly quad;
     private readonly configureOutput;
     private outputKey;
+    private hdr;
     private constructor();
     static create(): Promise<WebGPUComposite>;
     render(renderer: WebGPURenderer, scene: THREE.Scene, camera: THREE.Camera, composite: (attachments: CompositeAttachments) => void): void;

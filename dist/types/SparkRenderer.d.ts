@@ -16,7 +16,11 @@ export interface SparkRendererOptions<R extends SparkHostRenderer = THREE.WebGLR
      * rendering and significantly reduces performance.
      */
     renderer: R;
-    /** Native sort implementation. The reference uses GPU-generated depths and WASM sorting. */
+    /**
+     * Native sort implementation. "radix" (default) sorts on the GPU with no
+     * readback; "readback" uses GPU-generated depths and WASM sorting on the CPU,
+     * which stalls every frame while the camera moves.
+     */
     webgpuSort?: "readback" | "radix";
     /**
      * Callback function to be called when SparkRenderer needs to re-render,
@@ -790,6 +794,7 @@ export declare class SparkRenderer<R extends SparkHostRenderer = THREE.WebGLRend
         size?: number;
         alphaThreshold?: number;
     }): Promise<(SparkPickResult | null)[]>;
+    private pickPixels;
     private pickRender;
     /**
      * One raycastLodTree on the pick worker, at most one in flight, the others

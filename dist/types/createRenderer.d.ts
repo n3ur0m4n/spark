@@ -3,11 +3,10 @@ import type { WebGPURenderer } from "three/webgpu";
 /**
  * Features the native WebGPU backend does not support yet. createRenderer()
  * falls back to WebGL when `needs` lists one of them; remove entries as native
- * support lands. The first group mirrors the features SparkNativeRenderer and
- * getSparkRendererCapabilities() reject; pickAsync is fork-only WebGL work
- * the native path does not implement.
+ * support lands. They mirror the features SparkNativeRenderer and
+ * getSparkRendererCapabilities() reject.
  */
-export declare const WEBGPU_UNSUPPORTED_FEATURES: readonly ["xr", "modifiers", "skinning", "specializedTargets", "covarianceSplats", "transparentMeshes", "transparentSprites", "logarithmicDepth", "reversedDepth", "msaa", "customViewport", "scissorTest", "manualClear", "nonuniformSplatTransforms", "arrayCameras", "pickAsync"];
+export declare const WEBGPU_UNSUPPORTED_FEATURES: readonly ["xr", "modifiers", "skinning", "specializedTargets", "covarianceSplats", "transparentMeshes", "transparentSprites", "logarithmicDepth", "reversedDepth", "msaa", "customViewport", "scissorTest", "manualClear", "nonuniformSplatTransforms", "arrayCameras"];
 export type CreateRendererOptions = THREE.WebGLRendererParameters & NonNullable<ConstructorParameters<typeof WebGPURenderer>[0]> & {
     /** Features the app relies on; any unsupported by native WebGPU selects WebGL. */
     needs?: readonly string[];
