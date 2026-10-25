@@ -20,8 +20,17 @@ editCounts: vec4u,
 // Bindings 1-3 (and 8-10 for paged sources) and the load*() accessors come
 // from generateSourceBuffers.wgsl or generateSourcePaged.wgsl.
 @group(0) @binding(4) var<storage, read> indices: array<u32>;
-@group(0) @binding(5) var<storage, read_write> output: array<vec4u>;
-@group(0) @binding(6) var<storage, read_write> output2: array<vec4u>;
+// Written straight into the slot's splat textures (no staging buffer copy).
+@group(0) @binding(5) var output: texture_storage_2d_array<rgba32uint, write>;
+@group(0) @binding(6) var output2: texture_storage_2d_array<rgba32uint, write>;
+
+fn storeOutput(second: bool, dst: u32, value: vec4u) {
+    let size = textureDimensions(output);
+    let coord = vec2u(dst % size.x, (dst / size.x) % size.y);
+    let layer = dst / (size.x * size.y);
+    if (second) { textureStore(output2, coord, layer, value); }
+    else { textureStore(output, coord, layer, value); }
+}
 @group(0) @binding(7) var<storage, read_write> depths: array<u32>;
 
 // Native counterpart of SplatEdit.ts defineSdfArray/defineEdit: world-space
@@ -199,10 +208,10 @@ fn generate(@builtin(workgroup_id) group: vec3u,
     let rotation = quatQuat(frame.rotation, splat.quaternion);
     if (frame.outputExt != 0u) {
         let packed = packSplatExt(center, scales, rotation, splat.rgba);
-        output[dst] = packed.packed;
-        output2[dst] = packed.packed2;
+        storeOutput(false, dst, packed.packed);
+        storeOutput(true, dst, packed.packed2);
     } else {
         // Upstream uses camera-relative half precision and expanded LoD alpha.
-        output[dst] = packSplat(delta, scales, rotation, vec4f(splat.rgba.rgb, splat.rgba.a * 0.5));
+        storeOutput(false, dst, packSplat(delta, scales, rotation, vec4f(splat.rgba.rgb, splat.rgba.a * 0.5)));
     }
 }

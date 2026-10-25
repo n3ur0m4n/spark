@@ -25,7 +25,7 @@ try {
    source.numSplats=count;source.needsUpdate=true;
    const clearsBefore=clearRanges.length;
    await spark.renderAsync(scene,camera);
-   if(count===17){const ranges=clearRanges.slice(clearsBefore);check(`${mode}: shrink clears consumed extent below retained capacity`,ranges.length>0&&ranges.every(r=>r.offset===0&&r.size<r.capacity&&r.size>=count*16),{ranges});}
+   if(count===17){const ranges=clearRanges.slice(clearsBefore);check(`${mode}: shrink generates into slot textures without a staging clear`,ranges.length===0,{ranges});}
    if(count===0)check(`${mode}: empty generation releases source GPU allocations`,sourceBytes===0,{sourceBytes});
    if(count>0){
     const backend=spark.webgpuBackend;

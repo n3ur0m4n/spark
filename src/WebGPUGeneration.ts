@@ -277,8 +277,8 @@ export class WebGPUGeneration {
     encoder: GPUCommandEncoder,
     args: {
       meshes: NativeMeshGeneration[];
-      output: GPUBuffer;
-      output2: GPUBuffer;
+      output: GPUTextureView;
+      output2: GPUTextureView;
       depths: GPUBuffer;
       outputExt: boolean;
       viewOrigin: number[];

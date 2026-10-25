@@ -180,8 +180,7 @@ export class WebGPUSplatBackend {
   set useIndirectDraw(value: boolean) {
     this.writeRenderSlot().indirect = value;
   }
-  private generatedOutputBuffer: GPUBuffer | null = null;
-  private generatedOutputBuffer2: GPUBuffer | null = null;
+  private generatedOutputDummy: GPUTexture | null = null;
 
   private nativeGeneration: WebGPUGeneration | null = null;
   private nativeFillPipeline: GPUComputePipeline | null = null;
@@ -1079,8 +1078,6 @@ export class WebGPUSplatBackend {
       return;
     }
     const size = getTextureSize(args.numSplats);
-    const bytes = size.width * size.height * size.depth * 16;
-    this.assertStorageBufferFits(bytes, "native generated splats");
     if (
       size.width > device.limits.maxTextureDimension2D ||
       size.height > device.limits.maxTextureDimension2D ||
@@ -1090,36 +1087,13 @@ export class WebGPUSplatBackend {
         "Spark: native output exceeds device texture limits; use THREE.WebGLRenderer.",
       );
     this.ensureSplatTexture(args.numSplats);
-    if (
-      !this.generatedOutputBuffer ||
-      this.generatedOutputBuffer.size < bytes
-    ) {
-      this.generatedOutputBuffer?.destroy();
-      this.generatedOutputBuffer = device.createBuffer({
-        label: "spark-native-output",
-        size: bytes,
-        usage:
-          GPUBufferUsage.STORAGE |
-          GPUBufferUsage.COPY_SRC |
-          GPUBufferUsage.COPY_DST,
-      });
-    }
     if (args.outputExt) this.ensureSplatTexture2(args.numSplats);
-    const secondaryBytes = args.outputExt ? bytes : 16;
-    if (
-      !this.generatedOutputBuffer2 ||
-      this.generatedOutputBuffer2.size < secondaryBytes
-    ) {
-      this.generatedOutputBuffer2?.destroy();
-      this.generatedOutputBuffer2 = device.createBuffer({
-        label: "spark-native-output2",
-        size: secondaryBytes,
-        usage:
-          GPUBufferUsage.STORAGE |
-          GPUBufferUsage.COPY_SRC |
-          GPUBufferUsage.COPY_DST,
-      });
-    }
+    this.generatedOutputDummy ??= device.createTexture({
+      label: "spark-native-output2-dummy",
+      size: [1, 1, 1],
+      format: "rgba32uint",
+      usage: GPUTextureUsage.STORAGE_BINDING,
+    });
     const depthBytes = Math.ceil(args.numSplats / 256) * 256 * 4;
     this.assertStorageBufferFits(depthBytes, "native generated depths");
     if (!slot.nativeDepths || slot.nativeDepths.size < depthBytes) {
@@ -1153,11 +1127,8 @@ export class WebGPUSplatBackend {
     const encoder = device.createCommandEncoder({
       label: "spark-native-generation",
     });
-    // Initialize every texel copied below, including mapping gaps. Retained
-    // capacity outside this generation is neither copied nor consumed.
-    encoder.clearBuffer(this.generatedOutputBuffer, 0, bytes);
-    if (args.outputExt)
-      encoder.clearBuffer(this.generatedOutputBuffer2, 0, bytes);
+    // Generation writes the slot textures directly. Mapping-gap texels keep
+    // stale data but their depth stays +inf, so the sort never draws them.
     const fill = encoder.beginComputePass({
       label: "spark-native-depth-fill",
       ...this.timestampWritesFor("depth-fill"),
@@ -1184,12 +1155,18 @@ export class WebGPUSplatBackend {
       ...this.computeDispatchSize(Math.ceil(args.numSplats / 256)),
     );
     fill.end();
+    if (!slot.splatTextureView || (args.outputExt && !slot.splatTextureView2)) {
+      encoder.finish();
+      throw new Error("Spark: native generation textures are unavailable");
+    }
     try {
       this.nativeGeneration ??= new WebGPUGeneration(device);
       this.nativeGeneration.encode(encoder, {
         ...args,
-        output: this.generatedOutputBuffer,
-        output2: this.generatedOutputBuffer2,
+        output: slot.splatTextureView,
+        output2:
+          (args.outputExt && slot.splatTextureView2) ||
+          this.generatedOutputDummy.createView({ dimension: "2d-array" }),
         depths: slot.nativeDepths,
         timestampWrites: this.gpuTimingAvailable
           ? () => this.timestampWritesFor("generation")?.timestampWrites
@@ -1199,36 +1176,35 @@ export class WebGPUSplatBackend {
       encoder.finish();
       throw error;
     }
-    const texture = slot.splatTexture;
-    const texture2 = slot.splatTexture2;
-    if (!texture || (args.outputExt && !texture2)) {
-      encoder.finish();
-      throw new Error("Spark: native generation textures are unavailable");
-    }
-    for (let layer = 0; layer < size.depth; layer++) {
-      const source = {
-        buffer: this.generatedOutputBuffer,
-        offset: layer * size.width * size.height * 16,
-        bytesPerRow: size.width * 16,
-        rowsPerImage: size.height,
-      };
-      encoder.copyBufferToTexture(source, { texture, origin: [0, 0, layer] }, [
-        size.width,
-        size.height,
-        1,
-      ]);
-      if (args.outputExt && texture2)
-        encoder.copyBufferToTexture(
-          { ...source, buffer: this.generatedOutputBuffer2 },
-          { texture: texture2, origin: [0, 0, layer] },
-          [size.width, size.height, 1],
-        );
-    }
     device.queue.submit([encoder.finish()]);
     slot.generatedSpan = args.numSplats;
     this.halvedAlpha = !args.outputExt;
     this.splatEncoding = [0, 1, -12, 9];
     this.syncLegacyFields(slot);
+  }
+
+  /**
+   * Test hook: a COPY_SRC buffer holding the generated splat texels in
+   * linear splat order (the caller destroys it).
+   */
+  copyGeneratedOutput(second = false): GPUBuffer {
+    const slot = this.depthRenderSlot();
+    const texture = second ? slot.splatTexture2 : slot.splatTexture;
+    if (!texture) throw new Error("Spark: no generated native splats");
+    const { width, height, depthOrArrayLayers } = texture;
+    const buffer = this.device.createBuffer({
+      label: "spark-native-output-copy",
+      size: width * height * depthOrArrayLayers * 16,
+      usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+    const encoder = this.device.createCommandEncoder();
+    encoder.copyTextureToBuffer(
+      { texture },
+      { buffer, bytesPerRow: width * 16, rowsPerImage: height },
+      [width, height, depthOrArrayLayers],
+    );
+    this.device.queue.submit([encoder.finish()]);
+    return buffer;
   }
 
   async readNativeDepths(count: number): Promise<Uint32Array<ArrayBuffer>> {
@@ -1836,7 +1812,11 @@ export class WebGPUSplatBackend {
         label: "spark-splatData",
         size: [width, height, depth],
         format: "rgba32uint",
-        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+        usage:
+          GPUTextureUsage.TEXTURE_BINDING |
+          GPUTextureUsage.COPY_SRC |
+          GPUTextureUsage.COPY_DST |
+          GPUTextureUsage.STORAGE_BINDING,
         dimension: "2d",
       });
       slot.splatTextureView = slot.splatTexture.createView({
@@ -1875,7 +1855,11 @@ export class WebGPUSplatBackend {
         label: "spark-splatData2",
         size: [width, height, depth],
         format: "rgba32uint",
-        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+        usage:
+          GPUTextureUsage.TEXTURE_BINDING |
+          GPUTextureUsage.COPY_SRC |
+          GPUTextureUsage.COPY_DST |
+          GPUTextureUsage.STORAGE_BINDING,
         dimension: "2d",
       });
       slot.splatTextureView2 = slot.splatTexture2.createView({
@@ -2181,10 +2165,8 @@ export class WebGPUSplatBackend {
     this.nativeGeneration?.dispose();
     this.nativeGeneration = null;
     this.nativeSortUniform?.destroy();
-    this.generatedOutputBuffer?.destroy();
-    this.generatedOutputBuffer = null;
-    this.generatedOutputBuffer2?.destroy();
-    this.generatedOutputBuffer2 = null;
+    this.generatedOutputDummy?.destroy();
+    this.generatedOutputDummy = null;
 
     this.sparkUniformBuffer.destroy();
     this.projMatrixBuffer.destroy();

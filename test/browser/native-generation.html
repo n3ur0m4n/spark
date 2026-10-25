@@ -125,7 +125,7 @@ window.runNativeCase = async function(config) {
   const keys=[];for(let i=0;i<current.numSplats;i++)if(depths[i]<0x7f800000)keys.push([i,depths[i]]);
   let generated;
   if(config.inspectGenerated){
-   if(native){const b=spark.webgpuBackend,d=renderer.backend.device;generated=[await readBuffer(d,b.generatedOutputBuffer,current.numSplats*16),await readBuffer(d,b.generatedOutputBuffer2,current.numSplats*16)];}
+   if(native){const b=spark.webgpuBackend,d=renderer.backend.device;generated=[await readBuffer(d,b.copyGeneratedOutput(),current.numSplats*16),await readBuffer(d,b.copyGeneratedOutput(true),current.numSplats*16)];}
    else{const gl=renderer.getContext(),fb=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,fb);generated=[];
     for(let attachment=0;attachment<2;attachment++){const tex=renderer.properties.get(current.target.textures[attachment]).__webglTexture;
      gl.framebufferTextureLayer(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,tex,0,0);const data=new Uint32Array(2048*2*4);gl.readPixels(0,0,2048,2,gl.RGBA_INTEGER,gl.UNSIGNED_INT,data);generated.push(data);}

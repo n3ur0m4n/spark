@@ -68,8 +68,8 @@ async function runPagedCase(config){
   const selected=current.mapping.reduce((sum,m)=>sum+m.count,0);
   const words=current.numSplats*4;let generated;
   if(native){const b=spark.webgpuBackend,d=renderer.backend.device;
-   generated=[await readBuffer(d,b.generatedOutputBuffer,words*4)];
-   if(current.extSplats)generated.push(await readBuffer(d,b.generatedOutputBuffer2,words*4));}
+   generated=[await readBuffer(d,b.copyGeneratedOutput(),words*4)];
+   if(current.extSplats)generated.push(await readBuffer(d,b.copyGeneratedOutput(true),words*4));}
   else{const gl=renderer.getContext(),fb=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,fb);generated=[];
    const rows=Math.ceil(current.numSplats/2048);
    for(let attachment=0;attachment<(current.extSplats?2:1);attachment++){

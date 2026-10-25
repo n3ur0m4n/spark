@@ -11,7 +11,7 @@ async function readGenerated(spark,renderer){
  const current=spark.current,buffers=[];
  if(spark.isWebGPU){
   const device=renderer.backend.device,backend=spark.webgpuBackend;
-  for(const source of [backend.generatedOutputBuffer,...(current.extSplats?[backend.generatedOutputBuffer2]:[])]){
+  for(const source of [backend.copyGeneratedOutput(),...(current.extSplats?[backend.copyGeneratedOutput(true)]:[])]){
    const size=current.numSplats*16,map=device.createBuffer({size,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
    try{const encoder=device.createCommandEncoder();encoder.copyBufferToBuffer(source,0,map,0,size);device.queue.submit([encoder.finish()]);await map.mapAsync(GPUMapMode.READ);buffers.push(new Uint32Array(map.getMappedRange().slice(0)));}finally{map.destroy();}
   }

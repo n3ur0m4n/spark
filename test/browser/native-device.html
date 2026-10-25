@@ -21,7 +21,9 @@ try{
  check('failed source upload cannot commit a generation',spark.webgpuBackend.getActiveSlotGeneration()===before);
  const allocated=outputAllocations;spark.enableLod=false;let outputFailure;
  try{await spark.renderAsync(scene,camera);}catch(e){outputFailure=String(e);}
- check('oversized output rejected before texture allocation',/native generated splats needs/.test(outputFailure)&&outputAllocations===allocated,{outputFailure,allocationsBefore:allocated,allocationsAfter:outputAllocations});
+ // Generation writes the splat textures directly (no staging buffer), so the
+ // full-source storage limit is what rejects this scene.
+ check('oversized output rejected by native device limits',/native-source needs.*exceeding native device limits/.test(outputFailure)&&spark.webgpuBackend.getActiveSlotGeneration()===before,{outputFailure,allocationsBefore:allocated,allocationsAfter:outputAllocations});
 
  const small=new PackedSplats({construct:data=>data.pushSplat(new THREE.Vector3(),new THREE.Vector3(.2,.2,.2),new THREE.Quaternion(),.7,new THREE.Color(1,0,0))});await small.initialized;
  mesh.splats=small;source.lodSplats=undefined;spark.enableLod=false;
