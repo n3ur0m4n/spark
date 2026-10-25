@@ -1,0 +1,121 @@
+<!doctype html><html><head><meta charset="utf-8"><link rel="icon" href="data:,"><title>Native pick parity</title></head><body style="margin:0">
+<script type="module">
+// pickAsync()/pickPointsAsync()/raycastAsync() on WebGL and native WebGPU
+// (both orderings): the same screen points must reconstruct the same world
+// points (< 1 mm) on a synthetic scene (perspective and orthographic) and on
+// the paged LoD fixture. Also reports the pick latency of each backend.
+import * as THREE from 'three';
+import {WebGPURenderer} from 'three/webgpu';
+import {PackedSplats,SparkRenderer,SplatMesh} from '/src/index.ts';
+const errors=[],checks=[];
+window.addEventListener('unhandledrejection',e=>errors.push(String(e.reason)));
+window.addEventListener('error',e=>errors.push(e.message));
+const check=(name,ok,data={})=>{checks.push({name,ok,...data});if(!ok)throw Error(`${name}: ${JSON.stringify(data)}`);};
+const W=160,H=120,TOLERANCE=1e-3;
+// Screen points (CSS px): a grid over the content plus one empty corner.
+const POINTS=[[80,60],[60,45],[100,45],[60,75],[100,75],[70,60],[90,60],[80,50],[80,70],[2,2]];
+
+function syntheticSplats(){
+ let seed=7;const r=()=>{seed^=seed<<13;seed^=seed>>>17;seed^=seed<<5;return (seed>>>0)/4294967296;};
+ return new PackedSplats({maxSplats:6000,construct:d=>{
+  const p=new THREE.Vector3(),s=new THREE.Vector3(),q=new THREE.Quaternion(),c=new THREE.Color();
+  // An opaque, slightly tilted wall...
+  for(let i=0;i<60;i++)for(let j=0;j<60;j++)d.pushSplat(p.set(-1.5+i*.05,-1.5+j*.05,-.3+i*.004),s.set(.04,.04,.01),q.identity(),.95,c.setRGB(.8,.2,.2));
+  // ...behind a translucent cloud of oriented splats.
+  for(let i=0;i<2400;i++){q.setFromEuler(new THREE.Euler(r()*6,r()*6,r()*6));
+   d.pushSplat(p.set((r()-.5)*2.4,(r()-.5)*2.4,.2+r()*.8),s.set(.02+r()*.06,.02+r()*.06,.005+r()*.03),q,.15+r()*.5,c.setRGB(r(),r(),r()));}
+ }});
+}
+
+async function runCase(engine,scene){
+ const native=engine!=='webgl';
+ const renderer=native?new WebGPURenderer({antialias:false}):new THREE.WebGLRenderer({antialias:false});
+ if(native)await renderer.init();
+ renderer.setPixelRatio(1);renderer.setSize(W,H);document.body.append(renderer.domElement);
+ if(native)renderer.backend.device.addEventListener('uncapturederror',e=>errors.push(e.error.message));
+ const world=new THREE.Scene();
+ const camera=scene==='ortho'?new THREE.OrthographicCamera(-2,2,1.5,-1.5,.1,100):new THREE.PerspectiveCamera(60,W/H,.1,1000);
+ camera.position.set(.3,.2,scene==='paged'?7:4);camera.lookAt(0,0,0);camera.updateMatrixWorld();
+ const spark=new SparkRenderer({renderer,autoUpdate:native,minSortIntervalMs:0,webgpuSort:engine==='webgpu-readback'?'readback':'radix',
+  ...(scene==='paged'?{lodSplatCount:20000}:{enableLod:false})});
+ world.add(spark);
+ const mesh=scene==='paged'?new SplatMesh({url:'/test/browser/fixtures/chunked/furry-logo-pedestal-lod.rad',paged:true}):new SplatMesh({packedSplats:syntheticSplats()});
+ if(scene==='paged')mesh.quaternion.set(1,0,0,0);
+ world.add(mesh);
+ const draw=async()=>{
+  if(native){await spark.renderAsync(world,camera);return;}
+  renderer.getDrawingBufferSize(spark.renderSize);await spark.update({scene:world,camera});
+  const until=performance.now()+5000;while(spark.sorting||spark.sortDirty){if(performance.now()>until)throw Error('Sort did not settle');await new Promise(r=>setTimeout(r,1));}
+  renderer.render(world,camera);
+ };
+ try{
+  await mesh.initialized;
+  const deadline=performance.now()+60000;let quiet=0;
+  while(quiet<3){
+   if(performance.now()>deadline)throw Error(`${engine}/${scene}: did not settle`);
+   await draw();await new Promise(r=>setTimeout(r,16));
+   const pager=spark.pager;
+   const settled=scene!=='paged'||(pager&&mesh.paged.numSplats>0&&!spark.lodDirty&&!pager.isPending()&&spark.lodWorker?.queue==null);
+   quiet=settled?quiet+1:0;
+  }
+  await draw();await draw();
+  const single=[];
+  for(const [x,y] of POINTS)single.push(await spark.pickAsync({camera,x,y,solid:true}));
+  const batch=await spark.pickPointsAsync({camera,points:POINTS.map(([x,y])=>({x,y}))});
+  const rays=[];
+  for(const [x,y] of POINTS){
+   const raycaster=new THREE.Raycaster();raycaster.setFromCamera(new THREE.Vector2(x/W*2-1,1-y/H*2),camera);
+   const hits=await spark.raycastAsync(mesh,raycaster).catch(e=>String(e));
+   rays.push(Array.isArray(hits)?hits[0]?.distance??null:hits);
+  }
+  // Latency: median of repeated single picks at the center.
+  const times=[],batchTimes=[];
+  for(let i=0;i<15;i++){const t=performance.now();await spark.pickAsync({camera,x:80,y:60});times.push(performance.now()-t);}
+  for(let i=0;i<15;i++){const t=performance.now();await spark.pickPointsAsync({camera,points:POINTS.map(([x,y])=>({x,y}))});batchTimes.push(performance.now()-t);}
+  const median=a=>[...a].sort((p,q)=>p-q)[a.length>>1];
+  const plain=r=>r&&{point:r.point.toArray(),pointSolida:r.pointSolida?.toArray()??null,distanceMedia:r.distanceMedia,distanceSolida:r.distanceSolida,copertura:r.copertura,floatType:r.floatType};
+  return {engine,scene,single:single.map(plain),batch:batch.map(plain),rays,pickMs:median(times),batchMs:median(batchTimes)};
+ }finally{spark.dispose();mesh.dispose();renderer.dispose();renderer.domElement.remove();}
+}
+
+const distance=(a,b)=>Math.hypot(a[0]-b[0],a[1]-b[1],a[2]-b[2]);
+const latency={};
+try{
+ if(typeof SparkRenderer.prototype.raycastAsync!=='function')throw Error('raycastAsync missing');
+ for(const scene of ['synthetic','ortho','paged']){
+  const results=[];
+  for(const engine of ['webgl','webgpu','webgpu-readback'])results.push(await runCase(engine,scene));
+  const gl=results[0];
+  const hits=gl.single.filter(Boolean).length;
+  check(`${scene}: WebGL reference picks content`,hits>=POINTS.length-1&&gl.single.at(-1)===null,{hits});
+  const rayHits=gl.rays.filter(d=>typeof d==='number').length;
+  check(`${scene}: WebGL reference raycast hits content`,rayHits>=5,{rays:gl.rays});
+  for(const result of results){latency[`${result.engine}/${scene}`]={pickMs:+result.pickMs.toFixed(2),batchMs:+result.batchMs.toFixed(2)};}
+  for(const other of results.slice(1)){
+   let maxMedia=0,maxSolid=0,maxBatch=0,maxRay=0;
+   for(let i=0;i<POINTS.length;i++){
+    const a=gl.single[i],b=other.single[i];
+    check(`${scene}/${other.engine}: point ${i} hit agrees`,!a===!b,{webgl:a,webgpu:b});
+    if(a){
+     maxMedia=Math.max(maxMedia,distance(a.point,b.point));
+     check(`${scene}/${other.engine}: point ${i} solid hit agrees`,!a.pointSolida===!b.pointSolida,{webgl:a,webgpu:b});
+     if(a.pointSolida)maxSolid=Math.max(maxSolid,distance(a.pointSolida,b.pointSolida));
+    }
+    const c=gl.batch[i],d=other.batch[i];
+    check(`${scene}/${other.engine}: batch ${i} hit agrees`,!c===!d,{webgl:c,webgpu:d});
+    if(c)maxBatch=Math.max(maxBatch,distance(c.point,d.point));
+    // The batch must match the single picks on the same backend.
+    if(d&&b)check(`${scene}/${other.engine}: batch ${i} equals single`,distance(d.point,b.point)<1e-5,{single:b,batch:d});
+    const ra=gl.rays[i],rb=other.rays[i];
+    check(`${scene}/${other.engine}: raycast ${i} agrees`,(ra===null&&rb===null)||(typeof ra==='number'&&typeof rb==='number'&&Math.abs(ra-rb)<TOLERANCE),{webgl:ra,webgpu:rb});
+    if(typeof ra==='number')maxRay=Math.max(maxRay,Math.abs(ra-rb));
+   }
+   check(`${scene}/${other.engine}: pick point within 1 mm`,maxMedia<TOLERANCE,{maxMedia});
+   check(`${scene}/${other.engine}: solid point within 1 mm`,maxSolid<TOLERANCE,{maxSolid});
+   check(`${scene}/${other.engine}: batch point within 1 mm`,maxBatch<TOLERANCE,{maxBatch});
+   check(`${scene}/${other.engine}: raycast distance within 1 mm`,maxRay<TOLERANCE,{maxRay,floatType:other.single[0]?.floatType});
+  }
+ }
+ window.lifecycleResult={passed:errors.length===0,checks,errors,latency};
+}catch(e){window.lifecycleResult={passed:false,checks,errors,latency,error:String(e)};}
+</script></body></html>
