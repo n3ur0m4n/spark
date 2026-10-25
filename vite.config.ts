@@ -123,6 +123,14 @@ export default defineConfig(({ mode }) => {
     server: {
       watch: {
         usePolling: true,
+        // Polling stats every watched file: skip Cargo output and benchmark
+        // data (tens of thousands of files), which otherwise starve the server.
+        ignored: [
+          "**/rust/target/**",
+          "**/bench/data/**",
+          "**/bench/picker-bench/**",
+          "**/test-results/**",
+        ],
       },
       port: 8080,
     },
