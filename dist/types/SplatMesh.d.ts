@@ -142,6 +142,9 @@ export declare class SplatMesh extends SplatGenerator {
     coneFoveate?: number;
     showLodPage?: number;
     showLodPageDyno: DynoInt<string>;
+    private sourceFrameUpdate;
+    private sourceGenerator?;
+    hasNativeSourceGenerator(): boolean;
     constructor(options?: SplatMeshOptions);
     asyncInitialize(options: SplatMeshOptions): Promise<void>;
     static dynoTime: DynoFloat<"value">;
@@ -154,7 +157,7 @@ export declare class SplatMesh extends SplatGenerator {
     private constructGenerator;
     constructCovGenerator(context: SplatMeshContext): void;
     updateGenerator(): void;
-    update({ renderer, time, deltaTime, viewToWorld, camera, renderSize, globalEdits, lodIndices, }: FrameUpdateContext): void;
+    update({ time, deltaTime, viewToWorld, camera, renderSize, globalEdits, lodIndices, }: FrameUpdateContext | Omit<FrameUpdateContext, "renderer">): void;
     raycast(raycaster: THREE.Raycaster, intersects: {
         distance: number;
         point: THREE.Vector3;

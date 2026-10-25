@@ -49,7 +49,10 @@ export declare class PackedSplats implements SplatSource {
     isInitialized: boolean;
     target: THREE.WebGLArrayRenderTarget | null;
     source: THREE.DataArrayTexture | null;
-    needsUpdate: boolean;
+    dataVersion: number;
+    private _needsUpdate;
+    get needsUpdate(): boolean;
+    set needsUpdate(value: boolean);
     dyno: DynoUniform<typeof TPackedSplats, "packedSplats">;
     dynoRgbMinMaxLnScaleMinMax: DynoUniform<"vec4", "rgbMinMaxLnScaleMinMax">;
     dynoNumSh: DynoInt<"numSh">;

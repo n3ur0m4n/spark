@@ -36,6 +36,11 @@ export type ExtSplatsOptions = {
 export declare class ExtSplats implements SplatSource {
     maxSplats: number;
     numSplats: number;
+    /** Set after directly editing extArrays; also mark the SplatMesh for update. */
+    dataVersion: number;
+    private _needsUpdate;
+    get needsUpdate(): boolean;
+    set needsUpdate(value: boolean);
     extArrays: [Uint32Array, Uint32Array];
     extra: ExtSplatsExtra;
     maxSh: number;
@@ -73,6 +78,7 @@ export declare class ExtSplats implements SplatSource {
     setSplat(index: number, center: THREE.Vector3, scales: THREE.Vector3, quaternion: THREE.Quaternion, opacity: number, color: THREE.Color): void;
     pushSplat(center: THREE.Vector3, scales: THREE.Vector3, quaternion: THREE.Quaternion, opacity: number, color: THREE.Color): void;
     forEachSplat(callback: (index: number, center: THREE.Vector3, scales: THREE.Vector3, quaternion: THREE.Quaternion, opacity: number, color: THREE.Color) => void): void;
+    getTextures(): [THREE.DataArrayTexture, THREE.DataArrayTexture];
     private updateTextures;
     extractSplats(indices: Uint32Array, pageColoring: boolean): ExtSplats;
     static emptyArray: THREE.DataArrayTexture;

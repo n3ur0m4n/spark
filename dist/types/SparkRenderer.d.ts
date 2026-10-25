@@ -2,18 +2,22 @@ import * as THREE from "three";
 import { ExtSplats } from "./ExtSplats";
 import { PackedSplats } from "./PackedSplats";
 import { PagedSplats } from "./PagedSplats";
+import { type SparkHostRenderer } from "./RendererAdapter";
+import type { SparkRenderStats } from "./SparkRenderStats";
 import { SplatAccumulator } from "./SplatAccumulator";
 import { SplatMesh } from "./SplatMesh";
 import { SplatPager } from "./SplatPager";
 import { SplatWorker } from "./SplatWorker";
-export interface SparkRendererOptions {
+export interface SparkRendererOptions<R extends SparkHostRenderer = THREE.WebGLRenderer> {
     /**
      * Pass in your THREE.WebGLRenderer instance so Spark can perform work
      * outside the usual render loop. Should be created with antialias: false
      * (default setting) as WebGL anti-aliasing doesn't improve Gaussian Splatting
      * rendering and significantly reduces performance.
      */
-    renderer: THREE.WebGLRenderer;
+    renderer: R;
+    /** Native sort implementation. The reference uses GPU-generated depths and WASM sorting. */
+    webgpuSort?: "readback" | "radix";
     /**
      * Callback function to be called when SparkRenderer needs to re-render,
      * for example when splat sort order or LoD updates complete. May fire
@@ -368,13 +372,24 @@ export interface SparkPickResult {
     /** Wall-clock time for the whole pickAsync() call, in ms. */
     ms: number;
 }
-export declare class SparkRenderer extends THREE.Mesh {
-    readonly renderer: THREE.WebGLRenderer;
-    readonly material: THREE.ShaderMaterial;
+export declare class SparkRenderer<R extends SparkHostRenderer = THREE.WebGLRenderer> extends THREE.Mesh {
+    readonly renderer: R;
+    readonly material: R extends THREE.WebGLRenderer ? THREE.ShaderMaterial : THREE.Material;
+    private readonly adapter;
+    private readonly native;
+    webgpuSort: "readback" | "radix";
+    get isWebGPU(): boolean;
+    get webgpuBackend(): import("./WebGPUSplatBackend").WebGPUSplatBackend | null;
+    getCapabilities(): import("./RendererCapabilities").SparkRendererCapabilities;
+    /** Committed counts. GPU radix counts remain unavailable until explicitly read. */
+    getRenderStats(): SparkRenderStats;
+    /** Read counts for the generation committed when called; this may wait for the GPU. */
+    readRenderStatsAsync(): Promise<SparkRenderStats>;
+    private requireWebGLRenderer;
     readonly uniforms: ReturnType<typeof SparkRenderer.makeUniforms>;
     autoUpdate: boolean;
     preUpdate: boolean;
-    static sparkOverride?: SparkRenderer;
+    static sparkOverride?: SparkRenderer<SparkHostRenderer>;
     renderSize: THREE.Vector2;
     maxStdDev: number;
     minPixelRadius: number;
@@ -409,8 +424,13 @@ export declare class SparkRenderer extends THREE.Mesh {
     updateTimeoutId: ReturnType<typeof setTimeout> | undefined;
     onDirty?: () => void;
     dirty: boolean;
+    private readonly orderingBuffers;
     orderingTexture: THREE.DataTexture | null;
     maxSplats: number;
+    /**
+     * WebGL/reference draw count. With native radix this is an upper bound until
+     * readRenderStatsAsync() completes; use getRenderStats() for explicit validity.
+     */
     activeSplats: number;
     display: SplatAccumulator;
     current: SplatAccumulator;
@@ -427,7 +447,6 @@ export declare class SparkRenderer extends THREE.Mesh {
     readback32: Uint32Array<ArrayBuffer>;
     sortPool: SplatWorker[];
     private parallelSortBuffers?;
-    private orderingUpload;
     private readonly initWatched;
     enableLod: boolean;
     enableDriveLod: boolean;
@@ -519,7 +538,7 @@ export declare class SparkRenderer extends THREE.Mesh {
     readPause: number;
     sortPause: number;
     sortDelay: number;
-    constructor(options: SparkRendererOptions);
+    constructor(options: SparkRendererOptions<R>);
     static makeUniforms(): {
         renderSize: {
             value: THREE.Vector2;
@@ -621,8 +640,9 @@ export declare class SparkRenderer extends THREE.Mesh {
     dispose(): void;
     private dropErrorIfDisposed;
     setDirty(): void;
-    onBeforeRender(renderer: THREE.WebGLRenderer, scene: THREE.Scene, camera: THREE.Camera): void;
-    onAfterRender(): void;
+    onBeforeRender(renderer: SparkHostRenderer, scene: THREE.Scene, camera: THREE.Camera): void | Promise<void>;
+    private readonly orderingTrace;
+    onAfterRender(_renderer: SparkHostRenderer, _scene: THREE.Scene, camera: THREE.Camera): void;
     private updateStochastic;
     clearSplats(): void;
     update({ scene, camera, }: {
@@ -651,6 +671,11 @@ export declare class SparkRenderer extends THREE.Mesh {
     private saveRenderState;
     private resetRenderState;
     private static emptyOrdering;
+    /**
+     * Native WebGPU resolves after update and draw submission. Classic WebGL keeps
+     * its existing background updates. Neither route waits for GPU completion.
+     */
+    renderAsync(scene: THREE.Scene, camera: THREE.Camera): Promise<void>;
     render(scene: THREE.Scene, camera: THREE.Camera): void;
     renderTarget({ scene, camera, }: {
         scene: THREE.Scene;

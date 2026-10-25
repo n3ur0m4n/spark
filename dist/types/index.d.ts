@@ -1,4 +1,5 @@
 export { SparkRenderer, type SparkRendererOptions, type SparkPickResult, } from "./SparkRenderer";
+export type { SparkRenderStats } from "./SparkRenderStats";
 export { SplatAccumulator, type GeneratorMapping } from "./SplatAccumulator";
 export * as dyno from "./dyno";
 export { RgbaArray, readRgbaArray } from "./RgbaArray";
@@ -25,3 +26,6 @@ export * as utils from "./utils";
 export { LN_SCALE_MIN, LN_SCALE_MAX, SplatFileType } from "./defines";
 export * as defines from "./defines";
 export { SparkPortals, type SparkPortalsOptions, type PortalPair, DISK_PORTAL_FRAGMENT_SHADER, } from "./SparkPortals";
+export { getSparkRendererCapabilities, type SparkRendererCapabilities, } from "./RendererCapabilities";
+export type { SparkHostRenderer } from "./RendererAdapter";
+export { createRenderer, WEBGPU_UNSUPPORTED_FEATURES, type CreateRendererOptions, type CreateRendererResult, } from "./createRenderer";
