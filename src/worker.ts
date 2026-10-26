@@ -24,6 +24,8 @@ import init_wasm, {
   get_lod_tree_level,
   raycast_lod_tree,
   set_lod_radii,
+  decode_sogs_files_to_packedsplats,
+  decode_sogs_files_to_extsplats,
 } from "spark-rs";
 import type { ExtResult, PackedResult, SplatEncoding } from "./defines";
 import { sortPar16ScatterJs, sortParScatterJs } from "./sortParallel";
@@ -39,6 +41,8 @@ const rpcHandlers = {
   sortPar16Scatter: sortPar16ScatterJs,
   loadPackedSplats,
   loadExtSplats,
+  decodeSogsPacked,
+  decodeSogsExt,
   tinyLodPackedSplats,
   qualityLodPackedSplats,
   tinyLodExtSplats,
@@ -419,6 +423,43 @@ async function loadPackedSplats(
   return result as
     | (PackedResult & { lodSplats: PackedResult })
     | { lodSplats: PackedResult };
+}
+
+// SOG NON zippato (un file di lod-meta.json): meta.json + webp già scaricati
+// dal main thread (così passano dal fetch della pagina), decode senza lodTree.
+function decodeSogsPacked({
+  meta,
+  names,
+  files,
+  encoding,
+}: {
+  meta: Uint8Array;
+  names: string[];
+  files: Uint8Array[];
+  encoding?: SplatEncoding;
+}): PackedResult {
+  return toPackedResult(
+    decode_sogs_files_to_packedsplats(
+      meta,
+      names,
+      files,
+      encoding,
+    ) as DecodedPackedResult,
+  );
+}
+
+function decodeSogsExt({
+  meta,
+  names,
+  files,
+}: {
+  meta: Uint8Array;
+  names: string[];
+  files: Uint8Array[];
+}): ExtResult {
+  return toExtResult(
+    decode_sogs_files_to_extsplats(meta, names, files) as DecodedExtResult,
+  );
 }
 
 type DecodedExtResult = {

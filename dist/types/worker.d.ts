@@ -11,6 +11,8 @@ declare const rpcHandlers: {
     sortPar16Scatter: typeof sortPar16ScatterJs;
     loadPackedSplats: typeof loadPackedSplats;
     loadExtSplats: typeof loadExtSplats;
+    decodeSogsPacked: typeof decodeSogsPacked;
+    decodeSogsExt: typeof decodeSogsExt;
     tinyLodPackedSplats: typeof tinyLodPackedSplats;
     qualityLodPackedSplats: typeof qualityLodPackedSplats;
     tinyLodExtSplats: typeof tinyLodExtSplats;
@@ -91,6 +93,17 @@ declare function loadPackedSplats({ url, requestHeader, withCredentials, fileByt
 }): Promise<PackedResult | {
     lodSplats: PackedResult;
 }>;
+declare function decodeSogsPacked({ meta, names, files, encoding, }: {
+    meta: Uint8Array;
+    names: string[];
+    files: Uint8Array[];
+    encoding?: SplatEncoding;
+}): PackedResult;
+declare function decodeSogsExt({ meta, names, files, }: {
+    meta: Uint8Array;
+    names: string[];
+    files: Uint8Array[];
+}): ExtResult;
 declare function loadExtSplats({ url, requestHeader, withCredentials, fileBytes, fileType, pathName, chunked, chunkedLength, lod, lodBase, lodAbove, nonLod, sh1Codes, sh2Codes, sh3Codes, }: {
     url?: string;
     requestHeader?: Record<string, string>;

@@ -1,6 +1,7 @@
 import * as THREE from "three";
 
 import { decode_rad_header } from "spark-rs";
+import { type LodMetaData, isLodMetaUrl, parseLodMeta } from "./LodMeta";
 import {
   FileBytesPagedSplatsFetcher,
   type PagedSplatsFetcher,
@@ -65,6 +66,8 @@ export interface PagedSplatsOptions {
    * @default 3
    */
   maxSh?: number;
+  /** Formato LoD PlayCanvas "streamed SOG" (default: url che finisce con lod-meta.json) */
+  lodMeta?: boolean;
 }
 
 export class PagedSplats implements SplatSource {
@@ -83,6 +86,12 @@ export class PagedSplats implements SplatSource {
   indicesVersion = 0;
   splatEncoding?: SplatEncoding;
   radMetaPromise?: Promise<{ meta: RadMeta; chunksStart: number }>;
+  // lod-meta.json: albero foglie appiattito (undefined finché non caricato),
+  // 1 chunk = 1 file filenames[i]. Selezione in LodMeta.selectLodMeta.
+  lodMeta?: LodMetaData;
+  lodMetaPromise?: Promise<LodMetaData>;
+  lodMetaIndices?: Uint32Array;
+  lodMetaError?: unknown;
 
   readonly dynoNumSplats: dyno.DynoInt<"numSplats">;
   readonly dynoIndices: dyno.DynoUsampler2D<"indices", THREE.DataTexture>;
@@ -119,13 +128,21 @@ export class PagedSplats implements SplatSource {
     this.shMax = new dyno.DynoVec3({ value: new THREE.Vector3() });
 
     let fileType = options.fileType;
+    // lod-meta.json (PlayCanvas streamed SOG): solo da rootUrl
+    const lodMeta =
+      !options.fileBytes &&
+      !options.fetchSource &&
+      !!options.rootUrl &&
+      (options.lodMeta ?? (!fileType && isLodMetaUrl(options.rootUrl)));
     if (options.fileBytes) {
       fileType ??= getSplatFileType(options.fileBytes);
       this.fetchSource = new FileBytesPagedSplatsFetcher(options.fileBytes);
     } else if (options.fetchSource) {
       this.fetchSource = options.fetchSource;
     } else if (options.rootUrl) {
-      fileType ??= getSplatFileTypeFromPath(options.rootUrl);
+      fileType ??= lodMeta
+        ? SplatFileType.PCSOGS
+        : getSplatFileTypeFromPath(options.rootUrl);
       this.fetchSource = new UrlPagedSplatsFetcher(
         options.rootUrl,
         options.requestHeader,
@@ -140,6 +157,10 @@ export class PagedSplats implements SplatSource {
     }
     this.fileType = fileType;
 
+    if (lodMeta) {
+      this.lodMetaPromise = this.getLodMeta();
+      return;
+    }
     if (this.fileType === SplatFileType.RAD) {
       this.radMetaPromise = this.getRadMeta();
     }
@@ -201,10 +222,84 @@ export class PagedSplats implements SplatSource {
     return this.radMetaPromise;
   }
 
+  getLodMeta(): Promise<LodMetaData> {
+    if (this.lodMetaPromise) {
+      return this.lodMetaPromise;
+    }
+    this.lodMetaPromise = (async () => {
+      const fetcher = this.fetchSource as UrlPagedSplatsFetcher;
+      const baseUrl = new URL(
+        fetcher.rootUrl,
+        globalThis.location.href,
+      ).toString();
+      const bytes = await fetcher.fetchRangeImpl({
+        url: baseUrl,
+        requestHeader: fetcher.requestHeader,
+        withCredentials: fetcher.withCredentials,
+        signal: this.abortController.signal,
+      });
+      this.lodMeta = parseLodMeta(
+        JSON.parse(new TextDecoder().decode(bytes)),
+        baseUrl,
+      );
+      this.pager?.onUpdate?.();
+      return this.lodMeta;
+    })();
+    this.lodMetaPromise.catch((error) => {
+      this.lodMetaError = error;
+      if (error.name !== "AbortError") {
+        console.error(error);
+      }
+    });
+    return this.lodMetaPromise;
+  }
+
+  // Scarica meta.json + webp del file SOG (cartella) del chunk
+  async fetchSogsFiles(chunk: number) {
+    const { fileUrls } = await this.getLodMeta();
+    if (chunk < 0 || chunk >= fileUrls.length) {
+      throw new Error(
+        `Chunk index out of range: ${chunk} (max: ${fileUrls.length - 1})`,
+      );
+    }
+    const fetcher = this.fetchSource as UrlPagedSplatsFetcher;
+    const fetchUrl = (url: string) =>
+      fetcher.fetchRangeImpl({
+        url,
+        requestHeader: fetcher.requestHeader,
+        withCredentials: fetcher.withCredentials,
+        signal: this.abortController.signal,
+      });
+    const metaUrl = fileUrls[chunk];
+    const meta = await fetchUrl(metaUrl);
+    const json = JSON.parse(new TextDecoder().decode(meta));
+    if (json.count > 65536) {
+      throw new Error(
+        `lod-meta: "${metaUrl}" ha ${json.count} splat, max 65536 per file (1 file = 1 pagina)`,
+      );
+    }
+    const names: string[] = [
+      ...new Set<string>(
+        ["means", "scales", "quats", "sh0", "shN"].flatMap(
+          (key) => json[key]?.files ?? [],
+        ),
+      ),
+    ];
+    const files = await Promise.all(
+      names.map((name) => fetchUrl(new URL(name, metaUrl).toString())),
+    );
+    return { meta, names, files };
+  }
+
   async fetchDecodeChunk(chunk: number) {
     let decodeBytes = undefined;
+    const sogs = this.lodMetaPromise
+      ? await this.fetchSogsFiles(chunk)
+      : undefined;
 
-    if (this.fileType === SplatFileType.RAD) {
+    if (sogs) {
+      // decode sotto, nel worker
+    } else if (this.fileType === SplatFileType.RAD) {
       const { meta, chunksStart } = await this.getRadMeta();
       if (chunk < 0 || chunk >= meta.chunks.length) {
         throw new Error(
@@ -239,13 +334,15 @@ export class PagedSplats implements SplatSource {
         throw new Error("PagedSplats.pager not set");
       }
       if (!this.pager.extSplats) {
-        const result = await worker.call("loadPackedSplats", {
-          fileBytes: decodeBytes,
-          fileType: this.fileType,
-          sh1Codes: this.sh1Codes?.slice(),
-          sh2Codes: this.sh2Codes?.slice(),
-          sh3Codes: (this.sh3Codes as Uint32Array | undefined)?.slice(),
-        });
+        const result = sogs
+          ? { lodSplats: await worker.call("decodeSogsPacked", sogs) }
+          : await worker.call("loadPackedSplats", {
+              fileBytes: decodeBytes,
+              fileType: this.fileType,
+              sh1Codes: this.sh1Codes?.slice(),
+              sh2Codes: this.sh2Codes?.slice(),
+              sh3Codes: (this.sh3Codes as Uint32Array | undefined)?.slice(),
+            });
         if (!("lodSplats" in result)) {
           throw new Error("Loaded chunk does not contain LoD splats");
         }
@@ -284,15 +381,17 @@ export class PagedSplats implements SplatSource {
       }
 
       const sh3Codes = this.sh3Codes as [Uint32Array, Uint32Array] | undefined;
-      const result = await worker.call("loadExtSplats", {
-        fileBytes: decodeBytes,
-        fileType: this.fileType,
-        sh1Codes: this.sh1Codes?.slice(),
-        sh2Codes: this.sh2Codes?.slice(),
-        sh3Codes: sh3Codes
-          ? [sh3Codes[0].slice(), sh3Codes[1].slice()]
-          : undefined,
-      });
+      const result = sogs
+        ? { lodSplats: await worker.call("decodeSogsExt", sogs) }
+        : await worker.call("loadExtSplats", {
+            fileBytes: decodeBytes,
+            fileType: this.fileType,
+            sh1Codes: this.sh1Codes?.slice(),
+            sh2Codes: this.sh2Codes?.slice(),
+            sh3Codes: sh3Codes
+              ? [sh3Codes[0].slice(), sh3Codes[1].slice()]
+              : undefined,
+          });
       if (!("lodSplats" in result)) {
         throw new Error("Loaded chunk does not contain LoD splats");
       }

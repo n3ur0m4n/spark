@@ -200,6 +200,24 @@ fn decode_sogs<T: SplatReceiver>(bytes: Vec<u8>, splats: &mut T, _pathname: Opti
     }
 }
 
+/// Decodifica un SOG NON zippato (cartella, es. un file di lod-meta.json):
+/// `meta_bytes` = meta.json, `files` = nome file (come in meta.json) → bytes webp.
+pub fn decode_sogs_files<T: SplatReceiver>(
+    meta_bytes: &[u8],
+    files: &HashMap<String, Vec<u8>>,
+    splats: &mut T,
+) -> anyhow::Result<()> {
+    let meta: PcSogsRoot = serde_json::from_slice(meta_bytes)
+        .context("Failed to parse meta.json for SOGS")?;
+    let mut get_file = |name: &str| -> anyhow::Result<Vec<u8>> {
+        files.get(name).cloned().ok_or_else(|| anyhow!("Missing file {name} for SOGS"))
+    };
+    match meta {
+        PcSogsRoot::V2(v2) => decode_v2(v2, splats, &mut get_file),
+        PcSogsRoot::V1(v1) => decode_v1(v1, splats, &mut get_file),
+    }
+}
+
 fn meta_files(meta: &PcSogsRoot) -> Vec<&String> {
     let mut out = Vec::new();
     match meta {
@@ -572,22 +590,8 @@ fn decode_image(bytes: &[u8]) -> anyhow::Result<ImageData> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Decodifica un SOG non zippato (meta.json + file per nome) per i test
-    fn decode_sogs_files<T: SplatReceiver>(
-        meta_bytes: &[u8],
-        files: &HashMap<String, Vec<u8>>,
-        splats: &mut T,
-    ) -> anyhow::Result<()> {
-        let meta: PcSogsRoot = serde_json::from_slice(meta_bytes)?;
-        let mut get_file = |name: &str| -> anyhow::Result<Vec<u8>> {
-            files.get(name).cloned().ok_or_else(|| anyhow!("Missing file {name} for SOGS"))
-        };
-        match meta {
-            PcSogsRoot::V2(v2) => decode_v2(v2, splats, &mut get_file),
-            PcSogsRoot::V1(v1) => decode_v1(v1, splats, &mut get_file),
-        }
-    }
+    use crate::gsplat::GsplatArray;
+    use crate::tsplat::TsplatArray;
 
     fn png(rgba: Vec<u8>, w: u32, h: u32) -> Vec<u8> {
         let img = image::RgbaImage::from_raw(w, h, rgba).unwrap();
@@ -801,5 +805,85 @@ mod tests {
         dec.finish().unwrap();
         assert!(dec.buffer.is_empty());
         assert_same(&dec.into_splats(), &reference(&sy, false));
+    }
+
+    #[test]
+    fn decode_sogs_files_v2() {
+        // 2 splat: il primo al massimo (q=65535 → n=ln3 → p=2), il secondo al minimo (n=0 → p=0)
+        let meta = br#"{"version":2,"count":2,
+            "means":{"files":["ml.png","mu.png"],"mins":[0,0,0],"maxs":[1.0986123,1.0986123,1.0986123]},
+            "scales":{"files":["s.png"],"codebook":[0.0,-1.0]},
+            "quats":{"files":["q.png"]},
+            "sh0":{"files":["c.png"],"codebook":[0.0,1.0]}}"#;
+        let mut files = HashMap::new();
+        files.insert("ml.png".to_string(), png(vec![255, 255, 255, 255, 0, 0, 0, 255], 2, 1));
+        files.insert("mu.png".to_string(), png(vec![255, 255, 255, 255, 0, 0, 0, 255], 2, 1));
+        files.insert("s.png".to_string(), png(vec![0, 0, 0, 255, 1, 1, 1, 255], 2, 1));
+        files.insert("q.png".to_string(), png(vec![128, 128, 128, 252, 128, 128, 128, 252], 2, 1));
+        files.insert("c.png".to_string(), png(vec![0, 0, 0, 255, 1, 1, 1, 0], 2, 1));
+
+        let mut splats = GsplatArray::new();
+        decode_sogs_files(meta, &files, &mut splats).unwrap();
+        assert_eq!(splats.len(), 2);
+        let c0 = splats.splats[0].center;
+        assert!((c0.x - 2.0).abs() < 1e-3 && (c0.z - 2.0).abs() < 1e-3, "{c0:?}");
+        assert!(splats.splats[1].center.length() < 1e-4);
+
+        // file mancante → errore chiaro
+        files.remove("q.png");
+        let mut splats = GsplatArray::new();
+        assert!(decode_sogs_files(meta, &files, &mut splats).is_err());
+    }
+
+    /// Test su una cartella SOG reale: `SOGS_DIR=<cartella con meta.json> cargo test -- --nocapture`
+    #[test]
+    fn decode_sogs_files_dir() {
+        let Ok(dir) = std::env::var("SOGS_DIR") else { return };
+        let meta = std::fs::read(format!("{dir}/meta.json")).unwrap();
+        let mut files = HashMap::new();
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().to_string();
+            files.insert(name, std::fs::read(entry.path()).unwrap());
+        }
+        let mut splats = GsplatArray::new();
+        decode_sogs_files(&meta, &files, &mut splats).unwrap();
+        let (mut lo, mut hi) = (glam::Vec3::splat(f32::MAX), glam::Vec3::splat(f32::MIN));
+        for s in splats.splats.iter() {
+            lo = lo.min(s.center);
+            hi = hi.max(s.center);
+        }
+        println!("SOGS_DIR {dir}: {} splat, centri min {lo:?} max {hi:?}", splats.len());
+        assert!(splats.len() > 0);
+
+        // Con lod-meta.json nella cartella padre: centri di ogni foglia dentro il suo bound
+        let Ok(lod_meta) = std::fs::read(format!("{dir}/../lod-meta.json")) else { return };
+        let lod_meta: serde_json::Value = serde_json::from_slice(&lod_meta).unwrap();
+        let folder = std::path::Path::new(&dir).file_name().unwrap().to_string_lossy().to_string();
+        let file_index = lod_meta["filenames"].as_array().unwrap().iter()
+            .position(|f| f.as_str() == Some(&format!("{folder}/meta.json"))).unwrap() as u64;
+        let (mut stack, mut leaves, mut covered) = (vec![&lod_meta["tree"]], 0, 0usize);
+        while let Some(node) = stack.pop() {
+            if let Some(children) = node["children"].as_array() {
+                stack.extend(children.iter());
+                continue;
+            }
+            let v = |k: &str, d: usize| node["bound"][k][d].as_f64().unwrap() as f32;
+            for lod in node["lods"].as_object().unwrap().values() {
+                if lod["file"].as_u64() != Some(file_index) { continue; }
+                let (offset, count) = (lod["offset"].as_u64().unwrap() as usize, lod["count"].as_u64().unwrap() as usize);
+                for s in &splats.splats[offset..offset + count] {
+                    for d in 0..3 {
+                        let tol = 1e-3 * (1.0 + v("max", d).abs().max(v("min", d).abs()));
+                        assert!(s.center[d] >= v("min", d) - tol && s.center[d] <= v("max", d) + tol,
+                            "centro {:?} fuori bound foglia", s.center);
+                    }
+                }
+                leaves += 1;
+                covered += count;
+            }
+        }
+        println!("  {leaves} foglie nel file {file_index}, {covered} splat coperti, tutti dentro i bound");
+        assert_eq!(covered, splats.len());
     }
 }
