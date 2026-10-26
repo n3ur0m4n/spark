@@ -21,6 +21,9 @@ export declare class SparkNativeRenderer {
     /** Mapping (signature without the view) of the last radix-sorted ordering. */
     private sortedMapping;
     private lastSortTime;
+    /** View of the last radix sort (sort epsilon and sort-cone reuse). */
+    private readonly lastSortOrigin;
+    private readonly lastSortDir;
     /** The committed ordering was sorted for an earlier view. */
     private orderingStale;
     private staleTimeout;

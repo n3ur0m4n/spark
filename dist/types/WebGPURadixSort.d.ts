@@ -41,6 +41,9 @@ export declare class WebGPURadixSort {
      * point and using it is a validation error.
      */
     bufferEpoch: number;
+    private bindGroups;
+    private keyIds;
+    private nextKeyId;
     constructor(device: GPUDevice);
     isAvailable(): boolean;
     /**
@@ -62,6 +65,11 @@ export declare class WebGPURadixSort {
      * sorted indices (valid until the next sort or destroy).
      */
     encodeSort(encoder: GPUCommandEncoder, keysBuffer: GPUBuffer, elementCount: number, numBits?: number, skipLastPassKeyWrite?: boolean, destructiveKeys?: boolean, timestamps?: GPUComputePassTimestampWrites): GPUBuffer | null;
+    /**
+     * Cached bind group. Entries depend only on the pass/slot, the caller's
+     * key buffer and the allocation (bufferEpoch clears the cache).
+     */
+    private bindGroup;
     private encodePrefixSum;
 }
 /**

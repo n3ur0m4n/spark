@@ -13111,6 +13111,243 @@ var WebGPUGeneration = class {
 	}
 };
 //#endregion
+//#region src/shaders/onesweepBinning.wgsl?raw
+var onesweepBinning_default = "// Copyright © 2011-2026 PlayCanvas Ltd.\n// Copyright © Thomas Smith (b0nes164/GPUSorting)\n// SPDX-License-Identifier: MIT\n//\n// OneSweep DigitBinningPass: fused rank + block scan + decoupled lookback +\n// coalesced scatter for one 8-bit radix pass. Adapted from playcanvas/engine\n// 209ce5752527ab5050ec9632ca6dc1272542b70d (onesweep-binning.js), see that\n// file for the phase-by-phase description. The key count is always read from\n// b_count[0]; the dispatch must be exactly ceil(count / PART_SIZE) 1D\n// workgroups. The lookback spins, so it needs forward-progress guarantees\n// (NVIDIA/AMD/Intel desktop); other GPUs use the multipass sort.\n\nenable subgroups;\n\n@group(0) @binding(0) var<storage, read> inputKeys: array<u32>;\n@group(0) @binding(1) var<storage, read_write> outputKeys: array<u32>;\n@group(0) @binding(2) var<storage, read> inputValues: array<u32>;\n@group(0) @binding(3) var<storage, read_write> outputValues: array<u32>;\n@group(0) @binding(4) var<storage, read_write> b_passHist: array<atomic<u32>>;\n@group(0) @binding(5) var<storage, read_write> b_index: array<atomic<u32>>;\n@group(0) @binding(6) var<storage, read> b_count: array<u32>;\n\n// FLAGS bit 0: first pass (values = original index), bit 1: skip key write.\noverride PASS: u32 = 0u;\noverride FLAGS: u32 = 0u;\n\nconst RADIX: u32 = 256u;\nconst RADIX_MASK: u32 = 255u;\nconst D_DIM: u32 = 256u;\n// Host-patched: 15 keys/thread need 16420 B of workgroup memory, above the\n// 16384 B default limit; 14 fits.\nconst KEYS_PER_THREAD: u32 = 14u;\nconst PART_SIZE: u32 = D_DIM * KEYS_PER_THREAD;\nconst MAX_SUBGROUPS: u32 = 8u;\nconst WAVE_HISTS_SIZE: u32 = MAX_SUBGROUPS * RADIX;\nconst G_D_SIZE: u32 = max(PART_SIZE, WAVE_HISTS_SIZE);\n\nconst FLAG_REDUCTION: u32 = 1u;\nconst FLAG_INCLUSIVE: u32 = 2u;\nconst FLAG_MASK: u32 = 3u;\n\nvar<workgroup> g_d: array<atomic<u32>, G_D_SIZE>;\nvar<workgroup> digit_base: array<u32, RADIX>;\nvar<workgroup> sg_totals: array<u32, MAX_SUBGROUPS>;\nvar<workgroup> wg_partIndex: u32;\n\nfn passHistOffset(tb: u32, partitionIdx: u32) -> u32 {\n    return PASS * tb * RADIX + partitionIdx * RADIX;\n}\n\n@compute @workgroup_size(256, 1, 1)\nfn main(\n    @builtin(local_invocation_index) TID: u32,\n    @builtin(subgroup_invocation_id) sgInvId: u32,\n    @builtin(subgroup_size) sgSize: u32,\n) {\n    let waveIndex = TID / sgSize;\n    let ltMask = (1u << sgInvId) - 1u;\n    let activeMask = select(0xFFFFFFFFu, (1u << sgSize) - 1u, sgSize < 32u);\n    let currentBit = PASS << 3u;\n    let numKeys = b_count[0];\n    let threadBlocks = (numKeys + PART_SIZE - 1u) / PART_SIZE;\n    let isFirstPass = (FLAGS & 1u) != 0u;\n    let isLastPass = (FLAGS & 2u) != 0u;\n\n    if (TID == 0u) {\n        wg_partIndex = atomicAdd(&b_index[PASS], 1u);\n    }\n    let partitionIndex = workgroupUniformLoad(&wg_partIndex);\n\n    for (var i = TID; i < WAVE_HISTS_SIZE; i = i + D_DIM) {\n        atomicStore(&g_d[i], 0u);\n    }\n    workgroupBarrier();\n\n    let tileStart = partitionIndex * PART_SIZE;\n    let validInBlock = select(0u, min(PART_SIZE, numKeys - tileStart), tileStart < numKeys);\n\n    let subPartSize = sgSize * KEYS_PER_THREAD;\n    let waveBase = tileStart + waveIndex * subPartSize;\n\n    var keys: array<u32, KEYS_PER_THREAD>;\n    var values: array<u32, KEYS_PER_THREAD>;\n    var validMask: u32 = 0u;\n    for (var i = 0u; i < KEYS_PER_THREAD; i = i + 1u) {\n        let gid = waveBase + sgInvId + i * sgSize;\n        let is_valid = gid < numKeys;\n        keys[i] = select(0xFFFFFFFFu, inputKeys[gid], is_valid);\n        values[i] = select(select(0u, inputValues[gid], is_valid), gid, isFirstPass);\n        if (is_valid) {\n            validMask = validMask | (1u << i);\n        }\n    }\n\n    var offsets: array<u32, KEYS_PER_THREAD>;\n    for (var i = 0u; i < KEYS_PER_THREAD; i = i + 1u) {\n        let k = keys[i];\n        let isValid = ((validMask >> i) & 1u) == 1u;\n        let digit = (k >> currentBit) & RADIX_MASK;\n\n        var waveFlag: u32 = activeMask;\n        for (var b = 0u; b < 8u; b = b + 1u) {\n            let t = ((digit >> b) & 1u) == 1u;\n            let ballot = subgroupBallot(t).x;\n            waveFlag = waveFlag & select(~ballot, ballot, t);\n        }\n        waveFlag = waveFlag & subgroupBallot(isValid).x;\n\n        let peerBits = countOneBits(waveFlag & ltMask);\n        let totalBits = countOneBits(waveFlag);\n        let lowestRankPeer = firstTrailingBit(waveFlag);\n\n        var preIncrementVal: u32 = 0u;\n        if (isValid && peerBits == 0u) {\n            preIncrementVal = atomicAdd(&g_d[waveIndex * RADIX + digit], totalBits);\n        }\n        offsets[i] = subgroupShuffle(preIncrementVal, lowestRankPeer) + peerBits;\n        // Reconverge lanes (Independent Thread Scheduling) before next round.\n        workgroupBarrier();\n    }\n\n    var myHistRed: u32 = 0u;\n    {\n        var histReduction = atomicLoad(&g_d[TID]);\n        for (var w = 1u; w < MAX_SUBGROUPS; w = w + 1u) {\n            let idx = TID + w * RADIX;\n            let cnt = atomicLoad(&g_d[idx]);\n            histReduction = histReduction + cnt;\n            atomicStore(&g_d[idx], histReduction - cnt);\n        }\n        myHistRed = histReduction;\n    }\n\n    if (partitionIndex + 1u < threadBlocks) {\n        atomicAdd(&b_passHist[passHistOffset(threadBlocks, partitionIndex + 1u) + TID],\n            FLAG_REDUCTION | (myHistRed << 2u));\n    }\n\n    let warpExcl = subgroupExclusiveAdd(myHistRed);\n    let warpTotal = subgroupAdd(myHistRed);\n    if (sgInvId == 0u) {\n        sg_totals[waveIndex] = warpTotal;\n    }\n    workgroupBarrier();\n    if (TID == 0u) {\n        var acc: u32 = 0u;\n        for (var w = 0u; w < MAX_SUBGROUPS; w = w + 1u) {\n            let t = sg_totals[w];\n            sg_totals[w] = acc;\n            acc = acc + t;\n        }\n    }\n    workgroupBarrier();\n    let myDigitBase = warpExcl + sg_totals[waveIndex];\n\n    var scatterPos: array<u32, KEYS_PER_THREAD>;\n    for (var i = 0u; i < KEYS_PER_THREAD; i = i + 1u) {\n        let digit = (keys[i] >> currentBit) & RADIX_MASK;\n        let warpBase = select(0u, atomicLoad(&g_d[waveIndex * RADIX + digit]), waveIndex > 0u);\n        scatterPos[i] = offsets[i] + warpBase;\n    }\n    digit_base[TID] = myDigitBase;\n    workgroupBarrier();\n    for (var i = 0u; i < KEYS_PER_THREAD; i = i + 1u) {\n        let digit = (keys[i] >> currentBit) & RADIX_MASK;\n        scatterPos[i] = scatterPos[i] + digit_base[digit];\n    }\n    workgroupBarrier();\n\n    // Decoupled lookback (spins on FLAG_NOT_READY).\n    {\n        var lookbackReduction: u32 = 0u;\n        var k: u32 = partitionIndex;\n        var done: bool = false;\n        loop {\n            if (done) { break; }\n            let flagPayload = atomicLoad(&b_passHist[passHistOffset(threadBlocks, k) + TID]);\n            let flag = flagPayload & FLAG_MASK;\n            if (flag == FLAG_INCLUSIVE) {\n                lookbackReduction = lookbackReduction + (flagPayload >> 2u);\n                if (partitionIndex + 1u < threadBlocks) {\n                    atomicAdd(&b_passHist[passHistOffset(threadBlocks, partitionIndex + 1u) + TID],\n                        1u | (lookbackReduction << 2u));\n                }\n                digit_base[TID] = lookbackReduction - myDigitBase;\n                done = true;\n            } else if (flag == FLAG_REDUCTION) {\n                lookbackReduction = lookbackReduction + (flagPayload >> 2u);\n                if (k == 0u) { done = true; } else { k = k - 1u; }\n            }\n        }\n    }\n\n    for (var i = 0u; i < KEYS_PER_THREAD; i = i + 1u) {\n        if (((validMask >> i) & 1u) == 1u) {\n            atomicStore(&g_d[scatterPos[i]], keys[i]);\n        }\n    }\n    workgroupBarrier();\n\n    var linearDigits: array<u32, KEYS_PER_THREAD>;\n    for (var r = 0u; r < KEYS_PER_THREAD; r = r + 1u) {\n        let linearIdx = TID + r * D_DIM;\n        if (linearIdx < validInBlock) {\n            let k = atomicLoad(&g_d[linearIdx]);\n            let digit = (k >> currentBit) & RADIX_MASK;\n            linearDigits[r] = digit;\n            if (!isLastPass) {\n                outputKeys[digit_base[digit] + linearIdx] = k;\n            }\n        }\n    }\n    workgroupBarrier();\n\n    for (var i = 0u; i < KEYS_PER_THREAD; i = i + 1u) {\n        if (((validMask >> i) & 1u) == 1u) {\n            atomicStore(&g_d[scatterPos[i]], values[i]);\n        }\n    }\n    workgroupBarrier();\n\n    for (var r = 0u; r < KEYS_PER_THREAD; r = r + 1u) {\n        let linearIdx = TID + r * D_DIM;\n        if (linearIdx < validInBlock) {\n            outputValues[digit_base[linearDigits[r]] + linearIdx] = atomicLoad(&g_d[linearIdx]);\n        }\n    }\n}\n";
+//#endregion
+//#region src/shaders/onesweepGlobalHist.wgsl?raw
+var onesweepGlobalHist_default = "// Copyright © 2011-2026 PlayCanvas Ltd.\n// Copyright © Thomas Smith (b0nes164/GPUSorting)\n// SPDX-License-Identifier: MIT\n//\n// OneSweep GlobalHistogram: one read of the keys builds the 8-bit digit\n// histograms of every radix pass. Adapted from playcanvas/engine\n// 209ce5752527ab5050ec9632ca6dc1272542b70d (onesweep-global-hist.js); the\n// key count is always read from b_count[0] (GPU or host written).\n\n@group(0) @binding(0) var<storage, read> b_sort: array<vec4<u32>>;\n@group(0) @binding(1) var<storage, read_write> b_globalHist: array<atomic<u32>>;\n@group(0) @binding(2) var<storage, read> b_count: array<u32>;\n\noverride NUM_PASSES: u32 = 2u;\n\nconst RADIX: u32 = 256u;\nconst G_HIST_DIM: u32 = 128u;\nconst G_HIST_PART_SIZE: u32 = 32768u;\nconst G_HIST_PART_SIZE_VEC: u32 = G_HIST_PART_SIZE / 4u;\n\nvar<workgroup> g_gHist: array<atomic<u32>, 2048>;\n\nfn histOffset(row: u32, pass_: u32) -> u32 {\n    return row * RADIX + pass_ * 2u * RADIX;\n}\n\nfn addKey(key: u32, row: u32) {\n    for (var p = 0u; p < NUM_PASSES; p = p + 1u) {\n        atomicAdd(&g_gHist[((key >> (p * 8u)) & 0xFFu) + histOffset(row, p)], 1u);\n    }\n}\n\n@compute @workgroup_size(128, 1, 1)\nfn main(\n    @builtin(local_invocation_index) gtid: u32,\n    @builtin(workgroup_id) gid: vec3<u32>,\n    @builtin(num_workgroups) nwg: vec3<u32>,\n) {\n    let flatGid = gid.x + gid.y * nwg.x;\n    let numKeys = b_count[0];\n\n    for (var i = gtid; i < 2u * NUM_PASSES * RADIX; i = i + G_HIST_DIM) {\n        atomicStore(&g_gHist[i], 0u);\n    }\n    workgroupBarrier();\n\n    // Two shared rows halve atomic contention. Full vec4s take the fast loop;\n    // the single ragged tail vec4 (numKeys % 4 != 0) is handled by one thread.\n    let row = gtid / 64u;\n    let numKeysVecFull = numKeys >> 2u;\n    let partitionStartVec = flatGid * G_HIST_PART_SIZE_VEC;\n    let partitionEndVec = min(partitionStartVec + G_HIST_PART_SIZE_VEC, numKeysVecFull);\n    for (var i = partitionStartVec + gtid; i < partitionEndVec; i = i + G_HIST_DIM) {\n        let q = b_sort[i];\n        addKey(q.x, row);\n        addKey(q.y, row);\n        addKey(q.z, row);\n        addKey(q.w, row);\n    }\n\n    let tailIdx = numKeysVecFull;\n    if ((numKeys & 3u) != 0u &&\n        tailIdx >= partitionStartVec &&\n        tailIdx < partitionStartVec + G_HIST_PART_SIZE_VEC &&\n        (tailIdx - partitionStartVec) % G_HIST_DIM == gtid) {\n        let q = b_sort[tailIdx];\n        let base = tailIdx << 2u;\n        addKey(q.x, row);\n        if (base + 1u < numKeys) { addKey(q.y, row); }\n        if (base + 2u < numKeys) { addKey(q.z, row); }\n    }\n    workgroupBarrier();\n\n    for (var i = gtid; i < RADIX; i = i + G_HIST_DIM) {\n        for (var p = 0u; p < NUM_PASSES; p = p + 1u) {\n            let total = atomicLoad(&g_gHist[i + histOffset(0u, p)]) +\n                atomicLoad(&g_gHist[i + histOffset(1u, p)]);\n            if (total != 0u) {\n                atomicAdd(&b_globalHist[i + p * RADIX], total);\n            }\n        }\n    }\n}\n";
+//#endregion
+//#region src/shaders/onesweepScan.wgsl?raw
+var onesweepScan_default = "// Copyright © 2011-2026 PlayCanvas Ltd.\n// Copyright © Thomas Smith (b0nes164/GPUSorting)\n// SPDX-License-Identifier: MIT\n//\n// OneSweep Scan: exclusive scan of each pass's 256-digit global histogram,\n// published to partition 0 of b_passHist as FLAG_INCLUSIVE so the chained\n// lookback of DigitBinningPass terminates. One workgroup per radix pass.\n// Adapted from playcanvas/engine 209ce5752527ab5050ec9632ca6dc1272542b70d\n// (onesweep-scan.js).\n\nenable subgroups;\n\n@group(0) @binding(0) var<storage, read> b_globalHist: array<u32>;\n@group(0) @binding(1) var<storage, read_write> b_passHist: array<atomic<u32>>;\n@group(0) @binding(2) var<storage, read> b_count: array<u32>;\n\nconst RADIX: u32 = 256u;\nconst FLAG_INCLUSIVE: u32 = 2u;\n// Host-patched: tile size of the binning pass and 256 / min subgroup size.\nconst PART_SIZE: u32 = 3584u;\nconst MAX_SUBGROUPS: u32 = 8u;\n\nvar<workgroup> sg_totals: array<u32, MAX_SUBGROUPS>;\n\n@compute @workgroup_size(256, 1, 1)\nfn main(\n    @builtin(local_invocation_index) gtid: u32,\n    @builtin(workgroup_id) gid: vec3<u32>,\n    @builtin(subgroup_invocation_id) sgInvId: u32,\n    @builtin(subgroup_size) sgSize: u32,\n) {\n    let pass_ = gid.x;\n    let threadBlocks = (b_count[0] + PART_SIZE - 1u) / PART_SIZE;\n    let waveIndex = gtid / sgSize;\n\n    let t = b_globalHist[gtid + pass_ * RADIX];\n    let sgExcl = subgroupExclusiveAdd(t);\n    let sgTotal = subgroupAdd(t);\n    if (sgInvId == 0u) {\n        sg_totals[waveIndex] = sgTotal;\n    }\n    workgroupBarrier();\n\n    if (gtid == 0u) {\n        var acc: u32 = 0u;\n        for (var i = 0u; i < MAX_SUBGROUPS; i = i + 1u) {\n            let v = sg_totals[i];\n            sg_totals[i] = acc;\n            acc = acc + v;\n        }\n    }\n    workgroupBarrier();\n\n    let excl = sgExcl + sg_totals[waveIndex];\n    atomicStore(&b_passHist[pass_ * threadBlocks * RADIX + gtid], (excl << 2u) | FLAG_INCLUSIVE);\n}\n";
+//#endregion
+//#region src/WebGPUOneSweepSort.ts
+var RADIX$1 = 256;
+var G_HIST_PART_SIZE = 32768;
+/**
+* OneSweep's decoupled lookback spins on earlier partitions, which needs
+* forward-progress guarantees. Like PlayCanvas, enable it on NVIDIA only with
+* a <=32 lane subgroup (the binning ballots use 32-bit masks).
+*/
+function oneSweepSupported(device) {
+	if (!device.features.has("subgroups")) return false;
+	const info = device.adapterInfo;
+	if (!info?.vendor?.toLowerCase().includes("nvidia")) return false;
+	return (info.subgroupMinSize || 32) <= 32;
+}
+/**
+* Sorts `count` u32 keys (count read on the GPU from `countBuffer[0]`) and
+* returns the buffer of sorted values. Workgroup counts come from `args`
+* (binning triple at ONESWEEP_BINNING_ARGS, histogram triple at
+* ONESWEEP_HIST_ARGS); see `dispatchArgs`. The input keys buffer is
+* clobbered. Stable, ascending.
+*/
+var WebGPUOneSweepSort = class {
+	constructor(device) {
+		this.histPipes = /* @__PURE__ */ new Map();
+		this.binningPipes = /* @__PURE__ */ new Map();
+		this.capacity = 0;
+		this.allocatedBlocks = 0;
+		this.keys0 = null;
+		this.values0 = null;
+		this.values1 = null;
+		this.passHist = null;
+		this.bindGroups = /* @__PURE__ */ new Map();
+		this.ids = /* @__PURE__ */ new WeakMap();
+		this.nextId = 0;
+		this.device = device;
+		const keysPerThread = device.limits.maxComputeWorkgroupStorageSize >= 16420 ? 15 : 14;
+		this.partSize = 256 * keysPerThread;
+		const info = device.adapterInfo;
+		const maxSubgroups = Math.ceil(256 / (info?.subgroupMinSize || 32));
+		const patch = (code) => code.replace(/const KEYS_PER_THREAD: u32 = \d+u;/, `const KEYS_PER_THREAD: u32 = ${keysPerThread}u;`).replace(/const PART_SIZE: u32 = \d+u;/, `const PART_SIZE: u32 = ${this.partSize}u;`).replace(/const MAX_SUBGROUPS: u32 = \d+u;/, `const MAX_SUBGROUPS: u32 = ${maxSubgroups}u;`);
+		this.histModule = device.createShaderModule({
+			label: "spark-onesweep-hist",
+			code: onesweepGlobalHist_default
+		});
+		this.binningModule = device.createShaderModule({
+			label: "spark-onesweep-binning",
+			code: patch(onesweepBinning_default)
+		});
+		this.scanPipe = device.createComputePipeline({
+			label: "spark-onesweep-scan",
+			layout: "auto",
+			compute: {
+				module: device.createShaderModule({
+					label: "spark-onesweep-scan",
+					code: patch(onesweepScan_default)
+				}),
+				entryPoint: "main"
+			}
+		});
+		this.globalHist = this.buffer("spark-onesweep-global-hist", 4 * RADIX$1 * 4);
+		this.index = this.buffer("spark-onesweep-index", 16);
+	}
+	/** Compile the pipelines for `numBits` ahead of the first sort. */
+	warmup(numBits, initialValues) {
+		this.histPipe(numBits / 8);
+		for (let pass = 0; pass < numBits / 8; pass++) this.binningPipe(pass, this.flags(pass, numBits / 8, initialValues));
+	}
+	/** Indirect args for a host-known count (binning, then histogram). */
+	dispatchArgs(count) {
+		return new Uint32Array([
+			Math.max(1, Math.ceil(count / this.partSize)),
+			1,
+			1,
+			Math.max(1, Math.ceil(count / G_HIST_PART_SIZE)),
+			1,
+			1
+		]);
+	}
+	encodeSort(encoder, keys, capacity, countBuffer, args, numBits, initialValues, timestampWrites) {
+		const numPasses = numBits / 8;
+		this.allocate(capacity);
+		const passHist = this.passHist;
+		const keys0 = this.keys0;
+		const values0 = this.values0;
+		const values1 = this.values1;
+		encoder.clearBuffer(this.globalHist);
+		encoder.clearBuffer(passHist, 0, numPasses * this.allocatedBlocks * RADIX$1 * 4);
+		encoder.clearBuffer(this.index);
+		const pass = encoder.beginComputePass({
+			label: "spark-onesweep",
+			timestampWrites
+		});
+		const hist = this.histPipe(numPasses);
+		pass.setPipeline(hist);
+		pass.setBindGroup(0, this.bindGroup(hist, "hist", [
+			keys,
+			this.globalHist,
+			countBuffer
+		]));
+		pass.dispatchWorkgroupsIndirect(args, 12);
+		pass.setPipeline(this.scanPipe);
+		pass.setBindGroup(0, this.bindGroup(this.scanPipe, "scan", [
+			this.globalHist,
+			passHist,
+			countBuffer
+		]));
+		pass.dispatchWorkgroups(numPasses);
+		let inKeys = keys;
+		let outKeys = keys0;
+		let inValues = initialValues ?? values0;
+		let outValues = values1;
+		for (let p = 0; p < numPasses; p++) {
+			const pipe = this.binningPipe(p, this.flags(p, numPasses, !!initialValues));
+			pass.setPipeline(pipe);
+			pass.setBindGroup(0, this.bindGroup(pipe, `bin${p}`, [
+				inKeys,
+				outKeys,
+				inValues,
+				outValues,
+				passHist,
+				this.index,
+				countBuffer
+			]));
+			pass.dispatchWorkgroupsIndirect(args, 0);
+			if (p < numPasses - 1) {
+				inKeys = outKeys;
+				outKeys = inKeys === keys0 ? keys : keys0;
+				inValues = outValues;
+				outValues = inValues === values0 ? values1 : values0;
+			}
+		}
+		pass.end();
+		return outValues;
+	}
+	destroy() {
+		this.keys0?.destroy();
+		this.values0?.destroy();
+		this.values1?.destroy();
+		this.passHist?.destroy();
+		this.globalHist.destroy();
+		this.index.destroy();
+		this.bindGroups.clear();
+	}
+	flags(pass, numPasses, initialValues) {
+		return (pass === 0 && !initialValues ? 1 : 0) | (pass === numPasses - 1 ? 2 : 0);
+	}
+	histPipe(numPasses) {
+		let pipe = this.histPipes.get(numPasses);
+		if (!pipe) {
+			pipe = this.device.createComputePipeline({
+				label: `spark-onesweep-hist-${numPasses}`,
+				layout: "auto",
+				compute: {
+					module: this.histModule,
+					entryPoint: "main",
+					constants: { NUM_PASSES: numPasses }
+				}
+			});
+			this.histPipes.set(numPasses, pipe);
+		}
+		return pipe;
+	}
+	binningPipe(pass, flags) {
+		const key = `${pass}:${flags}`;
+		let pipe = this.binningPipes.get(key);
+		if (!pipe) {
+			pipe = this.device.createComputePipeline({
+				label: `spark-onesweep-binning-${key}`,
+				layout: "auto",
+				compute: {
+					module: this.binningModule,
+					entryPoint: "main",
+					constants: {
+						PASS: pass,
+						FLAGS: flags
+					}
+				}
+			});
+			this.binningPipes.set(key, pipe);
+		}
+		return pipe;
+	}
+	bindGroup(pipe, slot, buffers) {
+		const key = `${slot}:${pipe.label}:${buffers.map((b) => this.id(b)).join(",")}`;
+		let bg = this.bindGroups.get(key);
+		if (!bg) {
+			if (this.bindGroups.size > 64) this.bindGroups.clear();
+			bg = this.device.createBindGroup({
+				layout: pipe.getBindGroupLayout(0),
+				entries: buffers.map((buffer, binding) => ({
+					binding,
+					resource: { buffer }
+				}))
+			});
+			this.bindGroups.set(key, bg);
+		}
+		return bg;
+	}
+	id(buffer) {
+		let id = this.ids.get(buffer);
+		if (id === void 0) {
+			id = this.nextId++;
+			this.ids.set(buffer, id);
+		}
+		return id;
+	}
+	buffer(label, size) {
+		return this.device.createBuffer({
+			label,
+			size: Math.ceil(size / 256) * 256,
+			usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC
+		});
+	}
+	allocate(capacity) {
+		if (capacity <= this.capacity && this.keys0) return;
+		this.keys0?.destroy();
+		this.values0?.destroy();
+		this.values1?.destroy();
+		this.passHist?.destroy();
+		this.capacity = capacity;
+		this.allocatedBlocks = Math.max(1, Math.ceil(capacity / this.partSize));
+		this.keys0 = this.buffer("spark-onesweep-keys0", capacity * 4);
+		this.values0 = this.buffer("spark-onesweep-values0", capacity * 4);
+		this.values1 = this.buffer("spark-onesweep-values1", capacity * 4);
+		this.passHist = this.buffer("spark-onesweep-pass-hist", 4 * this.allocatedBlocks * RADIX$1 * 4);
+	}
+};
+//#endregion
 //#region src/WebGPURadixSort.ts
 var THREADS_PER_WORKGROUP = 256;
 var ELEMENTS_PER_WORKGROUP = THREADS_PER_WORKGROUP * 8;
@@ -13166,6 +13403,9 @@ var WebGPURadixSort = class {
 		this.lastSkipLastKeyWrite = false;
 		this.sortedIndices = null;
 		this.bufferEpoch = 0;
+		this.bindGroups = /* @__PURE__ */ new Map();
+		this.keyIds = /* @__PURE__ */ new WeakMap();
+		this.nextKeyId = 0;
 		this.device = device;
 		this.maxWorkgroups = device.limits.maxComputeWorkgroupsPerDimension || 65535;
 		this.available = this.compile();
@@ -13374,6 +13614,7 @@ var WebGPURadixSort = class {
 		this.prefixWorkgroupCount = 0;
 		this.activePrefixLevels = 0;
 		this.bufferEpoch++;
+		this.bindGroups.clear();
 	}
 	storageBuffer(label, size) {
 		return this.device.createBuffer({
@@ -13482,7 +13723,7 @@ var WebGPURadixSort = class {
 		let nextValues = this.values1;
 		const numPasses = numBits / BITS_PER_PASS;
 		for (let pass = 0; pass < numPasses; pass++) {
-			const histBg = this.device.createBindGroup({
+			const histBg = this.bindGroup(`h${pass}${+destructiveKeys}`, keysBuffer, {
 				layout: this.histogramLayout,
 				entries: [
 					{
@@ -13513,7 +13754,7 @@ var WebGPURadixSort = class {
 				passEnc.end();
 			}
 			this.encodePrefixSum(encoder);
-			const reorderBg = this.device.createBindGroup({
+			const reorderBg = this.bindGroup(`r${pass}${+destructiveKeys}`, keysBuffer, {
 				layout: this.reorderLayout,
 				entries: [
 					{
@@ -13565,12 +13806,31 @@ var WebGPURadixSort = class {
 		}
 		return this.sortedIndices;
 	}
+	/**
+	* Cached bind group. Entries depend only on the pass/slot, the caller's
+	* key buffer and the allocation (bufferEpoch clears the cache).
+	*/
+	bindGroup(slot, keys, descriptor) {
+		let keyId = keys ? this.keyIds.get(keys) : -1;
+		if (keyId === void 0) {
+			keyId = this.nextKeyId++;
+			if (keys) this.keyIds.set(keys, keyId);
+		}
+		const key = `${slot}:${keyId}`;
+		let bindGroup = this.bindGroups.get(key);
+		if (!bindGroup) {
+			if (this.bindGroups.size > 256) this.bindGroups.clear();
+			bindGroup = this.device.createBindGroup(descriptor);
+			this.bindGroups.set(key, bindGroup);
+		}
+		return bindGroup;
+	}
 	encodePrefixSum(encoder) {
 		if (!this.prefixLayout || !this.prefixScanPipe || !this.prefixAddPipe) return;
 		for (let i = 0; i < this.activePrefixLevels; i++) {
 			const level = this.prefixLevels[i];
 			const uniform = this.prefixUniforms[i];
-			const bg = this.device.createBindGroup({
+			const bg = this.bindGroup(`p${i}`, null, {
 				layout: this.prefixLayout,
 				entries: [
 					{
@@ -13596,7 +13856,7 @@ var WebGPURadixSort = class {
 		for (let i = this.activePrefixLevels - 2; i >= 0; i--) {
 			const level = this.prefixLevels[i];
 			const uniform = this.prefixUniforms[i];
-			const bg = this.device.createBindGroup({
+			const bg = this.bindGroup(`p${i}`, null, {
 				layout: this.prefixLayout,
 				entries: [
 					{
@@ -13623,7 +13883,7 @@ var WebGPURadixSort = class {
 };
 //#endregion
 //#region src/shaders/nativeSort.wgsl?raw
-var nativeSort_default = "struct SortParams { count: u32, _a: u32, _b: u32, _c: u32 }\n@group(0) @binding(0) var<uniform> params: SortParams;\n@group(0) @binding(1) var<storage, read> depths: array<u32>;\n@group(0) @binding(2) var<storage, read_write> keys: array<u32>;\n@group(0) @binding(3) var<storage, read> sorted: array<u32>;\n@group(0) @binding(4) var<storage, read_write> drawArgs: array<u32>;\n\n@compute @workgroup_size(256)\nfn prepareKeys(@builtin(workgroup_id) group: vec3u,\n               @builtin(local_invocation_id) local: vec3u,\n               @builtin(num_workgroups) groups: vec3u) {\n    let i = (group.y * groups.x + group.x) * 256u + local.x;\n    if (i >= params.count) { return; }\n    let depth = depths[i];\n    // Match sort32's validity and descending order, including valid zero and\n    // stable ties. Invalid keys sort strictly after every finite positive key.\n    keys[i] = select(0xffffffffu, 0x7fffffffu - depth, depth < 0x7f800000u);\n}\n\n@compute @workgroup_size(1)\nfn countDraw() {\n    // The sorted valid prefix ends at the first invalid depth. Binary search\n    // avoids CPU readback and avoids an atomic increment for every splat.\n    var lo = 0u;\n    var hi = params.count;\n    while (lo < hi) {\n        let mid = lo + (hi - lo) / 2u;\n        if (depths[sorted[mid]] < 0x7f800000u) { lo = mid + 1u; }\n        else { hi = mid; }\n    }\n    drawArgs[0] = 6u;\n    drawArgs[1] = lo;\n    drawArgs[2] = 0u;\n    drawArgs[3] = 0u;\n    drawArgs[4] = 0u;\n}\n";
+var nativeSort_default = "struct SortParams { count: u32, _a: u32, _b: u32, _c: u32 }\n@group(0) @binding(0) var<uniform> params: SortParams;\n@group(0) @binding(1) var<storage, read> depths: array<u32>;\n@group(0) @binding(2) var<storage, read_write> keys: array<u32>;\n@group(0) @binding(3) var<storage, read> sorted: array<u32>;\n@group(0) @binding(4) var<storage, read_write> drawArgs: array<u32>;\n\n@compute @workgroup_size(256)\nfn prepareKeys(@builtin(workgroup_id) group: vec3u,\n               @builtin(local_invocation_id) local: vec3u,\n               @builtin(num_workgroups) groups: vec3u) {\n    let i = (group.y * groups.x + group.x) * 256u + local.x;\n    if (i >= params.count) { return; }\n    let depth = depths[i];\n    // Match sort32's validity and descending order, including valid zero and\n    // stable ties. Invalid keys sort strictly after every finite positive key.\n    keys[i] = select(0xffffffffu, 0x7fffffffu - depth, depth < 0x7f800000u);\n}\n\n@compute @workgroup_size(1)\nfn countDraw() {\n    // The sorted valid prefix ends at the first invalid depth. Binary search\n    // avoids CPU readback and avoids an atomic increment for every splat.\n    var lo = 0u;\n    var hi = params.count;\n    while (lo < hi) {\n        let mid = lo + (hi - lo) / 2u;\n        if (depths[sorted[mid]] < 0x7f800000u) { lo = mid + 1u; }\n        else { hi = mid; }\n    }\n    drawArgs[0] = 6u;\n    drawArgs[1] = lo;\n    drawArgs[2] = 0u;\n    drawArgs[3] = 0u;\n    drawArgs[4] = 0u;\n}\n\n// OneSweep path: drop invalid (culled) splats before sorting and quantize the\n// survivors' depth to 16 bits between the view's valid min/max. Compaction\n// keeps index order, so the stable sort matches sorting every splat.\n// range[0] holds ~min so a zero-cleared buffer is the identity for atomicMax.\n@group(0) @binding(5) var<storage, read_write> range: array<atomic<u32>>;\n@group(0) @binding(6) var<storage, read_write> blockCounts: array<u32>;\n@group(0) @binding(7) var<storage, read_write> sortCount: array<u32>;\n@group(0) @binding(8) var<storage, read_write> sortArgs: array<u32>;\n@group(0) @binding(9) var<storage, read_write> values: array<u32>;\nvar<workgroup> wgMin: atomic<u32>;\nvar<workgroup> wgMax: atomic<u32>;\nvar<workgroup> scan: array<u32, 256>;\n\nconst BLOCK: u32 = 2048u;\n\nfn isValid(i: u32) -> bool {\n    return i < params.count && depths[i] < 0x7f800000u;\n}\n\n// Inclusive Hillis-Steele scan of `value` across the workgroup.\nfn workgroupScan(local: u32, value: u32) -> u32 {\n    scan[local] = value;\n    workgroupBarrier();\n    for (var offset = 1u; offset < 256u; offset = offset * 2u) {\n        let add = select(0u, scan[local - offset], local >= offset);\n        workgroupBarrier();\n        scan[local] = scan[local] + add;\n        workgroupBarrier();\n    }\n    return scan[local];\n}\n\n// Per 2048-splat block: valid count and the valid depth range.\n@compute @workgroup_size(256)\nfn compactCount(@builtin(workgroup_id) group: vec3u,\n                @builtin(local_invocation_id) local: vec3u,\n                @builtin(num_workgroups) groups: vec3u) {\n    let block = group.y * groups.x + group.x;\n    let base = block * BLOCK + local.x * 8u;\n    var lo = 0xffffffffu;\n    var hi = 0u;\n    var valid = 0u;\n    for (var k = 0u; k < 8u; k = k + 1u) {\n        if (isValid(base + k)) {\n            let depth = depths[base + k];\n            lo = min(lo, depth);\n            hi = max(hi, depth);\n            valid = valid + 1u;\n        }\n    }\n    if (local.x == 0u) {\n        atomicStore(&wgMin, 0xffffffffu);\n        atomicStore(&wgMax, 0u);\n    }\n    let total = workgroupScan(local.x, valid);\n    atomicMin(&wgMin, lo);\n    atomicMax(&wgMax, hi);\n    workgroupBarrier();\n    if (local.x == 255u && block * BLOCK < params.count) {\n        blockCounts[block] = total;\n        atomicMax(&range[0], ~atomicLoad(&wgMin));\n        atomicMax(&range[1], atomicLoad(&wgMax));\n    }\n}\n\n// One workgroup: exclusive block offsets, then the visible count drives the\n// sort, pack and draw dispatches (params._a = OneSweep partition size).\n@compute @workgroup_size(256)\nfn compactScan(@builtin(local_invocation_id) local: vec3u) {\n    let blocks = (params.count + BLOCK - 1u) / BLOCK;\n    var carry = 0u;\n    for (var start = 0u; start < blocks; start = start + 256u) {\n        let i = start + local.x;\n        let value = select(0u, blockCounts[i], i < blocks);\n        let inclusive = workgroupScan(local.x, value);\n        if (i < blocks) { blockCounts[i] = carry + inclusive - value; }\n        carry = carry + scan[255];\n        workgroupBarrier();\n    }\n    if (local.x == 0u) {\n        let n = carry;\n        sortCount[0] = n;\n        sortArgs[0] = (n + params._a - 1u) / params._a;\n        sortArgs[1] = 1u;\n        sortArgs[2] = 1u;\n        sortArgs[3] = (n + 32767u) / 32768u;\n        sortArgs[4] = 1u;\n        sortArgs[5] = 1u;\n        // packOrdering: 16x16 texels (4 indices each) of a 4096-wide texture.\n        sortArgs[6] = 256u;\n        sortArgs[7] = ((n + 16383u) / 16384u + 15u) / 16u;\n        sortArgs[8] = 1u;\n        drawArgs[0] = 6u;\n        drawArgs[1] = n;\n        drawArgs[2] = 0u;\n        drawArgs[3] = 0u;\n        drawArgs[4] = 0u;\n    }\n}\n\n@compute @workgroup_size(256)\nfn compactScatter(@builtin(workgroup_id) group: vec3u,\n                  @builtin(local_invocation_id) local: vec3u,\n                  @builtin(num_workgroups) groups: vec3u) {\n    let block = group.y * groups.x + group.x;\n    let base = block * BLOCK + local.x * 8u;\n    var valid = 0u;\n    for (var k = 0u; k < 8u; k = k + 1u) {\n        valid = valid + select(0u, 1u, isValid(base + k));\n    }\n    let inclusive = workgroupScan(local.x, valid);\n    if (block * BLOCK >= params.count) { return; }\n    var out = blockCounts[block] + inclusive - valid;\n    // Positive finite f32 bits order like the floats; far splats sort first.\n    let lo = bitcast<f32>(~atomicLoad(&range[0]));\n    let hi = bitcast<f32>(atomicLoad(&range[1]));\n    let scale = select(0.0, 65534.0 / (hi - lo), hi > lo);\n    for (var k = 0u; k < 8u; k = k + 1u) {\n        let i = base + k;\n        if (isValid(i)) {\n            let q = u32(clamp((bitcast<f32>(depths[i]) - lo) * scale, 0.0, 65534.0));\n            keys[out] = 0xfffeu - q;\n            values[out] = i;\n            out = out + 1u;\n        }\n    }\n}\n";
 //#endregion
 //#region src/WebGPUSplatBackend.ts
 function makeRenderSlot() {
@@ -13656,6 +13916,10 @@ function makeRenderSlot() {
 var WebGPUSplatBackend = class WebGPUSplatBackend {
 	static {
 		this.MAX_TIMESTAMP_PASSES = 8;
+	}
+	/** Key width of the GPU radix sort in use: 16 (OneSweep) or 32. */
+	get gpuSortKeyBits() {
+		return this.gpuSortMode === "auto" && this.oneSweep ? 16 : 32;
 	}
 	/** The draw mode belongs to the same committed slot as its ordering/count. */
 	get useIndirectDraw() {
@@ -13713,6 +13977,16 @@ var WebGPUSplatBackend = class WebGPUSplatBackend {
 		this.depthWidth = 0;
 		this.depthHeight = 0;
 		this.gpuSorter = null;
+		this.oneSweep = null;
+		this.gpuSortMode = "auto";
+		this.nativeRangeBuffer = null;
+		this.nativeCountBuffer = null;
+		this.nativeSortArgs = null;
+		this.nativeBlockCounts = null;
+		this.nativeCompactValues = null;
+		this.bindGroupCache = /* @__PURE__ */ new Map();
+		this.resourceIds = /* @__PURE__ */ new WeakMap();
+		this.nextResourceId = 0;
 		this.gpuSortUnavailable = false;
 		this.gpuSortValidated = false;
 		this.gpuSortPreparation = null;
@@ -13724,6 +13998,7 @@ var WebGPUSplatBackend = class WebGPUSplatBackend {
 		this.nativeFillPipeline = null;
 		this.nativeKeysPipeline = null;
 		this.nativeCountPipeline = null;
+		this.nativeCompactPipelines = [];
 		this.nativeSortUniform = null;
 		this.sparkUniformData = /* @__PURE__ */ new ArrayBuffer(208);
 		this.fragUniformData = /* @__PURE__ */ new ArrayBuffer(48);
@@ -13752,6 +14027,7 @@ var WebGPUSplatBackend = class WebGPUSplatBackend {
 		this.pickLayout = null;
 		this.pickPipelines = /* @__PURE__ */ new Map();
 		this.pickTargets = [];
+		this.orderingViews = /* @__PURE__ */ new WeakMap();
 		this.nativeKeysBuffer = null;
 		this.sortSequence = 0;
 		this.device = device;
@@ -14562,12 +14838,52 @@ var WebGPUSplatBackend = class WebGPUSplatBackend {
 					entryPoint: "countDraw"
 				}
 			});
+			this.nativeCompactPipelines = [
+				"compactCount",
+				"compactScan",
+				"compactScatter"
+			].map((entryPoint) => this.device.createComputePipeline({
+				label: `spark-native-${entryPoint}`,
+				layout: "auto",
+				compute: {
+					module,
+					entryPoint
+				}
+			}));
 			this.nativeSortUniform = this.device.createBuffer({
 				label: "spark-native-sort-uniform",
 				size: 16,
 				usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
 			});
 		}
+	}
+	/**
+	* Bind groups keyed by pipeline and resource identity. Resources only
+	* change on reallocation, so steady-state sorts create no bind groups.
+	*/
+	cachedBindGroup(pipeline, resources) {
+		const key = `${pipeline.label}|${resources.map(([binding, r]) => `${binding}:${this.resourceId(r)}`).join(",")}`;
+		let bindGroup = this.bindGroupCache.get(key);
+		if (!bindGroup) {
+			if (this.bindGroupCache.size > 128) this.bindGroupCache.clear();
+			bindGroup = this.device.createBindGroup({
+				layout: pipeline.getBindGroupLayout(0),
+				entries: resources.map(([binding, r]) => ({
+					binding,
+					resource: r instanceof GPUBuffer ? { buffer: r } : r
+				}))
+			});
+			this.bindGroupCache.set(key, bindGroup);
+		}
+		return bindGroup;
+	}
+	resourceId(resource) {
+		let id = this.resourceIds.get(resource);
+		if (id === void 0) {
+			id = this.nextResourceId++;
+			this.resourceIds.set(resource, id);
+		}
+		return id;
 	}
 	prepareNativeKeys(encoder, depths, keys, count) {
 		this.ensureNativeSortPipelines();
@@ -14585,24 +14901,77 @@ var WebGPUSplatBackend = class WebGPUSplatBackend {
 			...this.timestampWritesFor("keys")
 		});
 		pass.setPipeline(pipeline);
-		pass.setBindGroup(0, this.device.createBindGroup({
-			layout: pipeline.getBindGroupLayout(0),
-			entries: [
-				{
-					binding: 0,
-					resource: { buffer: uniform }
-				},
-				{
-					binding: 1,
-					resource: { buffer: depths }
-				},
-				{
-					binding: 2,
-					resource: { buffer: keys }
-				}
-			]
-		}));
+		pass.setBindGroup(0, this.cachedBindGroup(pipeline, [
+			[0, uniform],
+			[1, depths],
+			[2, keys]
+		]));
 		pass.dispatchWorkgroups(...this.computeDispatchSize(Math.ceil(count / 256)));
+		pass.end();
+	}
+	/**
+	* OneSweep input: compact the valid (uncull) splats in index order into
+	* 16-bit keys quantized between the view's min/max depth, plus their
+	* indices. The GPU writes the visible count, the sort/pack dispatch args
+	* and the slot's draw args.
+	*/
+	compactNativeKeys(encoder, depths, keys, values, count, drawArgs, partSize) {
+		this.ensureNativeSortPipelines();
+		const uniform = this.nativeSortUniform;
+		const [countPipe, scanPipe, scatterPipe] = this.nativeCompactPipelines;
+		const range = this.nativeRangeBuffer;
+		const sortCount = this.nativeCountBuffer;
+		const args = this.nativeSortArgs;
+		if (!uniform || !scatterPipe || !range || !sortCount || !args) throw new Error("Spark: native compaction pipeline is unavailable");
+		const blocks = Math.ceil(count / 2048);
+		if (!this.nativeBlockCounts || this.nativeBlockCounts.size < blocks * 4) {
+			this.nativeBlockCounts?.destroy();
+			this.nativeBlockCounts = this.device.createBuffer({
+				label: "spark-native-block-counts",
+				size: Math.ceil(blocks * 4 / 256) * 256,
+				usage: GPUBufferUsage.STORAGE
+			});
+		}
+		const blockCounts = this.nativeBlockCounts;
+		this.device.queue.writeBuffer(uniform, 0, new Uint32Array([
+			count,
+			partSize,
+			0,
+			0
+		]));
+		encoder.clearBuffer(range);
+		const pass = encoder.beginComputePass({
+			label: "spark-native-compact",
+			...this.timestampWritesFor("keys")
+		});
+		const dispatch = this.computeDispatchSize(blocks);
+		pass.setPipeline(countPipe);
+		pass.setBindGroup(0, this.cachedBindGroup(countPipe, [
+			[0, uniform],
+			[1, depths],
+			[5, range],
+			[6, blockCounts]
+		]));
+		pass.dispatchWorkgroups(...dispatch);
+		pass.setPipeline(scanPipe);
+		pass.setBindGroup(0, this.cachedBindGroup(scanPipe, [
+			[0, uniform],
+			[4, drawArgs],
+			[6, blockCounts],
+			[7, sortCount],
+			[8, args]
+		]));
+		pass.dispatchWorkgroups(1);
+		pass.setPipeline(scatterPipe);
+		pass.setBindGroup(0, this.cachedBindGroup(scatterPipe, [
+			[0, uniform],
+			[1, depths],
+			[2, keys],
+			[5, range],
+			[6, blockCounts],
+			[9, values]
+		]));
+		pass.dispatchWorkgroups(...dispatch);
 		pass.end();
 	}
 	createDrawArgs() {
@@ -14639,27 +15008,12 @@ var WebGPUSplatBackend = class WebGPUSplatBackend {
 		slot.nativeDrawArgs ??= this.createDrawArgs();
 		const pass = encoder.beginComputePass({ label: "spark-native-draw-count" });
 		pass.setPipeline(pipeline);
-		pass.setBindGroup(0, this.device.createBindGroup({
-			layout: pipeline.getBindGroupLayout(0),
-			entries: [
-				{
-					binding: 0,
-					resource: { buffer: uniform }
-				},
-				{
-					binding: 1,
-					resource: { buffer: depths }
-				},
-				{
-					binding: 3,
-					resource: { buffer: sorted }
-				},
-				{
-					binding: 4,
-					resource: { buffer: slot.nativeDrawArgs }
-				}
-			]
-		}));
+		pass.setBindGroup(0, this.cachedBindGroup(pipeline, [
+			[0, uniform],
+			[1, depths],
+			[3, sorted],
+			[4, slot.nativeDrawArgs]
+		]));
 		pass.dispatchWorkgroups(1);
 		pass.end();
 	}
@@ -15072,6 +15426,10 @@ var WebGPUSplatBackend = class WebGPUSplatBackend {
 			if (!this.gpuSorter.isAvailable() || !this.gpuSorter.warmup(32, true)) throw new Error("GPU radix pipelines are unavailable");
 			this.ensurePackOrderingPipeline();
 			this.ensureNativeSortPipelines();
+			if (oneSweepSupported(this.device)) {
+				this.oneSweep = new WebGPUOneSweepSort(this.device);
+				this.oneSweep.warmup(16, false);
+			}
 		} catch (error) {
 			failure = error;
 		}
@@ -15086,6 +15444,8 @@ var WebGPUSplatBackend = class WebGPUSplatBackend {
 			this.gpuSortUnavailable = true;
 			this.gpuSorter?.destroy();
 			this.gpuSorter = null;
+			this.oneSweep?.destroy();
+			this.oneSweep = null;
 			this.packOrderingUniform?.destroy();
 			this.packOrderingUniform = null;
 			this.packOrderingPipeline = null;
@@ -15145,6 +15505,14 @@ var WebGPUSplatBackend = class WebGPUSplatBackend {
 			usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
 		});
 	}
+	orderingStorageView(texture) {
+		let view = this.orderingViews.get(texture);
+		if (!view) {
+			view = texture.createView();
+			this.orderingViews.set(texture, view);
+		}
+		return view;
+	}
 	ensureGpuOrderingTexture(slot, width, rows) {
 		const usage = GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST;
 		if (slot.orderingTexture && slot.orderingRows >= rows && (slot.orderingTexture.usage & GPUTextureUsage.STORAGE_BINDING) !== 0) return slot.orderingTexture;
@@ -15188,29 +15556,38 @@ var WebGPUSplatBackend = class WebGPUSplatBackend {
 			0
 		]));
 		const encoder = device.createCommandEncoder({ label: "spark-native-radix" });
-		this.prepareNativeKeys(encoder, depths, keysBuffer, params.numSplats);
-		const sorted = this.gpuSorter.encodeSort(encoder, keysBuffer, params.numSplats, 32, true, true, this.timestampWritesFor("radix")?.timestampWrites);
+		let sorted;
+		const oneSweep = this.gpuSortMode === "auto" ? this.oneSweep : null;
+		if (oneSweep) {
+			const sortBuffer = (label, size, usage = 0) => device.createBuffer({
+				label,
+				size,
+				usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | usage
+			});
+			this.nativeRangeBuffer ??= sortBuffer("spark-native-depth-range", 16);
+			this.nativeCountBuffer ??= sortBuffer("spark-native-sort-count", 16);
+			this.nativeSortArgs ??= sortBuffer("spark-native-sort-args", 48, GPUBufferUsage.INDIRECT);
+			const valueBytes = Math.ceil(params.numSplats * 4 / 256) * 256;
+			if (!this.nativeCompactValues || this.nativeCompactValues.size < valueBytes) {
+				this.nativeCompactValues?.destroy();
+				this.nativeCompactValues = sortBuffer("spark-native-compact-values", valueBytes);
+			}
+			orderSlot.nativeDrawArgs ??= this.createDrawArgs();
+			this.compactNativeKeys(encoder, depths, keysBuffer, this.nativeCompactValues, params.numSplats, orderSlot.nativeDrawArgs, oneSweep.partSize);
+			sorted = oneSweep.encodeSort(encoder, keysBuffer, params.numSplats, this.nativeCountBuffer, this.nativeSortArgs, 16, this.nativeCompactValues, this.timestampWritesFor("radix")?.timestampWrites);
+		} else {
+			this.prepareNativeKeys(encoder, depths, keysBuffer, params.numSplats);
+			sorted = this.gpuSorter.encodeSort(encoder, keysBuffer, params.numSplats, 32, true, true, this.timestampWritesFor("radix")?.timestampWrites);
+		}
 		if (!sorted) {
 			encoder.finish();
 			return false;
 		}
-		const packBg = device.createBindGroup({
-			layout: this.packOrderingLayout,
-			entries: [
-				{
-					binding: 0,
-					resource: { buffer: sorted }
-				},
-				{
-					binding: 1,
-					resource: orderTex.createView()
-				},
-				{
-					binding: 2,
-					resource: { buffer: this.packOrderingUniform }
-				}
-			]
-		});
+		const packBg = this.cachedBindGroup(this.packOrderingPipeline, [
+			[0, sorted],
+			[1, this.orderingStorageView(orderTex)],
+			[2, this.packOrderingUniform]
+		]);
 		{
 			const pass = encoder.beginComputePass({
 				label: "spark-pack-ordering",
@@ -15218,10 +15595,11 @@ var WebGPUSplatBackend = class WebGPUSplatBackend {
 			});
 			pass.setPipeline(this.packOrderingPipeline);
 			pass.setBindGroup(0, packBg);
-			pass.dispatchWorkgroups(Math.ceil(256), Math.ceil(params.orderingRows / 16));
+			if (oneSweep && this.nativeSortArgs) pass.dispatchWorkgroupsIndirect(this.nativeSortArgs, 24);
+			else pass.dispatchWorkgroups(Math.ceil(256), Math.ceil(params.orderingRows / 16));
 			pass.end();
 		}
-		this.countNativeDraw(encoder, orderSlot, depths, sorted);
+		if (!oneSweep) this.countNativeDraw(encoder, orderSlot, depths, sorted);
 		this.useIndirectDraw = true;
 		device.queue.submit([encoder.finish()]);
 		this.sortInFlight = true;
@@ -15278,6 +15656,14 @@ var WebGPUSplatBackend = class WebGPUSplatBackend {
 		this.timestampReadInFlight = false;
 		this.gpuSorter?.destroy();
 		this.gpuSorter = null;
+		this.oneSweep?.destroy();
+		this.oneSweep = null;
+		this.nativeRangeBuffer?.destroy();
+		this.nativeCountBuffer?.destroy();
+		this.nativeSortArgs?.destroy();
+		this.nativeBlockCounts?.destroy();
+		this.nativeCompactValues?.destroy();
+		this.bindGroupCache.clear();
 		this.gpuSortValidated = false;
 		this.gpuSortPreparation = null;
 		this.useIndirectDraw = false;
@@ -15320,6 +15706,21 @@ function halfToFloat(v) {
 }
 //#endregion
 //#region src/SparkNativeRenderer.ts
+var SORT_EPSILON = .001;
+var CONE_MARGIN = 2 * Math.PI / 180;
+/**
+* True when the sort cone of the last sort, rotated by `angle`, still
+* contains the whole perspective view, so its culling leaves no holes.
+*/
+function coneCoversView(camera, sortCullCos, angle, sortCullFov) {
+	const perspective = camera;
+	if (sortCullCos === -2 || !perspective.isPerspectiveCamera) return false;
+	if (perspective.view?.enabled) return false;
+	const tanV = Math.tan(perspective.fov * Math.PI / 360) / (perspective.zoom || 1);
+	const halfDiagonal = Math.atan(tanV * Math.hypot(1, perspective.aspect));
+	const coneHalf = Math.min(sortCullFov, 360) * Math.PI / 360;
+	return angle + halfDiagonal + CONE_MARGIN <= coneHalf;
+}
 /** The native submission path; the WebGL renderer and LoD traversal stay unchanged. */
 var SparkNativeRenderer = class {
 	getRenderStats() {
@@ -15369,6 +15770,8 @@ var SparkNativeRenderer = class {
 		this.currentSignature = "";
 		this.sortedMapping = "";
 		this.lastSortTime = Number.NEGATIVE_INFINITY;
+		this.lastSortOrigin = new three.Vector3(NaN, 0, 0);
+		this.lastSortDir = new three.Vector3();
 		this.orderingStale = false;
 		this.updateQueue = Promise.resolve([]);
 		this.worker = null;
@@ -15726,7 +16129,11 @@ var SparkNativeRenderer = class {
 			});
 			const rows = Math.max(1, Math.ceil(next.numSplats / 16384));
 			const now = performance.now();
-			const reuse = sortMode === "radix" && next.numSplats > 0 && sortCullCos === -2 && mapping === this.sortedMapping && signature !== this.currentSignature && (this.backend.sortInFlight || now < this.lastSortTime + owner.minSortIntervalMs) && this.backend.reuseActiveOrdering(rows);
+			const angle = Math.acos(Math.min(1, Math.max(-1, next.viewDirection.dot(this.lastSortDir))));
+			const withinEpsilon = sortRadial ? next.viewOrigin.distanceTo(this.lastSortOrigin) <= SORT_EPSILON : angle <= SORT_EPSILON;
+			const reusable = sortMode === "radix" && next.numSplats > 0 && mapping === this.sortedMapping && signature !== this.currentSignature && (sortCullCos === -2 || coneCoversView(camera, sortCullCos, angle, owner.sortCullFov));
+			const reuseUntilSorted = reusable && !withinEpsilon && (this.backend.sortInFlight || now < this.lastSortTime + owner.minSortIntervalMs);
+			const reuse = reusable && (withinEpsilon || reuseUntilSorted) && this.backend.reuseActiveOrdering(rows);
 			if (reuse) {
 				indirect = true;
 				activeSplats = meshes.reduce((sum, mesh) => sum + mesh.count, 0);
@@ -15743,6 +16150,8 @@ var SparkNativeRenderer = class {
 				activeSplats = meshes.reduce((sum, mesh) => sum + mesh.count, 0);
 				this.sortedMapping = mapping;
 				this.lastSortTime = now;
+				this.lastSortOrigin.copy(next.viewOrigin);
+				this.lastSortDir.copy(next.viewDirection);
 			} else {
 				this.sortedMapping = "";
 				const readback = await this.backend.readNativeDepths(next.numSplats);
@@ -15777,8 +16186,8 @@ var SparkNativeRenderer = class {
 			owner.sortedDir.copy(next.viewDirection);
 			owner.setDirty();
 			this.currentSignature = signature;
-			this.orderingStale = reuse;
-			if (reuse) this.scheduleFinalSort();
+			this.orderingStale = reuse && reuseUntilSorted;
+			if (this.orderingStale) this.scheduleFinalSort();
 			return visible;
 		} catch (error) {
 			this.sortedMapping = "";

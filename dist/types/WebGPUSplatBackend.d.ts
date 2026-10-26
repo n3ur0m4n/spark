@@ -93,6 +93,20 @@ export declare class WebGPUSplatBackend {
     depthWidth: number;
     depthHeight: number;
     private gpuSorter;
+    /** 16-bit OneSweep sort; null where unsupported (multipass 32-bit). */
+    private oneSweep;
+    /** "multipass" forces the portable 32-bit sort (A/B and pixel tests). */
+    gpuSortMode: "auto" | "multipass";
+    /** Key width of the GPU radix sort in use: 16 (OneSweep) or 32. */
+    get gpuSortKeyBits(): 16 | 32;
+    private nativeRangeBuffer;
+    private nativeCountBuffer;
+    private nativeSortArgs;
+    private nativeBlockCounts;
+    private nativeCompactValues;
+    private bindGroupCache;
+    private resourceIds;
+    private nextResourceId;
     /** Latches pipeline failures; capacity checks still apply to each generation. */
     private gpuSortUnavailable;
     private gpuSortValidated;
@@ -108,6 +122,7 @@ export declare class WebGPUSplatBackend {
     private nativeFillPipeline;
     private nativeKeysPipeline;
     private nativeCountPipeline;
+    private nativeCompactPipelines;
     private nativeSortUniform;
     private sparkUniformData;
     private fragUniformData;
@@ -341,7 +356,20 @@ export declare class WebGPUSplatBackend {
     /** Explicit diagnostic readback; never inserted into the normal radix loop. */
     readNativeDrawCount(): Promise<number>;
     private ensureNativeSortPipelines;
+    /**
+     * Bind groups keyed by pipeline and resource identity. Resources only
+     * change on reallocation, so steady-state sorts create no bind groups.
+     */
+    private cachedBindGroup;
+    private resourceId;
     private prepareNativeKeys;
+    /**
+     * OneSweep input: compact the valid (uncull) splats in index order into
+     * 16-bit keys quantized between the view's min/max depth, plus their
+     * indices. The GPU writes the visible count, the sort/pack dispatch args
+     * and the slot's draw args.
+     */
+    private compactNativeKeys;
     private createDrawArgs;
     /**
      * True from a radix sort's submit until the GPU has executed it. Like the
@@ -409,6 +437,8 @@ export declare class WebGPUSplatBackend {
     ensureGpuSort(): Promise<boolean>;
     private prepareGpuSort;
     private ensurePackOrderingPipeline;
+    private orderingViews;
+    private orderingStorageView;
     private ensureGpuOrderingTexture;
     /**
      * Depth keys + portable GPU radix + pack into the ordering texture.
