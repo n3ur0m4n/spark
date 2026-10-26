@@ -484,6 +484,9 @@ export declare class SparkRenderer<R extends SparkHostRenderer = THREE.WebGLRend
         version: number;
     }[];
     lodDirty: boolean;
+    private lodPagesPending;
+    private lastPagesLodTime;
+    private lodPagesTimer?;
     lodIds: Map<PackedSplats | ExtSplats | PagedSplats, {
         lodId: number;
         lastTouched: number;

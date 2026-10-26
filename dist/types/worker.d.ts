@@ -189,7 +189,7 @@ declare function updateLodTrees({ ranges, }: {
         lodTreeData?: Uint32Array;
     }[];
 }): void;
-declare function traverseLodTrees({ maxSplats, pixelScaleLimit, lastPixelLimit, instances, traverseMode, }: {
+declare function traverseLodTrees({ maxSplats, pixelScaleLimit, lastPixelLimit, instances, traverseMode, raycastMaxSplats, }: {
     maxSplats: number;
     pixelScaleLimit: number;
     lastPixelLimit?: number;
@@ -205,12 +205,18 @@ declare function traverseLodTrees({ maxSplats, pixelScaleLimit, lastPixelLimit, 
         coneFoveate: number;
     }>;
     traverseMode: "dynamic" | "standard";
+    raycastMaxSplats?: number;
 }): {
     keyIndices: Record<string, {
         lodId: number;
         numSplats: number;
         indices: Uint32Array;
     }>;
+    raycastKeyIndices: Record<string, {
+        lodId: number;
+        numSplats: number;
+        indices: Uint32Array;
+    }> | undefined;
     chunks: [number, number][];
     pixelLimit: number | undefined;
 };
