@@ -12637,9 +12637,10 @@ var SplatAccumulator = class SplatAccumulator {
 //#region src/WebGPUComposite.ts
 /** Owns the linear color/depth target shared by Three.js and the splat pass. */
 var WebGPUComposite = class WebGPUComposite {
-	constructor(target, quad, configureOutput) {
+	constructor(target, quad, copyQuad, configureOutput) {
 		this.target = target;
 		this.quad = quad;
+		this.copyQuad = copyQuad;
 		this.configureOutput = configureOutput;
 		this.outputKey = "";
 		this.hdr = true;
@@ -12660,14 +12661,21 @@ var WebGPUComposite = class WebGPUComposite {
 			depthTest: false,
 			depthWrite: false
 		});
-		return new WebGPUComposite(target, new QuadMesh(material), (toneMapping, colorSpace) => {
+		const copyMaterial = new MeshBasicNodeMaterial({
+			transparent: true,
+			blending: three.NoBlending,
+			depthTest: false,
+			depthWrite: false
+		});
+		copyMaterial.fragmentNode = sample;
+		return new WebGPUComposite(target, new QuadMesh(material), new QuadMesh(copyMaterial), (toneMapping, colorSpace) => {
 			const straight = vec4(sample.rgb.div(sample.a.max(1e-6)), 1);
 			const converted = renderOutput(straight, toneMapping, colorSpace);
 			material.fragmentNode = vec4(converted.rgb.mul(sample.a), sample.a);
 			material.needsUpdate = true;
 		});
 	}
-	render(renderer, scene, camera, composite, splitOrder = Number.POSITIVE_INFINITY) {
+	render(renderer, scene, camera, composite, splitOrder = Number.POSITIVE_INFINITY, output = null) {
 		const previous = renderer.getRenderTarget();
 		if (previous || renderer.xr.isPresenting) throw new Error("Spark: native composition currently requires the canvas target outside XR; use WebGL for this scene.");
 		const hdr = renderer.toneMapping !== three.NoToneMapping;
@@ -12678,7 +12686,7 @@ var WebGPUComposite = class WebGPUComposite {
 			texture.colorSpace = hdr ? three.NoColorSpace : three.SRGBColorSpace;
 			this.target.dispose();
 		}
-		const size = renderer.getDrawingBufferSize(new three.Vector2());
+		const size = output ? new three.Vector2(output.width, output.height) : renderer.getDrawingBufferSize(new three.Vector2());
 		this.target.setSize(size.x, size.y);
 		const hostFunction = renderer.getRenderObjectFunction();
 		const draw = (...args) => hostFunction ? hostFunction(...args) : renderer.renderObject(...args);
@@ -12709,6 +12717,15 @@ var WebGPUComposite = class WebGPUComposite {
 		} finally {
 			renderer.setRenderObjectFunction(hostFunction);
 			renderer.setRenderTarget(previous);
+		}
+		if (output) {
+			try {
+				renderer.setRenderTarget(output);
+				this.copyQuad.render(renderer);
+			} finally {
+				renderer.setRenderTarget(previous);
+			}
+			return;
 		}
 		const toneMapping = renderer.toneMapping;
 		const colorSpace = renderer.outputColorSpace;
@@ -12757,8 +12774,10 @@ var WebGPUComposite = class WebGPUComposite {
 	}
 	dispose() {
 		this.target.dispose();
-		const materials = Array.isArray(this.quad.material) ? this.quad.material : [this.quad.material];
-		for (const material of materials) material.dispose();
+		for (const quad of [this.quad, this.copyQuad]) {
+			const materials = Array.isArray(quad.material) ? quad.material : [quad.material];
+			for (const material of materials) material.dispose();
+		}
 	}
 };
 //#endregion
@@ -15808,6 +15827,7 @@ var SparkNativeRenderer = class {
 		this.owner = owner;
 		this.renderer = renderer;
 		this.composite = null;
+		this.targetComposite = null;
 		this.queue = Promise.resolve();
 		this.disposed = false;
 		this.renderVisible = true;
@@ -15877,8 +15897,13 @@ var SparkNativeRenderer = class {
 			if (scale === 0 || node.matrixWorld.determinant() <= 0 || Math.abs(y.lengthSq() - scale) > tolerance || Math.abs(z.lengthSq() - scale) > tolerance || Math.abs(x.dot(y)) > tolerance || Math.abs(x.dot(z)) > tolerance || Math.abs(y.dot(z)) > tolerance) requireWebGL("nonuniform, mirrored or sheared splat transforms");
 		});
 	}
-	/** Each call keeps its camera snapshot and has its own submission promise. */
-	renderAsync(scene, camera) {
+	/**
+	* Each call keeps its camera snapshot and has its own submission promise.
+	* `target` receives the full composite (linear, no tone mapping) instead of
+	* the canvas; it has its own intermediate target so captures do not resize
+	* the canvas one.
+	*/
+	renderAsync(scene, camera, { target = null } = {}) {
 		if (this.disposed) return Promise.reject(/* @__PURE__ */ new Error("SparkRenderer is disposed"));
 		if (camera instanceof three.ArrayCamera) return Promise.reject(/* @__PURE__ */ new Error("Spark: array cameras require THREE.WebGLRenderer; native output was not submitted."));
 		if (camera.reversedDepth) return Promise.reject(/* @__PURE__ */ new Error("Spark: reversed depth requires THREE.WebGLRenderer; native output was not submitted."));
@@ -15892,29 +15917,35 @@ var SparkNativeRenderer = class {
 		const task = this.queue.catch(() => {}).then(async () => {
 			this.assertSupported(scene, snapshot);
 			const visible = this.isVisible(snapshot);
-			this.renderer.getDrawingBufferSize(this.owner.renderSize);
+			const readSize = () => {
+				if (target) this.owner.renderSize.set(target.width, target.height);
+				else this.renderer.getDrawingBufferSize(this.owner.renderSize);
+			};
+			readSize();
 			if (visible) await this.owner.onBeforeRender(this.renderer, scene, snapshot);
 			this.assertSupported(scene, snapshot);
-			if (!this.composite) {
-				const composite = await WebGPUComposite.create();
+			const key = target ? "targetComposite" : "composite";
+			let composite = this[key];
+			if (!composite) {
+				composite = await WebGPUComposite.create();
 				if (this.disposed) {
 					composite.dispose();
 					throw new Error("SparkRenderer is disposed");
 				}
-				this.composite = composite;
+				this[key] = composite;
 			}
-			this.renderer.getDrawingBufferSize(this.owner.renderSize);
+			readSize();
 			this.renderVisible = visible && this.isVisible(snapshot);
 			this.owner.updateStochastic(snapshot);
 			this.backend.stochastic = this.owner.stochasticActive;
 			this.updateUniforms(snapshot);
-			this.composite.render(this.renderer, scene, snapshot, ({ color, depth }) => {
+			composite.render(this.renderer, scene, snapshot, ({ color, depth }) => {
 				if (!this.renderVisible) return;
 				this.backend.premultipliedAlpha = this.owner.premultipliedAlpha;
 				this.backend.ensurePipeline(color.format);
 				if (!this.backend.setExternalDepthTexture(depth, color.width, color.height)) throw new Error("Spark: incompatible native composite depth attachment");
 				this.backend.renderSeparatePass(color, this.owner.activeSplats, true);
-			}, this.owner.renderOrder);
+			}, this.owner.renderOrder, target);
 		});
 		this.queue = task;
 		return task;
@@ -16323,6 +16354,8 @@ var SparkNativeRenderer = class {
 		this.worker = null;
 		this.composite?.dispose();
 		this.composite = null;
+		this.targetComposite?.dispose();
+		this.targetComposite = null;
 		this.backend.dispose();
 	}
 };
@@ -17551,10 +17584,20 @@ var SparkRenderer = class SparkRenderer extends three.Mesh {
 	/**
 	* Native WebGPU resolves after update and draw submission. Classic WebGL keeps
 	* its existing background updates. Neither route waits for GPU completion.
+	* `target` renders the full composite (Three.js objects and splats, with
+	* depth) into that render target instead of the canvas.
 	*/
-	async renderAsync(scene, camera) {
-		if (this.native) return this.native.renderAsync(scene, camera);
-		this.render(scene, camera);
+	async renderAsync(scene, camera, { target = null } = {}) {
+		if (this.native) return this.native.renderAsync(scene, camera, { target });
+		if (!target) return this.render(scene, camera);
+		const renderer = this.requireWebGLRenderer();
+		const previous = renderer.getRenderTarget();
+		try {
+			renderer.setRenderTarget(target);
+			this.render(scene, camera);
+		} finally {
+			renderer.setRenderTarget(previous);
+		}
 	}
 	render(scene, camera) {
 		if (this.isDisposed) throw new Error("SparkRenderer is disposed");

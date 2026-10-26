@@ -2467,10 +2467,24 @@ export class SparkRenderer<
   /**
    * Native WebGPU resolves after update and draw submission. Classic WebGL keeps
    * its existing background updates. Neither route waits for GPU completion.
+   * `target` renders the full composite (Three.js objects and splats, with
+   * depth) into that render target instead of the canvas.
    */
-  async renderAsync(scene: THREE.Scene, camera: THREE.Camera): Promise<void> {
-    if (this.native) return this.native.renderAsync(scene, camera);
-    this.render(scene, camera);
+  async renderAsync(
+    scene: THREE.Scene,
+    camera: THREE.Camera,
+    { target = null }: { target?: THREE.RenderTarget | null } = {},
+  ): Promise<void> {
+    if (this.native) return this.native.renderAsync(scene, camera, { target });
+    if (!target) return this.render(scene, camera);
+    const renderer = this.requireWebGLRenderer();
+    const previous = renderer.getRenderTarget();
+    try {
+      renderer.setRenderTarget(target as THREE.WebGLRenderTarget);
+      this.render(scene, camera);
+    } finally {
+      renderer.setRenderTarget(previous);
+    }
   }
 
   render(scene: THREE.Scene, camera: THREE.Camera): void {

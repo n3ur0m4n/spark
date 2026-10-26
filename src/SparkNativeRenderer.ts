@@ -48,6 +48,7 @@ function coneCoversView(
 export class SparkNativeRenderer {
   readonly backend: WebGPUSplatBackend;
   private composite: WebGPUComposite | null = null;
+  private targetComposite: WebGPUComposite | null = null;
   private queue: Promise<void> = Promise.resolve();
   private disposed = false;
   private renderVisible = true;
@@ -246,8 +247,17 @@ export class SparkNativeRenderer {
     });
   }
 
-  /** Each call keeps its camera snapshot and has its own submission promise. */
-  renderAsync(scene: THREE.Scene, camera: THREE.Camera): Promise<void> {
+  /**
+   * Each call keeps its camera snapshot and has its own submission promise.
+   * `target` receives the full composite (linear, no tone mapping) instead of
+   * the canvas; it has its own intermediate target so captures do not resize
+   * the canvas one.
+   */
+  renderAsync(
+    scene: THREE.Scene,
+    camera: THREE.Camera,
+    { target = null }: { target?: THREE.RenderTarget | null } = {},
+  ): Promise<void> {
     if (this.disposed)
       return Promise.reject(new Error("SparkRenderer is disposed"));
     // ArrayCamera inherits PerspectiveCamera, but needs one generation per view.
@@ -277,27 +287,32 @@ export class SparkNativeRenderer {
       .then(async () => {
         this.assertSupported(scene, snapshot);
         const visible = this.isVisible(snapshot);
-        this.renderer.getDrawingBufferSize(this.owner.renderSize);
+        const readSize = () => {
+          if (target) this.owner.renderSize.set(target.width, target.height);
+          else this.renderer.getDrawingBufferSize(this.owner.renderSize);
+        };
+        readSize();
         if (visible)
           await this.owner.onBeforeRender(this.renderer, scene, snapshot);
         this.assertSupported(scene, snapshot);
-        if (!this.composite) {
-          const composite = await WebGPUComposite.create();
+        const key = target ? "targetComposite" : "composite";
+        let composite = this[key];
+        if (!composite) {
+          composite = await WebGPUComposite.create();
           if (this.disposed) {
             composite.dispose();
             throw new Error("SparkRenderer is disposed");
           }
-          this.composite = composite;
+          this[key] = composite;
         }
         // The host can resize while generation/readback or module loading is
         // pending. Projection uniforms must match the attachments drawn below.
-        this.renderer.getDrawingBufferSize(this.owner.renderSize);
+        readSize();
         this.renderVisible = visible && this.isVisible(snapshot);
-        // Native frames always target the canvas, like WebGL canvas renders.
         this.owner.updateStochastic(snapshot);
         this.backend.stochastic = this.owner.stochasticActive;
         this.updateUniforms(snapshot);
-        this.composite.render(
+        composite.render(
           this.renderer,
           scene,
           snapshot,
@@ -323,6 +338,7 @@ export class SparkNativeRenderer {
             );
           },
           this.owner.renderOrder,
+          target,
         );
       });
     this.queue = task;
@@ -877,6 +893,8 @@ export class SparkNativeRenderer {
     this.worker = null;
     this.composite?.dispose();
     this.composite = null;
+    this.targetComposite?.dispose();
+    this.targetComposite = null;
     this.backend.dispose();
   }
 }

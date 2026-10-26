@@ -15,6 +15,7 @@ export class WebGPUComposite {
   private constructor(
     private readonly target: THREE.RenderTarget,
     private readonly quad: QuadMesh,
+    private readonly copyQuad: QuadMesh,
     private readonly configureOutput: (
       toneMapping: THREE.ToneMapping,
       colorSpace: string,
@@ -40,9 +41,19 @@ export class WebGPUComposite {
       depthTest: false,
       depthWrite: false,
     });
+    // External targets get the stored linear premultiplied color, like a
+    // Three.js render to a target (no tone mapping, linear working space).
+    const copyMaterial = new MeshBasicNodeMaterial({
+      transparent: true,
+      blending: THREE.NoBlending,
+      depthTest: false,
+      depthWrite: false,
+    });
+    copyMaterial.fragmentNode = sample;
     return new WebGPUComposite(
       target,
       new QuadMesh(material),
+      new QuadMesh(copyMaterial),
       (toneMapping, colorSpace) => {
         // The shared target stores premultiplied linear color. Nonlinear color
         // conversion and tone mapping must operate on the straight color, then
@@ -64,6 +75,7 @@ export class WebGPUComposite {
     camera: THREE.Camera,
     composite: (attachments: CompositeAttachments) => void,
     splitOrder = Number.POSITIVE_INFINITY,
+    output: THREE.RenderTarget | null = null,
   ): void {
     const previous = renderer.getRenderTarget();
     if (previous || renderer.xr.isPresenting) {
@@ -82,7 +94,9 @@ export class WebGPUComposite {
       texture.colorSpace = hdr ? THREE.NoColorSpace : THREE.SRGBColorSpace;
       this.target.dispose();
     }
-    const size = renderer.getDrawingBufferSize(new THREE.Vector2());
+    const size = output
+      ? new THREE.Vector2(output.width, output.height)
+      : renderer.getDrawingBufferSize(new THREE.Vector2());
     this.target.setSize(size.x, size.y);
     // Like the WebGL transparent list, transparent objects with renderOrder at
     // or above the SparkRenderer's draw after the splats: pass A skips them,
@@ -134,6 +148,15 @@ export class WebGPUComposite {
         >[0],
       );
       renderer.setRenderTarget(previous);
+    }
+    if (output) {
+      try {
+        renderer.setRenderTarget(output);
+        this.copyQuad.render(renderer);
+      } finally {
+        renderer.setRenderTarget(previous);
+      }
+      return;
     }
     const toneMapping = renderer.toneMapping;
     const colorSpace = renderer.outputColorSpace;
@@ -193,9 +216,11 @@ export class WebGPUComposite {
 
   dispose(): void {
     this.target.dispose();
-    const materials = Array.isArray(this.quad.material)
-      ? this.quad.material
-      : [this.quad.material];
-    for (const material of materials) material.dispose();
+    for (const quad of [this.quad, this.copyQuad]) {
+      const materials = Array.isArray(quad.material)
+        ? quad.material
+        : [quad.material];
+      for (const material of materials) material.dispose();
+    }
   }
 }

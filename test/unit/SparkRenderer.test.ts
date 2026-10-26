@@ -398,3 +398,29 @@ describe("a disposed SparkRenderer", () => {
     await expectNoUnhandledRejection(frame);
   });
 });
+
+describe("renderAsync with a target", () => {
+  test("renders into the target and restores the previous one (WebGL)", async () => {
+    const previous = new THREE.WebGLRenderTarget(1, 1);
+    const target = new THREE.WebGLRenderTarget(4, 4);
+    let current: THREE.WebGLRenderTarget | null = previous;
+    const rendered: (THREE.WebGLRenderTarget | null)[] = [];
+    const renderer = {
+      ...stubRenderer,
+      getRenderTarget: () => current,
+      setRenderTarget: (next: THREE.WebGLRenderTarget | null) => {
+        current = next;
+      },
+      render: () => rendered.push(current),
+    } as unknown as THREE.WebGLRenderer;
+    const spark = new SparkRenderer({ renderer, enableLod: false });
+
+    await spark.renderAsync(new THREE.Scene(), new THREE.PerspectiveCamera(), {
+      target,
+    });
+
+    expect(rendered).toEqual([target]);
+    expect(current).toBe(previous);
+    spark.dispose();
+  });
+});

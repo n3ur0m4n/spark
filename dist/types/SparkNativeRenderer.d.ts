@@ -11,6 +11,7 @@ export declare class SparkNativeRenderer {
     private readonly renderer;
     readonly backend: WebGPUSplatBackend;
     private composite;
+    private targetComposite;
     private queue;
     private disposed;
     private renderVisible;
@@ -39,8 +40,15 @@ export declare class SparkNativeRenderer {
     private identity;
     constructor(owner: SparkRenderer<SparkHostRenderer>, renderer: WebGPURenderer, device: GPUDevice);
     assertSupported(scene: THREE.Scene, camera: THREE.Camera): void;
-    /** Each call keeps its camera snapshot and has its own submission promise. */
-    renderAsync(scene: THREE.Scene, camera: THREE.Camera): Promise<void>;
+    /**
+     * Each call keeps its camera snapshot and has its own submission promise.
+     * `target` receives the full composite (linear, no tone mapping) instead of
+     * the canvas; it has its own intermediate target so captures do not resize
+     * the canvas one.
+     */
+    renderAsync(scene: THREE.Scene, camera: THREE.Camera, { target }?: {
+        target?: THREE.RenderTarget | null;
+    }): Promise<void>;
     /**
      * pickAsync() render: the w x h CSS-pixel crop at (ox, oy) of the
      * fullW x fullH view, drawn from the last submitted frame's ordering. Queued
