@@ -18,6 +18,32 @@ import {
   WebGPUSplatBackend,
 } from "./WebGPUSplatBackend";
 
+// Camera motion below this (world units, or radians for directional sorts)
+// keeps the last ordering, like PlayCanvas.
+const SORT_EPSILON = 0.001;
+// Rotation slack between the sort cone and the view's half-diagonal.
+const CONE_MARGIN = (2 * Math.PI) / 180;
+
+/**
+ * True when the sort cone of the last sort, rotated by `angle`, still
+ * contains the whole perspective view, so its culling leaves no holes.
+ */
+function coneCoversView(
+  camera: THREE.Camera,
+  sortCullCos: number,
+  angle: number,
+  sortCullFov: number,
+): boolean {
+  const perspective = camera as THREE.PerspectiveCamera;
+  if (sortCullCos === -2 || !perspective.isPerspectiveCamera) return false;
+  if (perspective.view?.enabled) return false;
+  const tanV =
+    Math.tan((perspective.fov * Math.PI) / 360) / (perspective.zoom || 1);
+  const halfDiagonal = Math.atan(tanV * Math.hypot(1, perspective.aspect));
+  const coneHalf = (Math.min(sortCullFov, 360) * Math.PI) / 360;
+  return angle + halfDiagonal + CONE_MARGIN <= coneHalf;
+}
+
 /** The native submission path; the WebGL renderer and LoD traversal stay unchanged. */
 export class SparkNativeRenderer {
   readonly backend: WebGPUSplatBackend;
@@ -32,6 +58,9 @@ export class SparkNativeRenderer {
   /** Mapping (signature without the view) of the last radix-sorted ordering. */
   private sortedMapping = "";
   private lastSortTime = Number.NEGATIVE_INFINITY;
+  /** View of the last radix sort (sort epsilon and sort-cone reuse). */
+  private readonly lastSortOrigin = new THREE.Vector3(Number.NaN, 0, 0);
+  private readonly lastSortDir = new THREE.Vector3();
   /** The committed ordering was sorted for an earlier view. */
   private orderingStale = false;
   private staleTimeout: ReturnType<typeof setTimeout> | undefined;
@@ -645,15 +674,30 @@ export class SparkNativeRenderer {
       // Like WebGL, which displays a regenerated accumulator with the last
       // ordering while its worker sort runs: one radix sort at a time (and no
       // more often than minSortIntervalMs) for a view-only change. Validity
-      // is view-independent only without the sort cone.
-      const reuse =
+      // is view-independent without the sort cone, or while the cone still
+      // covers the whole view. Like PlayCanvas (gsplat-manager.js), a view
+      // within SORT_EPSILON of the last sort keeps its ordering for good.
+      const angle = Math.acos(
+        Math.min(1, Math.max(-1, next.viewDirection.dot(this.lastSortDir))),
+      );
+      const withinEpsilon = sortRadial
+        ? next.viewOrigin.distanceTo(this.lastSortOrigin) <= SORT_EPSILON
+        : angle <= SORT_EPSILON;
+      const reusable =
         sortMode === "radix" &&
         next.numSplats > 0 &&
-        sortCullCos === -2 &&
         mapping === this.sortedMapping &&
         signature !== this.currentSignature &&
+        (sortCullCos === -2 ||
+          coneCoversView(camera, sortCullCos, angle, owner.sortCullFov));
+      const reuseUntilSorted =
+        reusable &&
+        !withinEpsilon &&
         (this.backend.sortInFlight ||
-          now < this.lastSortTime + owner.minSortIntervalMs) &&
+          now < this.lastSortTime + owner.minSortIntervalMs);
+      const reuse =
+        reusable &&
+        (withinEpsilon || reuseUntilSorted) &&
         this.backend.reuseActiveOrdering(rows);
       if (reuse) {
         indirect = true;
@@ -675,6 +719,8 @@ export class SparkNativeRenderer {
         activeSplats = meshes.reduce((sum, mesh) => sum + mesh.count, 0);
         this.sortedMapping = mapping;
         this.lastSortTime = now;
+        this.lastSortOrigin.copy(next.viewOrigin);
+        this.lastSortDir.copy(next.viewDirection);
       } else {
         this.sortedMapping = "";
         const readback = await this.backend.readNativeDepths(next.numSplats);
@@ -721,8 +767,9 @@ export class SparkNativeRenderer {
       owner.sortedDir.copy(next.viewDirection);
       owner.setDirty();
       this.currentSignature = signature;
-      this.orderingStale = reuse;
-      if (reuse) this.scheduleFinalSort();
+      // The final sort once the view settles (not needed within epsilon).
+      this.orderingStale = reuse && reuseUntilSorted;
+      if (this.orderingStale) this.scheduleFinalSort();
       return visible;
     } catch (error) {
       this.sortedMapping = "";
