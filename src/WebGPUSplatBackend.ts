@@ -178,6 +178,8 @@ export class WebGPUSplatBackend {
   private nativeRangeBuffer: GPUBuffer | null = null;
   private nativeCountBuffer: GPUBuffer | null = null;
   private nativeSortArgs: GPUBuffer | null = null;
+  private nativeBlockCounts: GPUBuffer | null = null;
+  private nativeCompactValues: GPUBuffer | null = null;
   private bindGroupCache = new Map<string, GPUBindGroup>();
   private resourceIds = new WeakMap<object, number>();
   private nextResourceId = 0;
@@ -201,8 +203,7 @@ export class WebGPUSplatBackend {
   private nativeFillPipeline: GPUComputePipeline | null = null;
   private nativeKeysPipeline: GPUComputePipeline | null = null;
   private nativeCountPipeline: GPUComputePipeline | null = null;
-  private nativeRangePipeline: GPUComputePipeline | null = null;
-  private nativeKeys16Pipeline: GPUComputePipeline | null = null;
+  private nativeCompactPipelines: GPUComputePipeline[] = [];
   private nativeSortUniform: GPUBuffer | null = null;
 
   // Reusable typed arrays for uniform writes
@@ -1303,16 +1304,17 @@ export class WebGPUSplatBackend {
         layout: "auto",
         compute: { module, entryPoint: "countDraw" },
       });
-      this.nativeRangePipeline = this.device.createComputePipeline({
-        label: "spark-native-range-pipeline",
-        layout: "auto",
-        compute: { module, entryPoint: "depthRange" },
-      });
-      this.nativeKeys16Pipeline = this.device.createComputePipeline({
-        label: "spark-native-keys16-pipeline",
-        layout: "auto",
-        compute: { module, entryPoint: "prepareKeys16" },
-      });
+      this.nativeCompactPipelines = [
+        "compactCount",
+        "compactScan",
+        "compactScatter",
+      ].map((entryPoint) =>
+        this.device.createComputePipeline({
+          label: `spark-native-${entryPoint}`,
+          layout: "auto",
+          compute: { module, entryPoint },
+        }),
+      );
       this.nativeSortUniform = this.device.createBuffer({
         label: "spark-native-sort-uniform",
         size: 16,
@@ -1357,23 +1359,16 @@ export class WebGPUSplatBackend {
     return id;
   }
 
-  /**
-   * 32-bit keys for the multipass sort, or (with `range`) 16-bit keys
-   * quantized between the view's min/max valid depth for OneSweep.
-   */
   private prepareNativeKeys(
     encoder: GPUCommandEncoder,
     depths: GPUBuffer,
     keys: GPUBuffer,
     count: number,
-    range?: GPUBuffer,
   ) {
     this.ensureNativeSortPipelines();
-    const pipeline = range
-      ? this.nativeKeys16Pipeline
-      : this.nativeKeysPipeline;
+    const pipeline = this.nativeKeysPipeline;
     const uniform = this.nativeSortUniform;
-    if (!pipeline || !uniform || (range && !this.nativeRangePipeline))
+    if (!pipeline || !uniform)
       throw new Error("Spark: native sort pipeline is unavailable");
     this.device.queue.writeBuffer(
       uniform,
@@ -1384,20 +1379,6 @@ export class WebGPUSplatBackend {
       label: "spark-native-sort-keys",
       ...this.timestampWritesFor("keys"),
     });
-    if (range && this.nativeRangePipeline) {
-      pass.setPipeline(this.nativeRangePipeline);
-      pass.setBindGroup(
-        0,
-        this.cachedBindGroup(this.nativeRangePipeline, [
-          [0, uniform],
-          [1, depths],
-          [5, range],
-        ]),
-      );
-      pass.dispatchWorkgroups(
-        ...this.computeDispatchSize(Math.ceil(count / 2048)),
-      );
-    }
     pass.setPipeline(pipeline);
     pass.setBindGroup(
       0,
@@ -1405,12 +1386,94 @@ export class WebGPUSplatBackend {
         [0, uniform],
         [1, depths],
         [2, keys],
-        ...(range ? [[5, range] as [number, GPUBuffer]] : []),
       ]),
     );
     pass.dispatchWorkgroups(
       ...this.computeDispatchSize(Math.ceil(count / 256)),
     );
+    pass.end();
+  }
+
+  /**
+   * OneSweep input: compact the valid (uncull) splats in index order into
+   * 16-bit keys quantized between the view's min/max depth, plus their
+   * indices. The GPU writes the visible count, the sort/pack dispatch args
+   * and the slot's draw args.
+   */
+  private compactNativeKeys(
+    encoder: GPUCommandEncoder,
+    depths: GPUBuffer,
+    keys: GPUBuffer,
+    values: GPUBuffer,
+    count: number,
+    drawArgs: GPUBuffer,
+    partSize: number,
+  ) {
+    this.ensureNativeSortPipelines();
+    const uniform = this.nativeSortUniform;
+    const [countPipe, scanPipe, scatterPipe] = this.nativeCompactPipelines;
+    const range = this.nativeRangeBuffer;
+    const sortCount = this.nativeCountBuffer;
+    const args = this.nativeSortArgs;
+    if (!uniform || !scatterPipe || !range || !sortCount || !args)
+      throw new Error("Spark: native compaction pipeline is unavailable");
+    const blocks = Math.ceil(count / 2048);
+    if (!this.nativeBlockCounts || this.nativeBlockCounts.size < blocks * 4) {
+      this.nativeBlockCounts?.destroy();
+      this.nativeBlockCounts = this.device.createBuffer({
+        label: "spark-native-block-counts",
+        size: Math.ceil((blocks * 4) / 256) * 256,
+        usage: GPUBufferUsage.STORAGE,
+      });
+    }
+    const blockCounts = this.nativeBlockCounts;
+    this.device.queue.writeBuffer(
+      uniform,
+      0,
+      new Uint32Array([count, partSize, 0, 0]),
+    );
+    encoder.clearBuffer(range);
+    const pass = encoder.beginComputePass({
+      label: "spark-native-compact",
+      ...this.timestampWritesFor("keys"),
+    });
+    const dispatch = this.computeDispatchSize(blocks);
+    pass.setPipeline(countPipe);
+    pass.setBindGroup(
+      0,
+      this.cachedBindGroup(countPipe, [
+        [0, uniform],
+        [1, depths],
+        [5, range],
+        [6, blockCounts],
+      ]),
+    );
+    pass.dispatchWorkgroups(...dispatch);
+    pass.setPipeline(scanPipe);
+    pass.setBindGroup(
+      0,
+      this.cachedBindGroup(scanPipe, [
+        [0, uniform],
+        [4, drawArgs],
+        [6, blockCounts],
+        [7, sortCount],
+        [8, args],
+      ]),
+    );
+    pass.dispatchWorkgroups(1);
+    pass.setPipeline(scatterPipe);
+    pass.setBindGroup(
+      0,
+      this.cachedBindGroup(scatterPipe, [
+        [0, uniform],
+        [1, depths],
+        [2, keys],
+        [5, range],
+        [6, blockCounts],
+        [9, values],
+      ]),
+    );
+    pass.dispatchWorkgroups(...dispatch);
     pass.end();
   }
 
@@ -2163,26 +2226,29 @@ export class WebGPUSplatBackend {
       this.nativeCountBuffer ??= sortBuffer("spark-native-sort-count", 16);
       this.nativeSortArgs ??= sortBuffer(
         "spark-native-sort-args",
-        32,
+        48,
         GPUBufferUsage.INDIRECT,
       );
-      device.queue.writeBuffer(
-        this.nativeCountBuffer,
-        0,
-        new Uint32Array([params.numSplats]),
-      );
-      device.queue.writeBuffer(
-        this.nativeSortArgs,
-        0,
-        oneSweep.dispatchArgs(params.numSplats),
-      );
-      encoder.clearBuffer(this.nativeRangeBuffer);
-      this.prepareNativeKeys(
+      const valueBytes = Math.ceil((params.numSplats * 4) / 256) * 256;
+      if (
+        !this.nativeCompactValues ||
+        this.nativeCompactValues.size < valueBytes
+      ) {
+        this.nativeCompactValues?.destroy();
+        this.nativeCompactValues = sortBuffer(
+          "spark-native-compact-values",
+          valueBytes,
+        );
+      }
+      orderSlot.nativeDrawArgs ??= this.createDrawArgs();
+      this.compactNativeKeys(
         encoder,
         depths,
         keysBuffer,
+        this.nativeCompactValues,
         params.numSplats,
-        this.nativeRangeBuffer,
+        orderSlot.nativeDrawArgs,
+        oneSweep.partSize,
       );
       sorted = oneSweep.encodeSort(
         encoder,
@@ -2191,7 +2257,7 @@ export class WebGPUSplatBackend {
         this.nativeCountBuffer,
         this.nativeSortArgs,
         16,
-        undefined,
+        this.nativeCompactValues,
         this.timestampWritesFor("radix")?.timestampWrites,
       );
     } else {
@@ -2222,14 +2288,18 @@ export class WebGPUSplatBackend {
       });
       pass.setPipeline(this.packOrderingPipeline);
       pass.setBindGroup(0, packBg);
-      pass.dispatchWorkgroups(
-        Math.ceil(4096 / 16),
-        Math.ceil(params.orderingRows / 16),
-      );
+      // OneSweep: the compaction wrote the pack args for the visible count.
+      if (oneSweep && this.nativeSortArgs)
+        pass.dispatchWorkgroupsIndirect(this.nativeSortArgs, 24);
+      else
+        pass.dispatchWorkgroups(
+          Math.ceil(4096 / 16),
+          Math.ceil(params.orderingRows / 16),
+        );
       pass.end();
     }
 
-    this.countNativeDraw(encoder, orderSlot, depths, sorted);
+    if (!oneSweep) this.countNativeDraw(encoder, orderSlot, depths, sorted);
     this.useIndirectDraw = true;
     device.queue.submit([encoder.finish()]);
     this.sortInFlight = true;
@@ -2297,6 +2367,8 @@ export class WebGPUSplatBackend {
     this.nativeRangeBuffer?.destroy();
     this.nativeCountBuffer?.destroy();
     this.nativeSortArgs?.destroy();
+    this.nativeBlockCounts?.destroy();
+    this.nativeCompactValues?.destroy();
     this.bindGroupCache.clear();
     this.gpuSortValidated = false;
     this.gpuSortPreparation = null;
