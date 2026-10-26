@@ -13134,15 +13134,22 @@ var WebGPUComposite = class WebGPUComposite {
 		let deferred = false;
 		const clearColor = renderer.getClearColor(new three.Color());
 		const clearAlpha = renderer.getClearAlpha();
+		const freshDescriptors = (renderTarget) => {
+			if (srgb !== "layer") return;
+			const data = renderer.backend.get?.(renderTarget);
+			if (data && typeof data === "object" && "descriptors" in data) data.descriptors = void 0;
+		};
 		try {
 			if (srgb === "layer") {
 				renderer.setClearColor(0, 0);
 				for (const layer of [this.lateTarget, this.splatTarget]) {
+					freshDescriptors(layer);
 					renderer.setRenderTarget(layer);
 					renderer.clear(true, false, false);
 				}
 				renderer.setClearColor(clearColor, clearAlpha);
 			}
+			freshDescriptors(this.target);
 			renderer.setRenderTarget(this.target);
 			renderer.setRenderObjectFunction(((...args) => {
 				if (late(args[0], args[4])) deferred = true;
@@ -13165,7 +13172,10 @@ var WebGPUComposite = class WebGPUComposite {
 				srgb
 			});
 			if (deferred) {
-				if (srgb === "layer") renderer.setRenderTarget(this.lateTarget);
+				if (srgb === "layer") {
+					freshDescriptors(this.lateTarget);
+					renderer.setRenderTarget(this.lateTarget);
+				}
 				this.renderLate(renderer, scene, camera, late, draw);
 			}
 		} finally {

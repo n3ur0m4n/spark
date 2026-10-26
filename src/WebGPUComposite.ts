@@ -194,17 +194,32 @@ export class WebGPUComposite {
     type Color4 = Parameters<WebGPURenderer["getClearColor"]>[0];
     const clearColor = renderer.getClearColor(new THREE.Color() as Color4);
     const clearAlpha = renderer.getClearAlpha();
+    // target and lateTarget share one depth texture, but Three.js caches a
+    // render pass descriptor (with the depth view) per render target. When
+    // one of them (re)initializes, it destroys and recreates the shared depth
+    // GPU texture and the other's cached descriptor keeps the destroyed view
+    // (validation error, splats dropped). Rebuild the descriptors on each use.
+    const freshDescriptors = (renderTarget: THREE.RenderTarget) => {
+      if (srgb !== "layer") return;
+      const data: unknown = (
+        renderer.backend as unknown as { get?: (o: object) => unknown }
+      ).get?.(renderTarget);
+      if (data && typeof data === "object" && "descriptors" in data)
+        (data as { descriptors?: unknown }).descriptors = undefined;
+    };
     try {
       if (srgb === "layer") {
         // Transparent clears. The late target first: a resize recreates the
         // shared depth texture on its first use, before pass A fills it.
         renderer.setClearColor(0x000000, 0);
         for (const layer of [this.lateTarget, this.splatTarget]) {
+          freshDescriptors(layer);
           renderer.setRenderTarget(layer);
           renderer.clear(true, false, false);
         }
         renderer.setClearColor(clearColor, clearAlpha);
       }
+      freshDescriptors(this.target);
       renderer.setRenderTarget(this.target);
       renderer.setRenderObjectFunction(((...args: RenderObjectArgs) => {
         if (late(args[0], args[4])) deferred = true;
@@ -240,7 +255,10 @@ export class WebGPUComposite {
       const depth = getTexture(this.target.depthTexture);
       composite({ color, depth, srgb });
       if (deferred) {
-        if (srgb === "layer") renderer.setRenderTarget(this.lateTarget);
+        if (srgb === "layer") {
+          freshDescriptors(this.lateTarget);
+          renderer.setRenderTarget(this.lateTarget);
+        }
         this.renderLate(renderer, scene, camera, late, draw);
       }
     } finally {
