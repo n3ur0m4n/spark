@@ -35,7 +35,7 @@ function arrayCamera(camera){
  return new THREE.ArrayCamera(views);
 }
 try{
- for(const mode of ['sprite','logarithmic','reversed','array']){
+ for(const mode of ['logarithmic','reversed','array']){
   const options={antialias:false,logarithmicDepthBuffer:mode==='logarithmic',reversedDepthBuffer:mode==='reversed'};
   const nativeRenderer=new WebGPURenderer(options);await nativeRenderer.init();
   nativeRenderer.backend.device.addEventListener('uncapturederror',e=>errors.push(e.error.message));

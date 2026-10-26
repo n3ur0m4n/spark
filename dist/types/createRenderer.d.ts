@@ -6,7 +6,12 @@ import type { WebGPURenderer } from "three/webgpu";
  * support lands. They mirror the features SparkNativeRenderer and
  * getSparkRendererCapabilities() reject.
  */
-export declare const WEBGPU_UNSUPPORTED_FEATURES: readonly ["xr", "modifiers", "skinning", "specializedTargets", "covarianceSplats", "transparentMeshes", "transparentSprites", "logarithmicDepth", "reversedDepth", "msaa", "customViewport", "scissorTest", "manualClear", "nonuniformSplatTransforms", "arrayCameras"];
+export declare const WEBGPU_UNSUPPORTED_FEATURES: readonly ["xr", "modifiers", "skinning", "specializedTargets", "covarianceSplats", "logarithmicDepth", "reversedDepth", "msaa", "customViewport", "scissorTest", "manualClear", "nonuniformSplatTransforms", "arrayCameras"];
+/**
+ * Smallest storage binding the native backend accepts: one paged extSplats
+ * buffer (256 pages x 65536 splats x 16 bytes). Adapters below select WebGL.
+ */
+export declare const WEBGPU_MIN_STORAGE_BUFFER_BINDING_SIZE: number;
 export type CreateRendererOptions = THREE.WebGLRendererParameters & NonNullable<ConstructorParameters<typeof WebGPURenderer>[0]> & {
     /** Features the app relies on; any unsupported by native WebGPU selects WebGL. */
     needs?: readonly string[];

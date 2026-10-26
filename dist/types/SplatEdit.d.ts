@@ -13,7 +13,8 @@ export declare enum SplatEditSdfType {
 export declare enum SplatEditRgbaBlendMode {
     MULTIPLY = "multiply",
     SET_RGB = "set_rgb",
-    ADD_RGBA = "add_rgba"
+    ADD_RGBA = "add_rgba",
+    SATURATE = "saturate"
 }
 export type SplatEditSdfOptions = {
     type?: SplatEditSdfType;

@@ -13,6 +13,7 @@ export declare class WebGPUComposite {
     private hdr;
     private constructor();
     static create(): Promise<WebGPUComposite>;
-    render(renderer: WebGPURenderer, scene: THREE.Scene, camera: THREE.Camera, composite: (attachments: CompositeAttachments) => void): void;
+    render(renderer: WebGPURenderer, scene: THREE.Scene, camera: THREE.Camera, composite: (attachments: CompositeAttachments) => void, splitOrder?: number): void;
+    private renderLate;
     dispose(): void;
 }

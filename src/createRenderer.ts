@@ -14,8 +14,6 @@ export const WEBGPU_UNSUPPORTED_FEATURES = [
   "skinning",
   "specializedTargets",
   "covarianceSplats",
-  "transparentMeshes",
-  "transparentSprites",
   "logarithmicDepth",
   "reversedDepth",
   "msaa",
@@ -25,6 +23,12 @@ export const WEBGPU_UNSUPPORTED_FEATURES = [
   "nonuniformSplatTransforms",
   "arrayCameras",
 ] as const;
+
+/**
+ * Smallest storage binding the native backend accepts: one paged extSplats
+ * buffer (256 pages x 65536 splats x 16 bytes). Adapters below select WebGL.
+ */
+export const WEBGPU_MIN_STORAGE_BUFFER_BINDING_SIZE = 256 * 1024 * 1024;
 
 export type CreateRendererOptions = THREE.WebGLRendererParameters &
   NonNullable<ConstructorParameters<typeof WebGPURenderer>[0]> & {
@@ -51,10 +55,31 @@ export async function createRenderer(
   const gpu = (globalThis.navigator as Navigator | undefined)?.gpu;
   if (!forceWebGL && gpu && !needs.some((need) => unsupported.includes(need))) {
     const adapter = await gpu.requestAdapter().catch(() => null);
-    if (adapter) {
+    const limits = adapter?.limits;
+    if (
+      adapter &&
+      !(
+        limits &&
+        limits.maxStorageBufferBindingSize <
+          WEBGPU_MIN_STORAGE_BUFFER_BINDING_SIZE
+      )
+    ) {
       // Dynamic so WebGL-only bundles never load three/webgpu.
       const { WebGPURenderer } = await import("three/webgpu");
-      const renderer = new WebGPURenderer(params);
+      // The device defaults (128 MiB binding, 256 MiB buffer) are below what
+      // large paged scenes need: request the adapter maxima.
+      const renderer = new WebGPURenderer(
+        limits
+          ? {
+              ...params,
+              requiredLimits: {
+                ...params.requiredLimits,
+                maxStorageBufferBindingSize: limits.maxStorageBufferBindingSize,
+                maxBufferSize: limits.maxBufferSize,
+              },
+            }
+          : params,
+      );
       try {
         await renderer.init();
         // WebGPURenderer silently falls back to its WebGL2 backend.

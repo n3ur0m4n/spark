@@ -57,6 +57,24 @@ describe("createRenderer", () => {
     expect(renderer).toMatchObject({ params: { antialias: false } });
   });
 
+  test("requests the adapter storage limits", async () => {
+    const limits = {
+      maxStorageBufferBindingSize: 1 << 30,
+      maxBufferSize: 2 ** 31,
+    };
+    stubGpu({ limits });
+    const { renderer, backend } = await createRenderer();
+    expect(backend).toBe("webgpu");
+    expect(renderer).toMatchObject({ params: { requiredLimits: limits } });
+  });
+
+  test("falls back to WebGL when the adapter storage limit is too small", async () => {
+    stubGpu({
+      limits: { maxStorageBufferBindingSize: 1 << 27, maxBufferSize: 1 << 28 },
+    });
+    expect((await createRenderer()).backend).toBe("webgl");
+  });
+
   test("falls back to WebGL without navigator.gpu", async () => {
     vi.stubGlobal("navigator", {});
     const { renderer, backend } = await createRenderer({ antialias: false });

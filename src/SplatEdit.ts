@@ -91,6 +91,9 @@ export enum SplatEditRgbaBlendMode {
   // the Gsplat. This can produce hyper-saturated results, but is useful
   // to easily “light up” areas.
   ADD_RGBA = "add_rgba",
+  // Scale the splat's saturation around its luminance by the SDF's opacity:
+  // 0 is grayscale, 1 leaves the color unchanged, above 1 oversaturates.
+  SATURATE = "saturate",
 }
 
 function rgbaBlendModeToNumber(mode: SplatEditRgbaBlendMode) {
@@ -101,6 +104,8 @@ function rgbaBlendModeToNumber(mode: SplatEditRgbaBlendMode) {
       return 1;
     case SplatEditRgbaBlendMode.ADD_RGBA:
       return 2;
+    case SplatEditRgbaBlendMode.SATURATE:
+      return 3;
     default:
       throw new Error(`Unknown blend mode: ${mode}`);
   }
@@ -749,6 +754,7 @@ export const defineEdit = unindent(/* glsl */ `
   const uint EDIT_BLEND_MULTIPLY = 0u;
   const uint EDIT_BLEND_SET_RGB = 1u;
   const uint EDIT_BLEND_ADD_RGBA = 2u;
+  const uint EDIT_BLEND_SATURATE = 3u;
   const uint EDIT_FLAG_INVERT = 0x100u;
 
   void decodeEdit(
@@ -786,6 +792,11 @@ export const defineEdit = unindent(/* glsl */ `
       case EDIT_BLEND_ADD_RGBA:
         target = rgba + sdfRgba;
         break;
+      case EDIT_BLEND_SATURATE: {
+        float luma = dot(rgba.rgb, vec3(0.2126, 0.7152, 0.0722));
+        target = vec4(mix(vec3(luma), rgba.rgb, sdfRgba.a), rgba.a);
+        break;
+      }
       default:
         // Debug output if blend mode not set
         target = vec4(fract(pos), 1.0);

@@ -3,6 +3,10 @@ import type { QuadMesh, WebGPURenderer } from "three/webgpu";
 
 export type CompositeAttachments = { color: GPUTexture; depth: GPUTexture };
 
+type RenderObjectArgs = Parameters<
+  NonNullable<ReturnType<WebGPURenderer["getRenderObjectFunction"]>>
+>;
+
 /** Owns the linear color/depth target shared by Three.js and the splat pass. */
 export class WebGPUComposite {
   private outputKey = "";
@@ -59,6 +63,7 @@ export class WebGPUComposite {
     scene: THREE.Scene,
     camera: THREE.Camera,
     composite: (attachments: CompositeAttachments) => void,
+    splitOrder = Number.POSITIVE_INFINITY,
   ): void {
     const previous = renderer.getRenderTarget();
     if (previous || renderer.xr.isPresenting) {
@@ -79,8 +84,21 @@ export class WebGPUComposite {
     }
     const size = renderer.getDrawingBufferSize(new THREE.Vector2());
     this.target.setSize(size.x, size.y);
+    // Like the WebGL transparent list, transparent objects with renderOrder at
+    // or above the SparkRenderer's draw after the splats: pass A skips them,
+    // pass B (no clear, same color/depth) draws only them.
+    const hostFunction = renderer.getRenderObjectFunction();
+    const draw = (...args: RenderObjectArgs) =>
+      hostFunction ? hostFunction(...args) : renderer.renderObject(...args);
+    const late = (object: THREE.Object3D, material: THREE.Material) =>
+      material.transparent && object.renderOrder >= splitOrder;
+    let deferred = false;
     try {
       renderer.setRenderTarget(this.target);
+      renderer.setRenderObjectFunction(((...args: RenderObjectArgs) => {
+        if (late(args[0], args[4])) deferred = true;
+        else draw(...args);
+      }) as Parameters<WebGPURenderer["setRenderObjectFunction"]>[0]);
       renderer.render(scene, camera);
       const backend = renderer.backend;
       if (!("get" in backend) || typeof backend.get !== "function") {
@@ -108,7 +126,13 @@ export class WebGPUComposite {
         throw new Error("Spark: composite depth texture is unavailable.");
       const depth = getTexture(this.target.depthTexture);
       composite({ color, depth });
+      if (deferred) this.renderLate(renderer, scene, camera, late, draw);
     } finally {
+      renderer.setRenderObjectFunction(
+        hostFunction as Parameters<
+          WebGPURenderer["setRenderObjectFunction"]
+        >[0],
+      );
       renderer.setRenderTarget(previous);
     }
     const toneMapping = renderer.toneMapping;
@@ -127,6 +151,43 @@ export class WebGPUComposite {
     } finally {
       renderer.toneMapping = toneMapping;
       renderer.outputColorSpace = colorSpace;
+    }
+  }
+
+  private renderLate(
+    renderer: WebGPURenderer,
+    scene: THREE.Scene,
+    camera: THREE.Camera,
+    late: (object: THREE.Object3D, material: THREE.Material) => boolean,
+    draw: (...args: RenderObjectArgs) => void,
+  ): void {
+    const state = {
+      opaque: renderer.opaque,
+      autoClear: renderer.autoClear,
+      autoClearColor: renderer.autoClearColor,
+      autoClearDepth: renderer.autoClearDepth,
+      autoClearStencil: renderer.autoClearStencil,
+      background: scene.background,
+    };
+    try {
+      renderer.opaque = false;
+      renderer.autoClear = false;
+      renderer.autoClearColor = false;
+      renderer.autoClearDepth = false;
+      renderer.autoClearStencil = false;
+      // A color background forces a clear even without autoClear.
+      scene.background = null;
+      renderer.setRenderObjectFunction(((...args: RenderObjectArgs) => {
+        if (late(args[0], args[4])) draw(...args);
+      }) as Parameters<WebGPURenderer["setRenderObjectFunction"]>[0]);
+      renderer.render(scene, camera);
+    } finally {
+      renderer.opaque = state.opaque;
+      renderer.autoClear = state.autoClear;
+      renderer.autoClearColor = state.autoClearColor;
+      renderer.autoClearDepth = state.autoClearDepth;
+      renderer.autoClearStencil = state.autoClearStencil;
+      scene.background = state.background;
     }
   }
 

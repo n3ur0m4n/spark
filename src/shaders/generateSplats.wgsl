@@ -134,6 +134,10 @@ fn applyEdits(center: ptr<function, vec3f>, rgba: ptr<function, vec4f>) {
             case 0u: { blended = *rgba * values[0]; }
             case 1u: { blended = vec4f(values[0].rgb, (*rgba).a * values[0].a); }
             case 2u: { blended = *rgba + values[0]; }
+            case 3u: {
+                let luma = dot((*rgba).rgb, vec3f(0.2126, 0.7152, 0.0722));
+                blended = vec4f(mix(vec3f(luma), (*rgba).rgb, values[0].a), (*rgba).a);
+            }
             default: { blended = vec4f(fract(*center), 1.0); }
         }
         *rgba = mix(*rgba, blended, modulate);

@@ -193,16 +193,17 @@ export class SparkNativeRenderer {
         const materials = Array.isArray(node.material)
           ? node.material
           : [node.material];
+        // Transparent objects are drawn by WebGPUComposite around the splat
+        // pass by renderOrder; transmission still needs the WebGL path.
         if (
           materials.some(
             (material) =>
-              material.transparent ||
-              ("transmission" in material &&
-                typeof material.transmission === "number" &&
-                material.transmission > 0),
+              "transmission" in material &&
+              typeof material.transmission === "number" &&
+              material.transmission > 0,
           )
         ) {
-          requireWebGL("transparent or transmissive Three.js objects");
+          requireWebGL("transmissive Three.js objects");
         }
       }
       if (!(node instanceof SplatGenerator)) return;
@@ -321,6 +322,7 @@ export class SparkNativeRenderer {
               true,
             );
           },
+          this.owner.renderOrder,
         );
       });
     this.queue = task;

@@ -9426,6 +9426,7 @@ var SplatEditRgbaBlendMode = /* @__PURE__ */ function(SplatEditRgbaBlendMode) {
 	SplatEditRgbaBlendMode["MULTIPLY"] = "multiply";
 	SplatEditRgbaBlendMode["SET_RGB"] = "set_rgb";
 	SplatEditRgbaBlendMode["ADD_RGBA"] = "add_rgba";
+	SplatEditRgbaBlendMode["SATURATE"] = "saturate";
 	return SplatEditRgbaBlendMode;
 }({});
 function rgbaBlendModeToNumber(mode) {
@@ -9433,6 +9434,7 @@ function rgbaBlendModeToNumber(mode) {
 		case "multiply": return 0;
 		case "set_rgb": return 1;
 		case "add_rgba": return 2;
+		case "saturate": return 3;
 		default: throw new Error(`Unknown blend mode: ${mode}`);
 	}
 }
@@ -9837,6 +9839,7 @@ var defineEdit = unindent(`
   const uint EDIT_BLEND_MULTIPLY = 0u;
   const uint EDIT_BLEND_SET_RGB = 1u;
   const uint EDIT_BLEND_ADD_RGBA = 2u;
+  const uint EDIT_BLEND_SATURATE = 3u;
   const uint EDIT_FLAG_INVERT = 0x100u;
 
   void decodeEdit(
@@ -9874,6 +9877,11 @@ var defineEdit = unindent(`
       case EDIT_BLEND_ADD_RGBA:
         target = rgba + sdfRgba;
         break;
+      case EDIT_BLEND_SATURATE: {
+        float luma = dot(rgba.rgb, vec3(0.2126, 0.7152, 0.0722));
+        target = vec4(mix(vec3(luma), rgba.rgb, sdfRgba.a), rgba.a);
+        break;
+      }
       default:
         // Debug output if blend mode not set
         target = vec4(fract(pos), 1.0);
@@ -12163,8 +12171,8 @@ function getSparkRendererCapabilities(renderer) {
 			skinning: webgl,
 			specializedTargets: webgl,
 			covarianceSplats: webgl,
-			transparentMeshes: webgl,
-			transparentSprites: webgl,
+			transparentMeshes: webgl || !!device,
+			transparentSprites: webgl || !!device,
 			logarithmicDepth: webgl,
 			reversedDepth: webgl,
 			msaa: webgl,
@@ -12659,7 +12667,7 @@ var WebGPUComposite = class WebGPUComposite {
 			material.needsUpdate = true;
 		});
 	}
-	render(renderer, scene, camera, composite) {
+	render(renderer, scene, camera, composite, splitOrder = Number.POSITIVE_INFINITY) {
 		const previous = renderer.getRenderTarget();
 		if (previous || renderer.xr.isPresenting) throw new Error("Spark: native composition currently requires the canvas target outside XR; use WebGL for this scene.");
 		const hdr = renderer.toneMapping !== three.NoToneMapping;
@@ -12672,8 +12680,16 @@ var WebGPUComposite = class WebGPUComposite {
 		}
 		const size = renderer.getDrawingBufferSize(new three.Vector2());
 		this.target.setSize(size.x, size.y);
+		const hostFunction = renderer.getRenderObjectFunction();
+		const draw = (...args) => hostFunction ? hostFunction(...args) : renderer.renderObject(...args);
+		const late = (object, material) => material.transparent && object.renderOrder >= splitOrder;
+		let deferred = false;
 		try {
 			renderer.setRenderTarget(this.target);
+			renderer.setRenderObjectFunction(((...args) => {
+				if (late(args[0], args[4])) deferred = true;
+				else draw(...args);
+			}));
 			renderer.render(scene, camera);
 			const backend = renderer.backend;
 			if (!("get" in backend) || typeof backend.get !== "function") throw new Error("Spark: unsupported Three.js texture interop; use WebGL.");
@@ -12689,7 +12705,9 @@ var WebGPUComposite = class WebGPUComposite {
 				color,
 				depth: getTexture(this.target.depthTexture)
 			});
+			if (deferred) this.renderLate(renderer, scene, camera, late, draw);
 		} finally {
+			renderer.setRenderObjectFunction(hostFunction);
 			renderer.setRenderTarget(previous);
 		}
 		const toneMapping = renderer.toneMapping;
@@ -12706,6 +12724,35 @@ var WebGPUComposite = class WebGPUComposite {
 		} finally {
 			renderer.toneMapping = toneMapping;
 			renderer.outputColorSpace = colorSpace;
+		}
+	}
+	renderLate(renderer, scene, camera, late, draw) {
+		const state = {
+			opaque: renderer.opaque,
+			autoClear: renderer.autoClear,
+			autoClearColor: renderer.autoClearColor,
+			autoClearDepth: renderer.autoClearDepth,
+			autoClearStencil: renderer.autoClearStencil,
+			background: scene.background
+		};
+		try {
+			renderer.opaque = false;
+			renderer.autoClear = false;
+			renderer.autoClearColor = false;
+			renderer.autoClearDepth = false;
+			renderer.autoClearStencil = false;
+			scene.background = null;
+			renderer.setRenderObjectFunction(((...args) => {
+				if (late(args[0], args[4])) draw(...args);
+			}));
+			renderer.render(scene, camera);
+		} finally {
+			renderer.opaque = state.opaque;
+			renderer.autoClear = state.autoClear;
+			renderer.autoClearColor = state.autoClearColor;
+			renderer.autoClearDepth = state.autoClearDepth;
+			renderer.autoClearStencil = state.autoClearStencil;
+			scene.background = state.background;
 		}
 	}
 	dispose() {
@@ -12786,7 +12833,7 @@ var generateSourceBuffers_default = "// Ordinary sources: one storage buffer per
 var generateSourcePaged_default = "// Paged sources: SplatPager's 256x256 page layers, indexed like the WebGL\n// pagedSplatTexCoord(). Selection indices are global pool indices.\n// SplatPager readers also treat zero alpha as inactive.\nconst ZERO_ALPHA_INACTIVE = true;\n@group(0) @binding(1) var primaryPages: texture_2d_array<u32>;\n@group(0) @binding(2) var secondaryPages: texture_2d_array<u32>;\n@group(0) @binding(3) var sh1Pages: texture_2d_array<u32>;\n@group(0) @binding(8) var sh2Pages: texture_2d_array<u32>;\n@group(0) @binding(9) var sh3Pages: texture_2d_array<u32>;\n@group(0) @binding(10) var sh3bPages: texture_2d_array<u32>;\n\nfn pageTexel(t: texture_2d_array<u32>, src: u32) -> vec4u {\n    return textureLoad(t, vec2u(src & 255u, (src >> 8u) & 255u), src >> 16u, 0);\n}\nfn loadPrimary(src: u32) -> vec4u { return pageTexel(primaryPages, src); }\nfn loadSecondary(src: u32) -> vec4u { return pageTexel(secondaryPages, src); }\nfn loadSh(band: u32, src: u32) -> vec4u {\n    switch band {\n        case 0u: { return pageTexel(sh1Pages, src); }\n        case 1u: { return pageTexel(sh2Pages, src); }\n        case 2u: { return pageTexel(sh3Pages, src); }\n        default: { return pageTexel(sh3bPages, src); }\n    }\n}\nfn loadPackedSh1(src: u32) -> vec2u { return pageTexel(sh1Pages, src).xy; }\n";
 //#endregion
 //#region src/shaders/generateSplats.wgsl?raw
-var generateSplats_default = "// Native counterpart of SplatAccumulator's ordinary SplatMesh generation.\n// One dispatch per mesh writes its upstream row-aligned destination range.\n// Depth is evaluated before output quantization, just like the WebGL MRT.\nstruct GenerateUniforms {\n    base: u32, count: u32, sourceCount: u32, indexed: u32,\n    sourceExt: u32, outputExt: u32, sortRadial: u32, numSh: u32,\n    rotation: vec4f,\n    translationScale: vec4f,\n    viewOrigin: vec4f,\n    viewDirection: vec4f, // w: sort cone cos(sortCullFov / 2), -2 when off\n    localViewOrigin: vec4f,\n    encoding: vec4f,\n    shMaxOpacity: vec4f,\n    shOffsets: vec4u,\n    recolor: vec4f,\n// x: SplatEdits.numEdits, y: SplatEdits.numSdfs (sdfData follows editData).\neditCounts: vec4u,\n};\n@group(0) @binding(0) var<uniform> frame: GenerateUniforms;\n// Bindings 1-3 (and 8-10 for paged sources) and the load*() accessors come\n// from generateSourceBuffers.wgsl or generateSourcePaged.wgsl.\n@group(0) @binding(4) var<storage, read> indices: array<u32>;\n// Written straight into the slot's splat textures (no staging buffer copy).\n@group(0) @binding(5) var output: texture_storage_2d_array<rgba32uint, write>;\n@group(0) @binding(6) var output2: texture_storage_2d_array<rgba32uint, write>;\n\nfn storeOutput(second: bool, dst: u32, value: vec4u) {\n    let size = textureDimensions(output);\n    let coord = vec2u(dst % size.x, (dst / size.x) % size.y);\n    let layer = dst / (size.x * size.y);\n    if (second) { textureStore(output2, coord, layer, value); }\n    else { textureStore(output, coord, layer, value); }\n}\n@group(0) @binding(7) var<storage, read_write> depths: array<u32>;\n\n// Native counterpart of SplatEdit.ts defineSdfArray/defineEdit: world-space\n// SDF RGBA/displace layers. editData holds frame.editCounts.x packed edits\n// (SplatEdits.editData) followed by 8 vec4u per SDF (SplatEdits.sdfData).\n@group(0) @binding(11) var<storage, read> editData: array<vec4u>;\n// WGSL rejects infinite constants; FLT_MAX stands in for GLSL 1.0 / 0.0.\nconst EDIT_INFINITY: f32 = 0x1.fffffep+127f;\n\nfn sdfRow(sdf: u32, row: u32) -> vec4f {\n    return bitcast<vec4f>(editData[frame.editCounts.x + sdf * 8u + row]);\n}\n\nfn evaluateSdfs(first: u32, count: u32, pos: vec3f, smoothK: f32,\n                values: ptr<function, array<vec4f, 2>>) -> f32 {\n    var accum = select(0.0, EDIT_INFINITY, smoothK == 0.0);\n    var maxExp = -EDIT_INFINITY;\n    (*values)[0] = vec4f(0.0);\n    (*values)[1] = vec4f(0.0);\n    let last = min(first + count, frame.editCounts.y);\n    for (var index = first; index < last; index++) {\n        let row0 = editData[frame.editCounts.x + index * 8u];\n        let flags = row0.w;\n        let sizes = sdfRow(index, 3u);\n        let sdfValues = array<vec4f, 2>(sdfRow(index, 4u), sdfRow(index, 5u));\n        var p = quatVec(sdfRow(index, 1u), pos * sdfRow(index, 2u).xyz) + bitcast<vec3f>(row0.xyz);\n        var distance = -EDIT_INFINITY;\n        switch (flags & 0xffu) {\n            case 1u: { distance = p.z; }\n            case 2u: { distance = length(p) - sizes.w; }\n            case 3u: {\n                let q = abs(p) - sizes.xyz + sizes.w;\n                distance = length(max(q, vec3f(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0) - sizes.w;\n            }\n            case 4u: {\n                let k0 = length(p / sizes.xyz);\n                let k1 = length(p / dot(sizes.xyz, sizes.xyz));\n                distance = k0 * (k0 - 1.0) / k1;\n            }\n            case 5u: {\n                let d = abs(vec2f(length(p.xz), p.y)) - sizes.wy;\n                distance = min(max(d.x, d.y), 0.0) + length(max(d, vec2f(0.0)));\n            }\n            case 6u: {\n                p.y -= clamp(p.y, -0.5 * sizes.y, 0.5 * sizes.y);\n                distance = length(p) - sizes.w;\n            }\n            case 7u: {\n                let angle = 0.25 * PI * sizes.w;\n                let c = vec2f(sin(angle), cos(angle));\n                let q = vec2f(length(p.xy), -p.z);\n                let d = length(q - c * max(dot(q, c), 0.0));\n                distance = d * select(1.0, -1.0, (q.x * c.y - q.y * c.x) < 0.0);\n            }\n            default: {}\n        }\n        if ((flags & 0x100u) != 0u) { distance = -distance; }\n        if (smoothK == 0.0) {\n            if (distance < accum) {\n                accum = distance;\n                *values = sdfValues;\n            }\n        } else {\n            let scaled = -distance / smoothK;\n            if (scaled > maxExp) {\n                let s = exp(maxExp - scaled);\n                accum *= s;\n                (*values)[0] *= s;\n                (*values)[1] *= s;\n                maxExp = scaled;\n            }\n            let weight = exp(scaled - maxExp);\n            accum += weight;\n            (*values)[0] += weight * sdfValues[0];\n            (*values)[1] += weight * sdfValues[1];\n        }\n    }\n    if (smoothK == 0.0) { return accum; }\n    // Very distant SDFs may result in 0 accumulation.\n    if (accum == 0.0) { return EDIT_INFINITY; }\n    (*values)[0] /= accum;\n    (*values)[1] /= accum;\n    return (-log(accum) - maxExp) * smoothK;\n}\n\nfn applyEdits(center: ptr<function, vec3f>, rgba: ptr<function, vec4f>) {\n    for (var e = 0u; e < frame.editCounts.x; e++) {\n        let packed = editData[e];\n        let softEdge = bitcast<f32>(packed.z);\n        var values: array<vec4f, 2>;\n        var distance = evaluateSdfs(packed.y & 0xffffu, packed.y >> 16u, *center, bitcast<f32>(packed.w), &values);\n        if ((packed.x & 0x100u) != 0u) { distance = -distance; }\n        var modulate: f32;\n        if (softEdge == 0.0) {\n            modulate = select(0.0, 1.0, distance < 0.0);\n        } else {\n            modulate = clamp(-distance / softEdge + 0.5, 0.0, 1.0);\n        }\n        var blended: vec4f;\n        switch (packed.x & 0xffu) {\n            case 0u: { blended = *rgba * values[0]; }\n            case 1u: { blended = vec4f(values[0].rgb, (*rgba).a * values[0].a); }\n            case 2u: { blended = *rgba + values[0]; }\n            default: { blended = vec4f(fract(*center), 1.0); }\n        }\n        *rgba = mix(*rgba, blended, modulate);\n        *center += values[1].xyz * modulate;\n    }\n}\n\n@compute @workgroup_size(256)\nfn generate(@builtin(workgroup_id) group: vec3u,\n            @builtin(local_invocation_id) local: vec3u,\n            @builtin(num_workgroups) groups: vec3u) {\n    let i = (group.y * groups.x + group.x) * 256u + local.x;\n    if (i >= frame.count) { return; }\n    let dst = frame.base + i;\n    var src = i;\n    if (frame.indexed != 0u) { src = indices[i]; }\n    if (src >= frame.sourceCount) { return; }\n    var splat: UnpackedSplat;\n    if (frame.sourceExt != 0u) {\n        splat = unpackSplatExt(loadPrimary(src), loadSecondary(src));\n    } else {\n        splat = unpackSplatEncoding(loadPrimary(src), frame.encoding);\n        splat.rgba.a *= frame.shMaxOpacity.w;\n    }\n    // Upstream marks source activity by nonzero scales, not opacity. Zero\n    // alpha still owns a finite depth/order entry and is discarded at draw,\n    // except for paged sources, whose readers drop it like zero scales.\n    if (all(splat.scales == vec3f(0.0)) || (ZERO_ALPHA_INACTIVE && splat.rgba.a == 0.0)) { return; }\n\n    if (frame.numSh > 0u) {\n        let dir = normalize(splat.center - frame.localViewOrigin.xyz);\n        var rgb = vec3f(0.0);\n        if (frame.sourceExt != 0u) {\n            let a = loadSh(0u, src);\n            if (frame.numSh == 1u) {\n                rgb = evaluateExtSH1(a, dir);\n            } else {\n                rgb = evaluateExtSH12(a, loadSh(1u, src), dir);\n                if (frame.numSh >= 3u) {\n                    rgb += evaluateExtSH3(loadSh(2u, src), loadSh(3u, src), dir);\n                }\n            }\n        } else {\n            rgb = evaluatePackedSH1(loadPackedSh1(src), dir, frame.shMaxOpacity.x);\n            if (frame.numSh >= 2u) {\n                rgb += evaluatePackedSH2(loadSh(1u, src), dir, frame.shMaxOpacity.y);\n            }\n            if (frame.numSh >= 3u) {\n                rgb += evaluatePackedSH3(loadSh(2u, src), dir, frame.shMaxOpacity.z);\n            }\n        }\n        // Match upstream source generation: signed SH colors survive until\n        // output encoding. Extended output preserves negative half floats;\n        // packed output performs its own format-specific clamping.\n        splat.rgba = vec4f(splat.rgba.rgb + rgb, splat.rgba.a);\n    }\n    splat.rgba *= frame.recolor;\n    var center = quatVec(frame.rotation, splat.center * frame.translationScale.w) + frame.translationScale.xyz;\n    // SplatMesh applies RGBA/displace edits in world space after recoloring.\n    applyEdits(&center, &splat.rgba);\n    let delta = center - frame.viewOrigin.xyz;\n    let dist = length(delta);\n    var metric = dot(delta, frame.viewDirection.xyz) + 100.0;\n    if (frame.sortRadial != 0u) { metric = dist; }\n    // Negative/NaN/infinite bit patterns are excluded by upstream sort32.\n    depths[dst] = bitcast<u32>(metric);\n    // Outside the sort cone (sortCullFov) the depth stays +inf: not drawn.\n    if (dist > 0.0 && dot(delta, frame.viewDirection.xyz) < frame.viewDirection.w * dist) {\n        depths[dst] = 0x7f800000u;\n    }\n    let scales = splat.scales * frame.translationScale.w;\n    let rotation = quatQuat(frame.rotation, splat.quaternion);\n    if (frame.outputExt != 0u) {\n        let packed = packSplatExt(center, scales, rotation, splat.rgba);\n        storeOutput(false, dst, packed.packed);\n        storeOutput(true, dst, packed.packed2);\n    } else {\n        // Upstream uses camera-relative half precision and expanded LoD alpha.\n        storeOutput(false, dst, packSplat(delta, scales, rotation, vec4f(splat.rgba.rgb, splat.rgba.a * 0.5)));\n    }\n}\n";
+var generateSplats_default = "// Native counterpart of SplatAccumulator's ordinary SplatMesh generation.\n// One dispatch per mesh writes its upstream row-aligned destination range.\n// Depth is evaluated before output quantization, just like the WebGL MRT.\nstruct GenerateUniforms {\n    base: u32, count: u32, sourceCount: u32, indexed: u32,\n    sourceExt: u32, outputExt: u32, sortRadial: u32, numSh: u32,\n    rotation: vec4f,\n    translationScale: vec4f,\n    viewOrigin: vec4f,\n    viewDirection: vec4f, // w: sort cone cos(sortCullFov / 2), -2 when off\n    localViewOrigin: vec4f,\n    encoding: vec4f,\n    shMaxOpacity: vec4f,\n    shOffsets: vec4u,\n    recolor: vec4f,\n// x: SplatEdits.numEdits, y: SplatEdits.numSdfs (sdfData follows editData).\neditCounts: vec4u,\n};\n@group(0) @binding(0) var<uniform> frame: GenerateUniforms;\n// Bindings 1-3 (and 8-10 for paged sources) and the load*() accessors come\n// from generateSourceBuffers.wgsl or generateSourcePaged.wgsl.\n@group(0) @binding(4) var<storage, read> indices: array<u32>;\n// Written straight into the slot's splat textures (no staging buffer copy).\n@group(0) @binding(5) var output: texture_storage_2d_array<rgba32uint, write>;\n@group(0) @binding(6) var output2: texture_storage_2d_array<rgba32uint, write>;\n\nfn storeOutput(second: bool, dst: u32, value: vec4u) {\n    let size = textureDimensions(output);\n    let coord = vec2u(dst % size.x, (dst / size.x) % size.y);\n    let layer = dst / (size.x * size.y);\n    if (second) { textureStore(output2, coord, layer, value); }\n    else { textureStore(output, coord, layer, value); }\n}\n@group(0) @binding(7) var<storage, read_write> depths: array<u32>;\n\n// Native counterpart of SplatEdit.ts defineSdfArray/defineEdit: world-space\n// SDF RGBA/displace layers. editData holds frame.editCounts.x packed edits\n// (SplatEdits.editData) followed by 8 vec4u per SDF (SplatEdits.sdfData).\n@group(0) @binding(11) var<storage, read> editData: array<vec4u>;\n// WGSL rejects infinite constants; FLT_MAX stands in for GLSL 1.0 / 0.0.\nconst EDIT_INFINITY: f32 = 0x1.fffffep+127f;\n\nfn sdfRow(sdf: u32, row: u32) -> vec4f {\n    return bitcast<vec4f>(editData[frame.editCounts.x + sdf * 8u + row]);\n}\n\nfn evaluateSdfs(first: u32, count: u32, pos: vec3f, smoothK: f32,\n                values: ptr<function, array<vec4f, 2>>) -> f32 {\n    var accum = select(0.0, EDIT_INFINITY, smoothK == 0.0);\n    var maxExp = -EDIT_INFINITY;\n    (*values)[0] = vec4f(0.0);\n    (*values)[1] = vec4f(0.0);\n    let last = min(first + count, frame.editCounts.y);\n    for (var index = first; index < last; index++) {\n        let row0 = editData[frame.editCounts.x + index * 8u];\n        let flags = row0.w;\n        let sizes = sdfRow(index, 3u);\n        let sdfValues = array<vec4f, 2>(sdfRow(index, 4u), sdfRow(index, 5u));\n        var p = quatVec(sdfRow(index, 1u), pos * sdfRow(index, 2u).xyz) + bitcast<vec3f>(row0.xyz);\n        var distance = -EDIT_INFINITY;\n        switch (flags & 0xffu) {\n            case 1u: { distance = p.z; }\n            case 2u: { distance = length(p) - sizes.w; }\n            case 3u: {\n                let q = abs(p) - sizes.xyz + sizes.w;\n                distance = length(max(q, vec3f(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0) - sizes.w;\n            }\n            case 4u: {\n                let k0 = length(p / sizes.xyz);\n                let k1 = length(p / dot(sizes.xyz, sizes.xyz));\n                distance = k0 * (k0 - 1.0) / k1;\n            }\n            case 5u: {\n                let d = abs(vec2f(length(p.xz), p.y)) - sizes.wy;\n                distance = min(max(d.x, d.y), 0.0) + length(max(d, vec2f(0.0)));\n            }\n            case 6u: {\n                p.y -= clamp(p.y, -0.5 * sizes.y, 0.5 * sizes.y);\n                distance = length(p) - sizes.w;\n            }\n            case 7u: {\n                let angle = 0.25 * PI * sizes.w;\n                let c = vec2f(sin(angle), cos(angle));\n                let q = vec2f(length(p.xy), -p.z);\n                let d = length(q - c * max(dot(q, c), 0.0));\n                distance = d * select(1.0, -1.0, (q.x * c.y - q.y * c.x) < 0.0);\n            }\n            default: {}\n        }\n        if ((flags & 0x100u) != 0u) { distance = -distance; }\n        if (smoothK == 0.0) {\n            if (distance < accum) {\n                accum = distance;\n                *values = sdfValues;\n            }\n        } else {\n            let scaled = -distance / smoothK;\n            if (scaled > maxExp) {\n                let s = exp(maxExp - scaled);\n                accum *= s;\n                (*values)[0] *= s;\n                (*values)[1] *= s;\n                maxExp = scaled;\n            }\n            let weight = exp(scaled - maxExp);\n            accum += weight;\n            (*values)[0] += weight * sdfValues[0];\n            (*values)[1] += weight * sdfValues[1];\n        }\n    }\n    if (smoothK == 0.0) { return accum; }\n    // Very distant SDFs may result in 0 accumulation.\n    if (accum == 0.0) { return EDIT_INFINITY; }\n    (*values)[0] /= accum;\n    (*values)[1] /= accum;\n    return (-log(accum) - maxExp) * smoothK;\n}\n\nfn applyEdits(center: ptr<function, vec3f>, rgba: ptr<function, vec4f>) {\n    for (var e = 0u; e < frame.editCounts.x; e++) {\n        let packed = editData[e];\n        let softEdge = bitcast<f32>(packed.z);\n        var values: array<vec4f, 2>;\n        var distance = evaluateSdfs(packed.y & 0xffffu, packed.y >> 16u, *center, bitcast<f32>(packed.w), &values);\n        if ((packed.x & 0x100u) != 0u) { distance = -distance; }\n        var modulate: f32;\n        if (softEdge == 0.0) {\n            modulate = select(0.0, 1.0, distance < 0.0);\n        } else {\n            modulate = clamp(-distance / softEdge + 0.5, 0.0, 1.0);\n        }\n        var blended: vec4f;\n        switch (packed.x & 0xffu) {\n            case 0u: { blended = *rgba * values[0]; }\n            case 1u: { blended = vec4f(values[0].rgb, (*rgba).a * values[0].a); }\n            case 2u: { blended = *rgba + values[0]; }\n            case 3u: {\n                let luma = dot((*rgba).rgb, vec3f(0.2126, 0.7152, 0.0722));\n                blended = vec4f(mix(vec3f(luma), (*rgba).rgb, values[0].a), (*rgba).a);\n            }\n            default: { blended = vec4f(fract(*center), 1.0); }\n        }\n        *rgba = mix(*rgba, blended, modulate);\n        *center += values[1].xyz * modulate;\n    }\n}\n\n@compute @workgroup_size(256)\nfn generate(@builtin(workgroup_id) group: vec3u,\n            @builtin(local_invocation_id) local: vec3u,\n            @builtin(num_workgroups) groups: vec3u) {\n    let i = (group.y * groups.x + group.x) * 256u + local.x;\n    if (i >= frame.count) { return; }\n    let dst = frame.base + i;\n    var src = i;\n    if (frame.indexed != 0u) { src = indices[i]; }\n    if (src >= frame.sourceCount) { return; }\n    var splat: UnpackedSplat;\n    if (frame.sourceExt != 0u) {\n        splat = unpackSplatExt(loadPrimary(src), loadSecondary(src));\n    } else {\n        splat = unpackSplatEncoding(loadPrimary(src), frame.encoding);\n        splat.rgba.a *= frame.shMaxOpacity.w;\n    }\n    // Upstream marks source activity by nonzero scales, not opacity. Zero\n    // alpha still owns a finite depth/order entry and is discarded at draw,\n    // except for paged sources, whose readers drop it like zero scales.\n    if (all(splat.scales == vec3f(0.0)) || (ZERO_ALPHA_INACTIVE && splat.rgba.a == 0.0)) { return; }\n\n    if (frame.numSh > 0u) {\n        let dir = normalize(splat.center - frame.localViewOrigin.xyz);\n        var rgb = vec3f(0.0);\n        if (frame.sourceExt != 0u) {\n            let a = loadSh(0u, src);\n            if (frame.numSh == 1u) {\n                rgb = evaluateExtSH1(a, dir);\n            } else {\n                rgb = evaluateExtSH12(a, loadSh(1u, src), dir);\n                if (frame.numSh >= 3u) {\n                    rgb += evaluateExtSH3(loadSh(2u, src), loadSh(3u, src), dir);\n                }\n            }\n        } else {\n            rgb = evaluatePackedSH1(loadPackedSh1(src), dir, frame.shMaxOpacity.x);\n            if (frame.numSh >= 2u) {\n                rgb += evaluatePackedSH2(loadSh(1u, src), dir, frame.shMaxOpacity.y);\n            }\n            if (frame.numSh >= 3u) {\n                rgb += evaluatePackedSH3(loadSh(2u, src), dir, frame.shMaxOpacity.z);\n            }\n        }\n        // Match upstream source generation: signed SH colors survive until\n        // output encoding. Extended output preserves negative half floats;\n        // packed output performs its own format-specific clamping.\n        splat.rgba = vec4f(splat.rgba.rgb + rgb, splat.rgba.a);\n    }\n    splat.rgba *= frame.recolor;\n    var center = quatVec(frame.rotation, splat.center * frame.translationScale.w) + frame.translationScale.xyz;\n    // SplatMesh applies RGBA/displace edits in world space after recoloring.\n    applyEdits(&center, &splat.rgba);\n    let delta = center - frame.viewOrigin.xyz;\n    let dist = length(delta);\n    var metric = dot(delta, frame.viewDirection.xyz) + 100.0;\n    if (frame.sortRadial != 0u) { metric = dist; }\n    // Negative/NaN/infinite bit patterns are excluded by upstream sort32.\n    depths[dst] = bitcast<u32>(metric);\n    // Outside the sort cone (sortCullFov) the depth stays +inf: not drawn.\n    if (dist > 0.0 && dot(delta, frame.viewDirection.xyz) < frame.viewDirection.w * dist) {\n        depths[dst] = 0x7f800000u;\n    }\n    let scales = splat.scales * frame.translationScale.w;\n    let rotation = quatQuat(frame.rotation, splat.quaternion);\n    if (frame.outputExt != 0u) {\n        let packed = packSplatExt(center, scales, rotation, splat.rgba);\n        storeOutput(false, dst, packed.packed);\n        storeOutput(true, dst, packed.packed2);\n    } else {\n        // Upstream uses camera-relative half precision and expanded LoD alpha.\n        storeOutput(false, dst, packSplat(delta, scales, rotation, vec4f(splat.rgba.rgb, splat.rgba.a * 0.5)));\n    }\n}\n";
 //#endregion
 //#region src/WebGPUGeneration.ts
 /** Source uploads are shared across instances; output ownership stays with the backend slot. */
@@ -15811,7 +15858,7 @@ var SparkNativeRenderer = class {
 		scene.traverseVisible((node) => {
 			if (!camera.layers.test(node.layers)) return;
 			if (node instanceof three.Mesh || node instanceof three.Line || node instanceof three.Points || node instanceof three.Sprite) {
-				if ((Array.isArray(node.material) ? node.material : [node.material]).some((material) => material.transparent || "transmission" in material && typeof material.transmission === "number" && material.transmission > 0)) requireWebGL("transparent or transmissive Three.js objects");
+				if ((Array.isArray(node.material) ? node.material : [node.material]).some((material) => "transmission" in material && typeof material.transmission === "number" && material.transmission > 0)) requireWebGL("transmissive Three.js objects");
 			}
 			if (!(node instanceof SplatGenerator)) return;
 			if (!(node instanceof SplatMesh) || !node.hasNativeSourceGenerator()) requireWebGL("custom splat generators");
@@ -15867,7 +15914,7 @@ var SparkNativeRenderer = class {
 				this.backend.ensurePipeline(color.format);
 				if (!this.backend.setExternalDepthTexture(depth, color.width, color.height)) throw new Error("Spark: incompatible native composite depth attachment");
 				this.backend.renderSeparatePass(color, this.owner.activeSplats, true);
-			});
+			}, this.owner.renderOrder);
 		});
 		this.queue = task;
 		return task;
@@ -20837,8 +20884,6 @@ var WEBGPU_UNSUPPORTED_FEATURES = [
 	"skinning",
 	"specializedTargets",
 	"covarianceSplats",
-	"transparentMeshes",
-	"transparentSprites",
 	"logarithmicDepth",
 	"reversedDepth",
 	"msaa",
@@ -20858,9 +20903,18 @@ async function createRenderer(options = {}) {
 	const unsupported = WEBGPU_UNSUPPORTED_FEATURES;
 	const gpu = globalThis.navigator?.gpu;
 	if (!forceWebGL && gpu && !needs.some((need) => unsupported.includes(need))) {
-		if (await gpu.requestAdapter().catch(() => null)) {
+		const adapter = await gpu.requestAdapter().catch(() => null);
+		const limits = adapter?.limits;
+		if (adapter && !(limits && limits.maxStorageBufferBindingSize < 268435456)) {
 			const { WebGPURenderer } = await import("three/webgpu");
-			const renderer = new WebGPURenderer(params);
+			const renderer = new WebGPURenderer(limits ? {
+				...params,
+				requiredLimits: {
+					...params.requiredLimits,
+					maxStorageBufferBindingSize: limits.maxStorageBufferBindingSize,
+					maxBufferSize: limits.maxBufferSize
+				}
+			} : params);
 			try {
 				await renderer.init();
 				if (getSparkRendererCapabilities(renderer).backend === "webgpu") return {
