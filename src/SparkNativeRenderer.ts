@@ -319,7 +319,14 @@ export class SparkNativeRenderer {
           ({ color, depth }) => {
             if (!this.renderVisible) return;
             this.backend.premultipliedAlpha = this.owner.premultipliedAlpha;
-            this.backend.ensurePipeline(color.format);
+            // sRGB blending draws through a non-sRGB alias of the target.
+            const srgb =
+              this.srgbBlendActive() && color.format.endsWith("-srgb");
+            this.backend.ensurePipeline(
+              srgb
+                ? (color.format.slice(0, -5) as GPUTextureFormat)
+                : color.format,
+            );
             if (
               !this.backend.setExternalDepthTexture(
                 depth,
@@ -335,6 +342,7 @@ export class SparkNativeRenderer {
               color,
               this.owner.activeSplats,
               true,
+              srgb,
             );
           },
           this.owner.renderOrder,
@@ -394,6 +402,13 @@ export class SparkNativeRenderer {
     return task;
   }
 
+  /** Same condition as WebGPUComposite's 8-bit sRGB target (no tone mapping). */
+  private srgbBlendActive(): boolean {
+    return (
+      this.owner.srgbBlend && this.renderer.toneMapping === THREE.NoToneMapping
+    );
+  }
+
   private updateUniforms(
     camera: THREE.Camera,
     pick?: { width: number; height: number },
@@ -435,7 +450,8 @@ export class SparkNativeRenderer {
     }
     uniforms.enable2DGS.value = owner.enable2DGS;
     uniforms.lodInflate.value = owner.lodInflate;
-    uniforms.encodeLinear.value = true;
+    // sRGB blending writes sRGB-encoded colors (see renderSeparatePass).
+    uniforms.encodeLinear.value = !this.srgbBlendActive();
     uniforms.enableExtSplats.value = owner.display.extSplats;
     uniforms.enableCovSplats.value = false;
     uniforms.time.value = owner.display.time;

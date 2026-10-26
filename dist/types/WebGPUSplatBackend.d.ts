@@ -69,6 +69,8 @@ export declare class WebGPUSplatBackend {
     vertexBuffer: GPUBuffer;
     indexBuffer: GPUBuffer;
     depthTexture: GPUTexture | null;
+    /** Non-sRGB copy of an sRGB color target, for renderSeparatePass(srgbBlend). */
+    private srgbScratch;
     depthTextureView: GPUTextureView | null;
     /** Externally-owned scene depth (three.js), adopted via setExternalDepthTexture(). */
     private externalDepthTexture;
@@ -386,8 +388,14 @@ export declare class WebGPUSplatBackend {
     /**
      * Execute a separate render pass that composites splats onto the
      * provided color texture, preserving existing content (loadOp: "load").
+     *
+     * srgbBlend (sRGB color texture only): blend on the stored sRGB-encoded
+     * bytes, like WebGL drawing into an sRGB canvas, instead of in linear space.
+     * The target is copied to a non-sRGB texture of the same bytes, the splats
+     * (sRGB-encoded colors, pipeline in the non-sRGB format) blend there, and the
+     * bytes are copied back.
      */
-    renderSeparatePass(colorTexture: GPUTexture, numInstances: number, preloadedDepth?: boolean): void;
+    renderSeparatePass(colorTexture: GPUTexture, numInstances: number, preloadedDepth?: boolean, srgbBlend?: boolean): void;
     private pickUniforms;
     private pickLayout;
     private pickPipelines;

@@ -142,6 +142,8 @@ export class WebGPUSplatBackend {
 
   // Own depth texture for the separate render pass
   depthTexture: GPUTexture | null = null;
+  /** Non-sRGB copy of an sRGB color target, for renderSeparatePass(srgbBlend). */
+  private srgbScratch: GPUTexture | null = null;
   depthTextureView: GPUTextureView | null = null;
   /** Externally-owned scene depth (three.js), adopted via setExternalDepthTexture(). */
   private externalDepthTexture: GPUTexture | null = null;
@@ -1566,11 +1568,18 @@ export class WebGPUSplatBackend {
   /**
    * Execute a separate render pass that composites splats onto the
    * provided color texture, preserving existing content (loadOp: "load").
+   *
+   * srgbBlend (sRGB color texture only): blend on the stored sRGB-encoded
+   * bytes, like WebGL drawing into an sRGB canvas, instead of in linear space.
+   * The target is copied to a non-sRGB texture of the same bytes, the splats
+   * (sRGB-encoded colors, pipeline in the non-sRGB format) blend there, and the
+   * bytes are copied back.
    */
   renderSeparatePass(
     colorTexture: GPUTexture,
     numInstances: number,
     preloadedDepth = false,
+    srgbBlend = false,
   ): void {
     const slot = this.activeRenderSlot();
     if (numInstances <= 0) {
@@ -1624,10 +1633,41 @@ export class WebGPUSplatBackend {
     const loadExistingDepth = useExternalDepth || preloadedDepth;
 
     const encoder = device.createCommandEncoder({ label: "spark-render" });
+    let drawTexture = colorTexture;
+    if (srgbBlend) {
+      const format = colorTexture.format.replace(
+        /-srgb$/,
+        "",
+      ) as GPUTextureFormat;
+      const scratch = this.srgbScratch;
+      if (
+        scratch?.width !== width ||
+        scratch?.height !== height ||
+        scratch?.format !== format
+      ) {
+        scratch?.destroy();
+        this.srgbScratch = device.createTexture({
+          label: "spark-srgb-blend",
+          size: [width, height],
+          format,
+          usage:
+            GPUTextureUsage.RENDER_ATTACHMENT |
+            GPUTextureUsage.COPY_SRC |
+            GPUTextureUsage.COPY_DST,
+        });
+      }
+      drawTexture = this.srgbScratch as GPUTexture;
+      // Formats differing only by -srgb are copy-compatible: raw bytes.
+      encoder.copyTextureToTexture(
+        { texture: colorTexture },
+        { texture: drawTexture },
+        [width, height],
+      );
+    }
     const pass = encoder.beginRenderPass({
       colorAttachments: [
         {
-          view: colorTexture.createView(),
+          view: drawTexture.createView(),
           loadOp: "load" as GPULoadOp,
           storeOp: "store" as GPUStoreOp,
         },
@@ -1655,6 +1695,13 @@ export class WebGPUSplatBackend {
     }
 
     pass.end();
+    if (drawTexture !== colorTexture) {
+      encoder.copyTextureToTexture(
+        { texture: drawTexture },
+        { texture: colorTexture },
+        [width, height],
+      );
+    }
     device.queue.submit([encoder.finish()]);
 
     // The splat render pass is the last GPU work Spark submits in a frame, so
@@ -2348,6 +2395,8 @@ export class WebGPUSplatBackend {
     this.orderingTexture = null;
     this.depthTexture?.destroy();
     this.depthTexture = null;
+    this.srgbScratch?.destroy();
+    this.srgbScratch = null;
     this.depthTextureView = null;
     this.syncDepthReadbackBuffer?.destroy();
     this.syncDepthReadbackBuffer = null;

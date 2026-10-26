@@ -90,8 +90,9 @@ export class WebGPUComposite {
       );
     }
     // Without tone mapping the canvas clamps to [0, 1] anyway, so an sRGB
-    // 8-bit target (linear blending, half the bandwidth of half float) is
-    // enough. The splat pass is fill-rate bound: this is its main cost.
+    // 8-bit target (half the bandwidth of half float) is enough. The splat
+    // pass is fill-rate bound: this is its main cost. Three.js blends linearly
+    // in it; splats blend on its sRGB bytes unless srgbBlend is off.
     const hdr = renderer.toneMapping !== THREE.NoToneMapping;
     if (hdr !== this.hdr) {
       this.hdr = hdr;

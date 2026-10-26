@@ -14433,6 +14433,7 @@ var WebGPUSplatBackend = class WebGPUSplatBackend {
 			9
 		];
 		this.depthTexture = null;
+		this.srgbScratch = null;
 		this.depthTextureView = null;
 		this.externalDepthTexture = null;
 		this.externalDepthView = null;
@@ -15490,8 +15491,14 @@ var WebGPUSplatBackend = class WebGPUSplatBackend {
 	/**
 	* Execute a separate render pass that composites splats onto the
 	* provided color texture, preserving existing content (loadOp: "load").
+	*
+	* srgbBlend (sRGB color texture only): blend on the stored sRGB-encoded
+	* bytes, like WebGL drawing into an sRGB canvas, instead of in linear space.
+	* The target is copied to a non-sRGB texture of the same bytes, the splats
+	* (sRGB-encoded colors, pipeline in the non-sRGB format) blend there, and the
+	* bytes are copied back.
 	*/
-	renderSeparatePass(colorTexture, numInstances, preloadedDepth = false) {
+	renderSeparatePass(colorTexture, numInstances, preloadedDepth = false, srgbBlend = false) {
 		const slot = this.activeRenderSlot();
 		if (numInstances <= 0) {
 			this.noteDrawSkipped("zero-instances");
@@ -15524,9 +15531,25 @@ var WebGPUSplatBackend = class WebGPUSplatBackend {
 		}
 		const loadExistingDepth = useExternalDepth || preloadedDepth;
 		const encoder = device.createCommandEncoder({ label: "spark-render" });
+		let drawTexture = colorTexture;
+		if (srgbBlend) {
+			const format = colorTexture.format.replace(/-srgb$/, "");
+			const scratch = this.srgbScratch;
+			if (scratch?.width !== width || scratch?.height !== height || scratch?.format !== format) {
+				scratch?.destroy();
+				this.srgbScratch = device.createTexture({
+					label: "spark-srgb-blend",
+					size: [width, height],
+					format,
+					usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST
+				});
+			}
+			drawTexture = this.srgbScratch;
+			encoder.copyTextureToTexture({ texture: colorTexture }, { texture: drawTexture }, [width, height]);
+		}
 		const pass = encoder.beginRenderPass({
 			colorAttachments: [{
-				view: colorTexture.createView(),
+				view: drawTexture.createView(),
 				loadOp: "load",
 				storeOp: "store"
 			}],
@@ -15547,6 +15570,7 @@ var WebGPUSplatBackend = class WebGPUSplatBackend {
 		if (slot.nativeDrawArgs && this.useIndirectDraw) pass.drawIndexedIndirect(slot.nativeDrawArgs, 0);
 		else pass.drawIndexed(6, numInstances);
 		pass.end();
+		if (drawTexture !== colorTexture) encoder.copyTextureToTexture({ texture: drawTexture }, { texture: colorTexture }, [width, height]);
 		device.queue.submit([encoder.finish()]);
 		this.resolveGpuTiming();
 	}
@@ -16112,6 +16136,8 @@ var WebGPUSplatBackend = class WebGPUSplatBackend {
 		this.orderingTexture = null;
 		this.depthTexture?.destroy();
 		this.depthTexture = null;
+		this.srgbScratch?.destroy();
+		this.srgbScratch = null;
 		this.depthTextureView = null;
 		this.syncDepthReadbackBuffer?.destroy();
 		this.syncDepthReadbackBuffer = null;
@@ -16346,9 +16372,10 @@ var SparkNativeRenderer = class {
 			composite.render(this.renderer, scene, snapshot, ({ color, depth }) => {
 				if (!this.renderVisible) return;
 				this.backend.premultipliedAlpha = this.owner.premultipliedAlpha;
-				this.backend.ensurePipeline(color.format);
+				const srgb = this.srgbBlendActive() && color.format.endsWith("-srgb");
+				this.backend.ensurePipeline(srgb ? color.format.slice(0, -5) : color.format);
 				if (!this.backend.setExternalDepthTexture(depth, color.width, color.height)) throw new Error("Spark: incompatible native composite depth attachment");
-				this.backend.renderSeparatePass(color, this.owner.activeSplats, true);
+				this.backend.renderSeparatePass(color, this.owner.activeSplats, true, srgb);
 			}, this.owner.renderOrder, target);
 		});
 		this.queue = task;
@@ -16382,6 +16409,10 @@ var SparkNativeRenderer = class {
 		this.queue = task.then(() => {});
 		return task;
 	}
+	/** Same condition as WebGPUComposite's 8-bit sRGB target (no tone mapping). */
+	srgbBlendActive() {
+		return this.owner.srgbBlend && this.renderer.toneMapping === three.NoToneMapping;
+	}
 	updateUniforms(camera, pick) {
 		const owner = this.owner;
 		const uniforms = owner.uniforms;
@@ -16411,7 +16442,7 @@ var SparkNativeRenderer = class {
 		]) uniforms[key].value = owner[key];
 		uniforms.enable2DGS.value = owner.enable2DGS;
 		uniforms.lodInflate.value = owner.lodInflate;
-		uniforms.encodeLinear.value = true;
+		uniforms.encodeLinear.value = !this.srgbBlendActive();
 		uniforms.enableExtSplats.value = owner.display.extSplats;
 		uniforms.enableCovSplats.value = false;
 		uniforms.time.value = owner.display.time;
@@ -17072,6 +17103,7 @@ var SparkRenderer = class SparkRenderer extends three.Mesh {
 		this.minSortIntervalMs = options.minSortIntervalMs ?? 0;
 		this.sortThreads = options.sortThreads ?? Math.max(1, Math.min(4, (globalThis.navigator?.hardwareConcurrency || 2) - 1));
 		this.sortCullFov = options.sortCullFov ?? 0;
+		this.srgbBlend = options.srgbBlend ?? true;
 		this.sort16 = options.sort16 ?? false;
 		this.stochastic = options.stochastic ?? "off";
 		this.stochasticSettleMs = options.stochasticSettleMs ?? 100;

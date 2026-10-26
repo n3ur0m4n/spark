@@ -214,6 +214,13 @@ export interface SparkRendererOptions<
    */
   sortCullFov?: number;
   /**
+   * WebGPU native path without tone mapping: blend splats in sRGB space like
+   * the WebGL path (and other 3DGS viewers) instead of in linear space.
+   * Three.js objects keep their linear blending. Ignored with tone mapping.
+   * @default true
+   */
+  srgbBlend?: boolean;
+  /**
    * Sort by the depth rounded to 16-bit float (one counting pass instead of
    * two radix passes). Same splats are drawn, ordering precision is ~1/2048
    * of the distance.
@@ -506,6 +513,7 @@ export class SparkRenderer<
   minSortIntervalMs: number;
   sortThreads: number;
   sortCullFov: number;
+  srgbBlend: boolean;
   sort16: boolean;
   // sortCullFov of the last generated accumulator, as cos(half angle)
   private sortCullCos = -2;
@@ -799,6 +807,7 @@ export class SparkRenderer<
         Math.min(4, (globalThis.navigator?.hardwareConcurrency || 2) - 1),
       );
     this.sortCullFov = options.sortCullFov ?? 0;
+    this.srgbBlend = options.srgbBlend ?? true;
     this.sort16 = options.sort16 ?? false;
     this.stochastic = options.stochastic ?? "off";
     this.stochasticSettleMs = options.stochasticSettleMs ?? 100;
