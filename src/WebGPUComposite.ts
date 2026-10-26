@@ -41,15 +41,14 @@ export class WebGPUComposite {
       depthTest: false,
       depthWrite: false,
     });
-    // External targets get the stored linear premultiplied color, like a
-    // Three.js render to a target (no tone mapping, linear working space).
+    // External targets get the canvas image (same tone mapping) as linear
+    // premultiplied color; an sRGB target texture encodes it on write.
     const copyMaterial = new MeshBasicNodeMaterial({
       transparent: true,
       blending: THREE.NoBlending,
       depthTest: false,
       depthWrite: false,
     });
-    copyMaterial.fragmentNode = sample;
     return new WebGPUComposite(
       target,
       new QuadMesh(material),
@@ -65,6 +64,13 @@ export class WebGPUComposite {
         const converted = renderOutput(straight, toneMapping, colorSpace);
         material.fragmentNode = vec4(converted.rgb.mul(sample.a), sample.a);
         material.needsUpdate = true;
+        const linear = renderOutput(
+          straight,
+          toneMapping,
+          THREE.LinearSRGBColorSpace,
+        );
+        copyMaterial.fragmentNode = vec4(linear.rgb.mul(sample.a), sample.a);
+        copyMaterial.needsUpdate = true;
       },
     );
   }
@@ -149,7 +155,16 @@ export class WebGPUComposite {
       );
       renderer.setRenderTarget(previous);
     }
+    const toneMapping = renderer.toneMapping;
+    const colorSpace = renderer.outputColorSpace;
+    const outputKey = `${toneMapping}:${colorSpace}`;
+    if (outputKey !== this.outputKey) {
+      this.configureOutput(toneMapping, colorSpace);
+      this.outputKey = outputKey;
+    }
     if (output) {
+      // A target that is not the output target gets no automatic tone
+      // mapping or color conversion from Three.js.
       try {
         renderer.setRenderTarget(output);
         this.copyQuad.render(renderer);
@@ -157,13 +172,6 @@ export class WebGPUComposite {
         renderer.setRenderTarget(previous);
       }
       return;
-    }
-    const toneMapping = renderer.toneMapping;
-    const colorSpace = renderer.outputColorSpace;
-    const outputKey = `${toneMapping}:${colorSpace}`;
-    if (outputKey !== this.outputKey) {
-      this.configureOutput(toneMapping, colorSpace);
-      this.outputKey = outputKey;
     }
     try {
       // The quad owns the final conversion. Suppress Three's automatic output

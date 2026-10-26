@@ -249,9 +249,9 @@ export class SparkNativeRenderer {
 
   /**
    * Each call keeps its camera snapshot and has its own submission promise.
-   * `target` receives the full composite (linear, no tone mapping) instead of
-   * the canvas; it has its own intermediate target so captures do not resize
-   * the canvas one.
+   * `target` receives the full composite instead of the canvas: the canvas
+   * image (same tone mapping) as linear premultiplied color. It has its own
+   * intermediate target so captures do not resize the canvas one.
    */
   renderAsync(
     scene: THREE.Scene,

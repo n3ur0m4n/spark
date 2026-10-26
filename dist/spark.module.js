@@ -12647,12 +12647,14 @@ var WebGPUComposite = class WebGPUComposite {
 			depthTest: false,
 			depthWrite: false
 		});
-		copyMaterial.fragmentNode = sample;
 		return new WebGPUComposite(target, new QuadMesh(material), new QuadMesh(copyMaterial), (toneMapping, colorSpace) => {
 			const straight = vec4(sample.rgb.div(sample.a.max(1e-6)), 1);
 			const converted = renderOutput(straight, toneMapping, colorSpace);
 			material.fragmentNode = vec4(converted.rgb.mul(sample.a), sample.a);
 			material.needsUpdate = true;
+			const linear = renderOutput(straight, toneMapping, THREE.LinearSRGBColorSpace);
+			copyMaterial.fragmentNode = vec4(linear.rgb.mul(sample.a), sample.a);
+			copyMaterial.needsUpdate = true;
 		});
 	}
 	render(renderer, scene, camera, composite, splitOrder = Number.POSITIVE_INFINITY, output = null) {
@@ -12698,6 +12700,13 @@ var WebGPUComposite = class WebGPUComposite {
 			renderer.setRenderObjectFunction(hostFunction);
 			renderer.setRenderTarget(previous);
 		}
+		const toneMapping = renderer.toneMapping;
+		const colorSpace = renderer.outputColorSpace;
+		const outputKey = `${toneMapping}:${colorSpace}`;
+		if (outputKey !== this.outputKey) {
+			this.configureOutput(toneMapping, colorSpace);
+			this.outputKey = outputKey;
+		}
 		if (output) {
 			try {
 				renderer.setRenderTarget(output);
@@ -12706,13 +12715,6 @@ var WebGPUComposite = class WebGPUComposite {
 				renderer.setRenderTarget(previous);
 			}
 			return;
-		}
-		const toneMapping = renderer.toneMapping;
-		const colorSpace = renderer.outputColorSpace;
-		const outputKey = `${toneMapping}:${colorSpace}`;
-		if (outputKey !== this.outputKey) {
-			this.configureOutput(toneMapping, colorSpace);
-			this.outputKey = outputKey;
 		}
 		try {
 			renderer.toneMapping = THREE.NoToneMapping;
@@ -15879,9 +15881,9 @@ var SparkNativeRenderer = class {
 	}
 	/**
 	* Each call keeps its camera snapshot and has its own submission promise.
-	* `target` receives the full composite (linear, no tone mapping) instead of
-	* the canvas; it has its own intermediate target so captures do not resize
-	* the canvas one.
+	* `target` receives the full composite instead of the canvas: the canvas
+	* image (same tone mapping) as linear premultiplied color. It has its own
+	* intermediate target so captures do not resize the canvas one.
 	*/
 	renderAsync(scene, camera, { target = null } = {}) {
 		if (this.disposed) return Promise.reject(/* @__PURE__ */ new Error("SparkRenderer is disposed"));
