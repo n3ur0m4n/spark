@@ -91,6 +91,7 @@ impl<T: Ord> FourHeap<T> {
     }
 }
 
+#[cfg(test)]
 type Frontier<T> = BinaryHeap<T>;
 
 #[derive(Debug, Clone, Default)]
@@ -454,6 +455,8 @@ pub fn traverse_lod_trees(
     view_to_objects: &[f32], lod_scales: &[f32],
     behind_foveates: &[f32], cone_foveates: &[f32],
     cone_fov0s: &[f32], cone_fovs: &[f32],
+    // Fork: raycast set (budget min(this, 10% of selected)) from the same traversal
+    raycast_max_splats: Option<u32>,
 ) -> anyhow::Result<Object, JsValue> {
     let max_splats = max_splats as usize;
     let num_instances = lod_ids.len();
@@ -497,24 +500,32 @@ pub fn traverse_lod_trees(
         }).collect();
 
         let stats = traversal::select(max_splats, pixel_scale_limit, root_pages, &instances, traversal);
-        let instance_outputs = &mut traversal.instance_outputs[..num_instances];
+        let to_indices = |outputs: &[Vec<u32>]| {
+            let instance_indices = Array::new();
+            for (inst_index, instance_output) in outputs[..num_instances].iter().enumerate() {
+                let rows = instance_output.len().div_ceil(16384);
+                let capacity = rows * 16384;
+                let output = Uint32Array::new_with_length(capacity as u32);
+                output.subarray(0, instance_output.len() as u32).copy_from(instance_output);
+
+                let result = Object::new();
+                let lod_id = instances[inst_index].0;
+                Reflect::set(&result, &JsValue::from_str("lodId"), &JsValue::from(lod_id)).unwrap();
+                Reflect::set(&result, &JsValue::from_str("numSplats"), &JsValue::from(instance_output.len() as u32)).unwrap();
+                Reflect::set(&result, &JsValue::from_str("indices"), &JsValue::from(output)).unwrap();
+                instance_indices.push(&JsValue::from(result));
+            }
+            instance_indices
+        };
+        let instance_indices = to_indices(&traversal.instance_outputs);
+        let raycast_indices = raycast_max_splats.map(|raycast| {
+            let total: usize = traversal.instance_outputs[..num_instances].iter().map(Vec::len).sum();
+            // Same budget as the former JS call: min(lodRaycast, Math.round(0.1 * total))
+            let budget = (raycast as usize).min((total as f64 * 0.1).round() as usize);
+            traversal::select_raycast(budget, pixel_scale_limit, root_pages, &instances, traversal);
+            to_indices(&traversal.raycast_outputs)
+        });
         let touched = &traversal.touched;
-        let instance_indices = Array::new();
-
-        for (inst_index, instance_output) in instance_outputs.iter_mut().enumerate() {
-            // instance_output.sort_unstable();
-            let rows = instance_output.len().div_ceil(16384);
-            let capacity = rows * 16384;
-            let output = Uint32Array::new_with_length(capacity as u32);
-            output.subarray(0, instance_output.len() as u32).copy_from(instance_output);
-
-            let result = Object::new();
-            let lod_id = instances[inst_index].0;
-            Reflect::set(&result, &JsValue::from_str("lodId"), &JsValue::from(lod_id)).unwrap();
-            Reflect::set(&result, &JsValue::from_str("numSplats"), &JsValue::from(instance_output.len() as u32)).unwrap();
-            Reflect::set(&result, &JsValue::from_str("indices"), &JsValue::from(output)).unwrap();
-            instance_indices.push(&JsValue::from(result));
-        }
 
         let out_chunks = Array::new();
 
@@ -532,6 +543,9 @@ pub fn traverse_lod_trees(
         Reflect::set(&result, &JsValue::from_str("outputSize"), &JsValue::from(stats.emitted)).unwrap();
         Reflect::set(&result, &JsValue::from_str("frontierSize"), &JsValue::from(stats.drained)).unwrap();
         Reflect::set(&result, &JsValue::from_str("leafCount"), &JsValue::from(stats.leaves)).unwrap();
+        if let Some(raycast_indices) = raycast_indices {
+            Reflect::set(&result, &JsValue::from_str("raycastIndices"), &JsValue::from(raycast_indices)).unwrap();
+        }
         Ok(result)
     })
 }

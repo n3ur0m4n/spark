@@ -603,6 +603,10 @@ export class SparkRenderer<
   private disposed = false;
   lodMeshes: { mesh: SplatMesh; version: number }[] = [];
   lodDirty = false;
+  // Fork: page-arrival traversals coalesced to at most one per 300 ms
+  private lodPagesPending = false;
+  private lastPagesLodTime = 0;
+  private lodPagesTimer?: ReturnType<typeof setTimeout>;
   lodIds: Map<
     PackedSplats | ExtSplats | PagedSplats,
     { lodId: number; lastTouched: number; rootPage?: number }
@@ -2057,10 +2061,24 @@ export class SparkRenderer<
         })),
       });
       await worker.call("updateLodTrees", { ranges: lodUpdates });
-      this.lodDirty = true;
+      this.lodPagesPending = true;
+    }
+
+    if (this.lodPagesPending && !this.lodDirty) {
+      const wait = this.lastPagesLodTime + 300 - performance.now();
+      if (wait <= 0) {
+        this.lodDirty = true;
+        this.lastPagesLodTime = performance.now();
+      } else if (this.lodPagesTimer === undefined) {
+        this.lodPagesTimer = setTimeout(() => {
+          this.lodPagesTimer = undefined;
+          this.setDirty();
+        }, wait);
+      }
     }
 
     if (this.lodDirty) {
+      this.lodPagesPending = false;
       const now = performance.now();
       const deltaPred = new THREE.Vector3();
       if (this.lastLod) {
@@ -2219,6 +2237,14 @@ export class SparkRenderer<
       >,
     );
 
+    // Fork: standard mode derives the raycast set from this same traversal
+    const wantRaycast =
+      !!this.lodRaycast &&
+      this.lodTraverseMode !== "dynamic" &&
+      performance.now() - this.lastLodRaycastTime >= this.lodRaycastIntervalMs;
+    if (wantRaycast) {
+      this.lastLodRaycastTime = performance.now();
+    }
     const traverseStart = performance.now();
     const result = await worker.call("traverseLodTrees", {
       maxSplats: radMaxSplats,
@@ -2226,10 +2252,11 @@ export class SparkRenderer<
       lastPixelLimit: this.lastPixelLimit,
       instances,
       traverseMode: this.lodTraverseMode,
+      raycastMaxSplats: wantRaycast ? this.lodRaycast : undefined,
     });
     this.lastTraverseTime = performance.now() - traverseStart;
 
-    const { keyIndices, chunks, pixelLimit } = result;
+    const { keyIndices, raycastKeyIndices, chunks, pixelLimit } = result;
     this.lastPixelLimit = pixelLimit;
     const totalLodSplats = Object.values(keyIndices).reduce(
       (sum, { numSplats }) => sum + numSplats,
@@ -2240,6 +2267,11 @@ export class SparkRenderer<
     // );
 
     this.updateLodIndices(uuidToMesh, keyIndices);
+    if (raycastKeyIndices) {
+      for (const [uuid, countIndices] of Object.entries(raycastKeyIndices)) {
+        (uuidToMesh.get(uuid) as SplatMesh).raycastIndices = countIndices;
+      }
+    }
     // console.log("chunks.length =", chunks.length);
 
     if (this.pager) {
@@ -2355,6 +2387,7 @@ export class SparkRenderer<
 
     if (
       this.lodRaycast &&
+      this.lodTraverseMode === "dynamic" &&
       performance.now() - this.lastLodRaycastTime >= this.lodRaycastIntervalMs
     ) {
       this.lastLodRaycastTime = performance.now();

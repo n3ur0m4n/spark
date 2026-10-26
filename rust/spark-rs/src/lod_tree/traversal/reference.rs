@@ -120,9 +120,14 @@ pub(super) fn select_reference(
     let output_size = output.len();
     let frontier_size = frontier.len();
 
-    for (_, inst_index, paged_index) in frontier.drain() {
-        output.push((inst_index, paged_index));
-    }
+    // Fork: drained heap tail sorted by paged index per instance (the heap's
+    // internal order is history dependent and not reproducible without it).
+    let mut drained: Vec<(u32, u32)> = frontier
+        .drain()
+        .map(|(_, inst_index, paged_index)| (inst_index, paged_index))
+        .collect();
+    drained.sort_unstable();
+    output.extend(drained);
 
     let mut instance_counts = vec![0; num_instances];
     for &(inst_index, _) in output.iter() {

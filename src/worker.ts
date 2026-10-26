@@ -827,6 +827,7 @@ function traverseLodTrees({
   lastPixelLimit,
   instances,
   traverseMode,
+  raycastMaxSplats,
 }: {
   maxSplats: number;
   pixelScaleLimit: number;
@@ -846,6 +847,8 @@ function traverseLodTrees({
     }
   >;
   traverseMode: "dynamic" | "standard";
+  // Fork: raycast set from the same traversal (standard mode only)
+  raycastMaxSplats?: number;
 }) {
   const keyInstances = Object.entries(instances);
   const lodIds = new Uint32Array(
@@ -894,6 +897,7 @@ function traverseLodTrees({
     coneFoveates,
     coneFov0s,
     coneFovs,
+    traverseMode === "dynamic" ? undefined : raycastMaxSplats,
   ) as {
     instanceIndices: {
       lodId: number;
@@ -902,23 +906,33 @@ function traverseLodTrees({
     }[];
     chunks: [number, number][];
     pixelLimit?: number;
+    raycastIndices?: {
+      lodId: number;
+      numSplats: number;
+      indices: Uint32Array;
+    }[];
   };
-  const { instanceIndices, chunks, pixelLimit } = result;
+  const { instanceIndices, chunks, pixelLimit, raycastIndices } = result;
 
-  const indices = keyInstances.reduce(
-    (indices, [key, _instance], index) => {
-      indices[key] = instanceIndices[index];
-      return indices;
-    },
-    {} as Record<
-      string,
-      { lodId: number; numSplats: number; indices: Uint32Array }
-    >,
-  );
+  const byKey = (
+    list: { lodId: number; numSplats: number; indices: Uint32Array }[],
+  ) =>
+    keyInstances.reduce(
+      (indices, [key, _instance], index) => {
+        indices[key] = list[index];
+        return indices;
+      },
+      {} as Record<
+        string,
+        { lodId: number; numSplats: number; indices: Uint32Array }
+      >,
+    );
+  const indices = byKey(instanceIndices);
   // console.log(`traverseLodTrees: instanceIndices=${instanceIndices.length}`);
   // console.log(`traverseLodTrees: chunks=${chunks.length}`, JSON.stringify(chunks));
   return {
     keyIndices: indices,
+    raycastKeyIndices: raycastIndices ? byKey(raycastIndices) : undefined,
     chunks,
     pixelLimit,
   };
