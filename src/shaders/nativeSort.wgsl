@@ -34,3 +34,55 @@ fn countDraw() {
     drawArgs[3] = 0u;
     drawArgs[4] = 0u;
 }
+
+// 16-bit keys: depths quantized linearly between the view's valid min/max.
+// range[0] holds ~min so a zero-cleared buffer is the identity for atomicMax.
+@group(0) @binding(5) var<storage, read_write> range: array<atomic<u32>>;
+var<workgroup> wgMin: atomic<u32>;
+var<workgroup> wgMax: atomic<u32>;
+
+@compute @workgroup_size(256)
+fn depthRange(@builtin(workgroup_id) group: vec3u,
+              @builtin(local_invocation_id) local: vec3u,
+              @builtin(num_workgroups) groups: vec3u) {
+    let base = (group.y * groups.x + group.x) * 2048u + local.x;
+    var lo = 0xffffffffu;
+    var hi = 0u;
+    for (var k = 0u; k < 8u; k = k + 1u) {
+        let i = base + k * 256u;
+        if (i < params.count) {
+            let depth = depths[i];
+            if (depth < 0x7f800000u) {
+                lo = min(lo, depth);
+                hi = max(hi, depth);
+            }
+        }
+    }
+    if (local.x == 0u) {
+        atomicStore(&wgMin, 0xffffffffu);
+        atomicStore(&wgMax, 0u);
+    }
+    workgroupBarrier();
+    atomicMin(&wgMin, lo);
+    atomicMax(&wgMax, hi);
+    workgroupBarrier();
+    if (local.x == 0u) {
+        atomicMax(&range[0], ~atomicLoad(&wgMin));
+        atomicMax(&range[1], atomicLoad(&wgMax));
+    }
+}
+
+@compute @workgroup_size(256)
+fn prepareKeys16(@builtin(workgroup_id) group: vec3u,
+                 @builtin(local_invocation_id) local: vec3u,
+                 @builtin(num_workgroups) groups: vec3u) {
+    let i = (group.y * groups.x + group.x) * 256u + local.x;
+    if (i >= params.count) { return; }
+    let depth = depths[i];
+    // Positive finite f32 bits order like the floats; far splats sort first.
+    let lo = bitcast<f32>(~atomicLoad(&range[0]));
+    let hi = bitcast<f32>(atomicLoad(&range[1]));
+    let scale = select(0.0, 65534.0 / (hi - lo), hi > lo);
+    let q = u32(clamp((bitcast<f32>(depth) - lo) * scale, 0.0, 65534.0));
+    keys[i] = select(0xffffu, 0xfffeu - q, depth < 0x7f800000u);
+}

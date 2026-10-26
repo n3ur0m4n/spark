@@ -34,6 +34,9 @@ try {
     "radixSort4bit",
     "radixSortReorder",
     "prefixSum",
+    "onesweepGlobalHist",
+    "onesweepScan",
+    "onesweepBinning",
   ]) {
     // Generation is validated once per source accessor variant.
     const text = name.startsWith("generateSource")
@@ -47,7 +50,8 @@ try {
           ? `${shader("splatDefines")}\n`
           : "") + shader(name);
     const file = join(directory, `${name}.wgsl`);
-    writeFileSync(file, text);
+    // Naga validates subgroup builtins but rejects the enable directive.
+    writeFileSync(file, text.replace(/^enable subgroups;$/m, ""));
     execFileSync(naga, [file], { stdio: "inherit" });
     console.log(`Validated ${name}`);
   }

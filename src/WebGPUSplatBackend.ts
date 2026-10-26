@@ -3,6 +3,7 @@ import {
   type NativeMeshGeneration,
   WebGPUGeneration,
 } from "./WebGPUGeneration";
+import { WebGPUOneSweepSort, oneSweepSupported } from "./WebGPUOneSweepSort";
 import { WebGPURadixSort } from "./WebGPURadixSort";
 import { calcDispatchSize } from "./WebGPUUtils";
 import {
@@ -166,6 +167,20 @@ export class WebGPUSplatBackend {
   depthHeight = 0; // current write target (cycles 0 -> 1 -> 2 -> 0)
 
   private gpuSorter: WebGPURadixSort | null = null;
+  /** 16-bit OneSweep sort; null where unsupported (multipass 32-bit). */
+  private oneSweep: WebGPUOneSweepSort | null = null;
+  /** "multipass" forces the portable 32-bit sort (A/B and pixel tests). */
+  gpuSortMode: "auto" | "multipass" = "auto";
+  /** Key width of the GPU radix sort in use: 16 (OneSweep) or 32. */
+  get gpuSortKeyBits(): 16 | 32 {
+    return this.gpuSortMode === "auto" && this.oneSweep ? 16 : 32;
+  }
+  private nativeRangeBuffer: GPUBuffer | null = null;
+  private nativeCountBuffer: GPUBuffer | null = null;
+  private nativeSortArgs: GPUBuffer | null = null;
+  private bindGroupCache = new Map<string, GPUBindGroup>();
+  private resourceIds = new WeakMap<object, number>();
+  private nextResourceId = 0;
   /** Latches pipeline failures; capacity checks still apply to each generation. */
   private gpuSortUnavailable = false;
   private gpuSortValidated = false;
@@ -186,6 +201,8 @@ export class WebGPUSplatBackend {
   private nativeFillPipeline: GPUComputePipeline | null = null;
   private nativeKeysPipeline: GPUComputePipeline | null = null;
   private nativeCountPipeline: GPUComputePipeline | null = null;
+  private nativeRangePipeline: GPUComputePipeline | null = null;
+  private nativeKeys16Pipeline: GPUComputePipeline | null = null;
   private nativeSortUniform: GPUBuffer | null = null;
 
   // Reusable typed arrays for uniform writes
@@ -1286,6 +1303,16 @@ export class WebGPUSplatBackend {
         layout: "auto",
         compute: { module, entryPoint: "countDraw" },
       });
+      this.nativeRangePipeline = this.device.createComputePipeline({
+        label: "spark-native-range-pipeline",
+        layout: "auto",
+        compute: { module, entryPoint: "depthRange" },
+      });
+      this.nativeKeys16Pipeline = this.device.createComputePipeline({
+        label: "spark-native-keys16-pipeline",
+        layout: "auto",
+        compute: { module, entryPoint: "prepareKeys16" },
+      });
       this.nativeSortUniform = this.device.createBuffer({
         label: "spark-native-sort-uniform",
         size: 16,
@@ -1294,16 +1321,59 @@ export class WebGPUSplatBackend {
     }
   }
 
+  /**
+   * Bind groups keyed by pipeline and resource identity. Resources only
+   * change on reallocation, so steady-state sorts create no bind groups.
+   */
+  private cachedBindGroup(
+    pipeline: GPUComputePipeline,
+    resources: [number, GPUBuffer | GPUTextureView][],
+  ): GPUBindGroup {
+    const key = `${pipeline.label}|${resources
+      .map(([binding, r]) => `${binding}:${this.resourceId(r)}`)
+      .join(",")}`;
+    let bindGroup = this.bindGroupCache.get(key);
+    if (!bindGroup) {
+      // ponytail: entries of destroyed buffers just age out with the clear.
+      if (this.bindGroupCache.size > 128) this.bindGroupCache.clear();
+      bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: resources.map(([binding, r]) => ({
+          binding,
+          resource: r instanceof GPUBuffer ? { buffer: r } : r,
+        })),
+      });
+      this.bindGroupCache.set(key, bindGroup);
+    }
+    return bindGroup;
+  }
+
+  private resourceId(resource: object): number {
+    let id = this.resourceIds.get(resource);
+    if (id === undefined) {
+      id = this.nextResourceId++;
+      this.resourceIds.set(resource, id);
+    }
+    return id;
+  }
+
+  /**
+   * 32-bit keys for the multipass sort, or (with `range`) 16-bit keys
+   * quantized between the view's min/max valid depth for OneSweep.
+   */
   private prepareNativeKeys(
     encoder: GPUCommandEncoder,
     depths: GPUBuffer,
     keys: GPUBuffer,
     count: number,
+    range?: GPUBuffer,
   ) {
     this.ensureNativeSortPipelines();
-    const pipeline = this.nativeKeysPipeline;
+    const pipeline = range
+      ? this.nativeKeys16Pipeline
+      : this.nativeKeysPipeline;
     const uniform = this.nativeSortUniform;
-    if (!pipeline || !uniform)
+    if (!pipeline || !uniform || (range && !this.nativeRangePipeline))
       throw new Error("Spark: native sort pipeline is unavailable");
     this.device.queue.writeBuffer(
       uniform,
@@ -1314,17 +1384,29 @@ export class WebGPUSplatBackend {
       label: "spark-native-sort-keys",
       ...this.timestampWritesFor("keys"),
     });
+    if (range && this.nativeRangePipeline) {
+      pass.setPipeline(this.nativeRangePipeline);
+      pass.setBindGroup(
+        0,
+        this.cachedBindGroup(this.nativeRangePipeline, [
+          [0, uniform],
+          [1, depths],
+          [5, range],
+        ]),
+      );
+      pass.dispatchWorkgroups(
+        ...this.computeDispatchSize(Math.ceil(count / 2048)),
+      );
+    }
     pass.setPipeline(pipeline);
     pass.setBindGroup(
       0,
-      this.device.createBindGroup({
-        layout: pipeline.getBindGroupLayout(0),
-        entries: [
-          { binding: 0, resource: { buffer: uniform } },
-          { binding: 1, resource: { buffer: depths } },
-          { binding: 2, resource: { buffer: keys } },
-        ],
-      }),
+      this.cachedBindGroup(pipeline, [
+        [0, uniform],
+        [1, depths],
+        [2, keys],
+        ...(range ? [[5, range] as [number, GPUBuffer]] : []),
+      ]),
     );
     pass.dispatchWorkgroups(
       ...this.computeDispatchSize(Math.ceil(count / 256)),
@@ -1407,15 +1489,12 @@ export class WebGPUSplatBackend {
     pass.setPipeline(pipeline);
     pass.setBindGroup(
       0,
-      this.device.createBindGroup({
-        layout: pipeline.getBindGroupLayout(0),
-        entries: [
-          { binding: 0, resource: { buffer: uniform } },
-          { binding: 1, resource: { buffer: depths } },
-          { binding: 3, resource: { buffer: sorted } },
-          { binding: 4, resource: { buffer: slot.nativeDrawArgs } },
-        ],
-      }),
+      this.cachedBindGroup(pipeline, [
+        [0, uniform],
+        [1, depths],
+        [3, sorted],
+        [4, slot.nativeDrawArgs],
+      ]),
     );
     pass.dispatchWorkgroups(1);
     pass.end();
@@ -1892,6 +1971,10 @@ export class WebGPUSplatBackend {
       }
       this.ensurePackOrderingPipeline();
       this.ensureNativeSortPipelines();
+      if (oneSweepSupported(this.device)) {
+        this.oneSweep = new WebGPUOneSweepSort(this.device);
+        this.oneSweep.warmup(16, false);
+      }
     } catch (error) {
       failure = error;
     }
@@ -1906,6 +1989,8 @@ export class WebGPUSplatBackend {
       this.gpuSortUnavailable = true;
       this.gpuSorter?.destroy();
       this.gpuSorter = null;
+      this.oneSweep?.destroy();
+      this.oneSweep = null;
       this.packOrderingUniform?.destroy();
       this.packOrderingUniform = null;
       this.packOrderingPipeline = null;
@@ -1964,6 +2049,16 @@ export class WebGPUSplatBackend {
       size: 16,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
+  }
+
+  private orderingViews = new WeakMap<GPUTexture, GPUTextureView>();
+  private orderingStorageView(texture: GPUTexture): GPUTextureView {
+    let view = this.orderingViews.get(texture);
+    if (!view) {
+      view = texture.createView();
+      this.orderingViews.set(texture, view);
+    }
+    return view;
   }
 
   private ensureGpuOrderingTexture(
@@ -2055,28 +2150,71 @@ export class WebGPUSplatBackend {
     const encoder = device.createCommandEncoder({
       label: "spark-native-radix",
     });
-    this.prepareNativeKeys(encoder, depths, keysBuffer, params.numSplats);
-    const sorted = this.gpuSorter.encodeSort(
-      encoder,
-      keysBuffer,
-      params.numSplats,
-      32,
-      true,
-      true,
-      this.timestampWritesFor("radix")?.timestampWrites,
-    );
+    let sorted: GPUBuffer | null;
+    const oneSweep = this.gpuSortMode === "auto" ? this.oneSweep : null;
+    if (oneSweep) {
+      const sortBuffer = (label: string, size: number, usage = 0) =>
+        device.createBuffer({
+          label,
+          size,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | usage,
+        });
+      this.nativeRangeBuffer ??= sortBuffer("spark-native-depth-range", 16);
+      this.nativeCountBuffer ??= sortBuffer("spark-native-sort-count", 16);
+      this.nativeSortArgs ??= sortBuffer(
+        "spark-native-sort-args",
+        32,
+        GPUBufferUsage.INDIRECT,
+      );
+      device.queue.writeBuffer(
+        this.nativeCountBuffer,
+        0,
+        new Uint32Array([params.numSplats]),
+      );
+      device.queue.writeBuffer(
+        this.nativeSortArgs,
+        0,
+        oneSweep.dispatchArgs(params.numSplats),
+      );
+      encoder.clearBuffer(this.nativeRangeBuffer);
+      this.prepareNativeKeys(
+        encoder,
+        depths,
+        keysBuffer,
+        params.numSplats,
+        this.nativeRangeBuffer,
+      );
+      sorted = oneSweep.encodeSort(
+        encoder,
+        keysBuffer,
+        params.numSplats,
+        this.nativeCountBuffer,
+        this.nativeSortArgs,
+        16,
+        undefined,
+        this.timestampWritesFor("radix")?.timestampWrites,
+      );
+    } else {
+      this.prepareNativeKeys(encoder, depths, keysBuffer, params.numSplats);
+      sorted = this.gpuSorter.encodeSort(
+        encoder,
+        keysBuffer,
+        params.numSplats,
+        32,
+        true,
+        true,
+        this.timestampWritesFor("radix")?.timestampWrites,
+      );
+    }
     if (!sorted) {
       encoder.finish();
       return false;
     }
-    const packBg = device.createBindGroup({
-      layout: this.packOrderingLayout,
-      entries: [
-        { binding: 0, resource: { buffer: sorted } },
-        { binding: 1, resource: orderTex.createView() },
-        { binding: 2, resource: { buffer: this.packOrderingUniform } },
-      ],
-    });
+    const packBg = this.cachedBindGroup(this.packOrderingPipeline, [
+      [0, sorted],
+      [1, this.orderingStorageView(orderTex)],
+      [2, this.packOrderingUniform],
+    ]);
     {
       const pass = encoder.beginComputePass({
         label: "spark-pack-ordering",
@@ -2154,6 +2292,12 @@ export class WebGPUSplatBackend {
     this.timestampReadInFlight = false;
     this.gpuSorter?.destroy();
     this.gpuSorter = null;
+    this.oneSweep?.destroy();
+    this.oneSweep = null;
+    this.nativeRangeBuffer?.destroy();
+    this.nativeCountBuffer?.destroy();
+    this.nativeSortArgs?.destroy();
+    this.bindGroupCache.clear();
     this.gpuSortValidated = false;
     this.gpuSortPreparation = null;
     this.useIndirectDraw = false;

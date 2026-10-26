@@ -25,6 +25,7 @@
       cpuRadixSort4bit,
       cpuRadixSort4bitDescending,
     } from "/src/WebGPURadixSort.ts";
+    import { WebGPUOneSweepSort, oneSweepSupported } from "/src/WebGPUOneSweepSort.ts";
 
     const status = document.getElementById("status");
     const lines = [];
@@ -84,7 +85,9 @@
       }
       const info = adapter.info ?? {};
       log(`adapter: ${info.vendor || "?"} / ${info.architecture || "?"} / ${info.description || info.device || "?"}`);
-      const device = await adapter.requestDevice();
+      const device = await adapter.requestDevice({
+        requiredFeatures: adapter.features.has("subgroups") ? ["subgroups"] : [],
+      });
       const sorter = new WebGPURadixSort(device);
       if (!sorter.isAvailable() || !sorter.warmup(32, true)) {
         log("FAIL: GPU radix pipelines unavailable", "fail");
@@ -136,9 +139,55 @@
       device.createBuffer = createBuffer;
       if (scratchAllocations !== 0) throw new Error(`Scratch reallocated ${scratchAllocations} times`);
       const resourceReuse = {counts: reuseCounts, scratchAllocations, passed:true};
+
+      // OneSweep (NVIDIA + subgroups only): 16/32-bit, synthesized and
+      // caller-supplied initial values, against the stable CPU radix.
+      const oneSweep = {supported: oneSweepSupported(device), cases: []};
+      if (oneSweep.supported) {
+        const sweeper = new WebGPUOneSweepSort(device);
+        const storage = (data) => {
+          const buffer = device.createBuffer({
+            size: Math.max(256, Math.ceil(data.byteLength / 16) * 16),
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC | GPUBufferUsage.INDIRECT,
+          });
+          device.queue.writeBuffer(buffer, 0, data);
+          return buffer;
+        };
+        for (const n of [1, 3, 3583, 3584, 3585, 3841, 32769, 1000003, 2500000]) {
+          for (const bits of [16, 32]) {
+            for (const withValues of [false, true]) {
+              const mask = bits === 32 ? 0xffffffff : 0xffff;
+              const keys = Uint32Array.from({length:n}, (_, i) => (Math.imul(i + 1, 1664525) >>> 0) % (i % 3 ? 97 : mask + 1 || 0x100000000) & mask);
+              const values = Uint32Array.from({length:n}, (_, i) => (i * 7 + 3) >>> 0);
+              const keysBuffer = storage(keys);
+              const countBuffer = storage(new Uint32Array([n, 0, 0, 0]));
+              const argsBuffer = storage(sweeper.dispatchArgs(n));
+              const valuesBuffer = withValues ? storage(values) : undefined;
+              const encoder = device.createCommandEncoder();
+              const sorted = sweeper.encodeSort(encoder, keysBuffer, n, countBuffer, argsBuffer, bits, valuesBuffer);
+              const readback = device.createBuffer({size: n * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ});
+              encoder.copyBufferToBuffer(sorted, 0, readback, 0, n * 4);
+              device.queue.submit([encoder.finish()]);
+              await readback.mapAsync(GPUMapMode.READ);
+              const gpu = new Uint32Array(readback.getMappedRange().slice(0));
+              readback.unmap();
+              for (const b of [keysBuffer, countBuffer, argsBuffer, valuesBuffer, readback]) b?.destroy();
+              const order = cpuRadixSort4bit(keys, bits);
+              const cpu = withValues ? Uint32Array.from(order, (i) => values[i]) : order;
+              const ok = arraysEqual(cpu, gpu);
+              oneSweep.cases.push({n, bits, withValues, pass: ok});
+              log(`onesweep ${bits}-bit${withValues ? " values" : ""} N=${n}: ${ok ? "PASS" : "FAIL"}`);
+              if (!ok) throw new Error(`OneSweep mismatch N=${n} bits=${bits} values=${withValues}`);
+            }
+          }
+        }
+        sweeper.destroy();
+      } else {
+        log("onesweep: unsupported on this adapter (multipass fallback)");
+      }
       await device.queue.onSubmittedWorkDone();
       const pass = cases.every(test => test.pass) && errors.length === 0;
-      window.__sparkRadixSelftest = {pass, cases, errors, resourceReuse,
+      window.__sparkRadixSelftest = {pass, cases, errors, resourceReuse, oneSweep,
         adapter: {vendor:info.vendor, architecture:info.architecture, device:info.device, description:info.description}};
       log(pass ? "ALL PASS" : "FAILED", pass ? "pass" : "fail");
       sorter.destroy();

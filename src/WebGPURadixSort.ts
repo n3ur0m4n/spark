@@ -95,6 +95,10 @@ export class WebGPURadixSort {
    * point and using it is a validation error.
    */
   bufferEpoch = 0;
+  // Bind groups reused across sorts; dropped with the buffers they bind.
+  private bindGroups = new Map<string, GPUBindGroup>();
+  private keyIds = new WeakMap<GPUBuffer, number>();
+  private nextKeyId = 0;
 
   constructor(device: GPUDevice) {
     this.device = device;
@@ -353,6 +357,7 @@ export class WebGPURadixSort {
     this.activePrefixLevels = 0;
     // Invalidate any bind group a caller cached against the old buffers.
     this.bufferEpoch++;
+    this.bindGroups.clear();
   }
 
   private storageBuffer(label: string, size: number): GPUBuffer {
@@ -531,7 +536,7 @@ export class WebGPURadixSort {
     const numPasses = numBits / BITS_PER_PASS;
 
     for (let pass = 0; pass < numPasses; pass++) {
-      const histBg = this.device.createBindGroup({
+      const histBg = this.bindGroup(`h${pass}${+destructiveKeys}`, keysBuffer, {
         layout: this.histogramLayout,
         entries: [
           { binding: 0, resource: { buffer: currentKeys } },
@@ -560,17 +565,21 @@ export class WebGPURadixSort {
 
       this.encodePrefixSum(encoder);
 
-      const reorderBg = this.device.createBindGroup({
-        layout: this.reorderLayout,
-        entries: [
-          { binding: 0, resource: { buffer: currentKeys } },
-          { binding: 1, resource: { buffer: nextKeys } },
-          { binding: 2, resource: { buffer: this.blockSums } },
-          { binding: 3, resource: { buffer: currentValues } },
-          { binding: 4, resource: { buffer: nextValues } },
-          { binding: 5, resource: { buffer: this.sortUniform } },
-        ],
-      });
+      const reorderBg = this.bindGroup(
+        `r${pass}${+destructiveKeys}`,
+        keysBuffer,
+        {
+          layout: this.reorderLayout,
+          entries: [
+            { binding: 0, resource: { buffer: currentKeys } },
+            { binding: 1, resource: { buffer: nextKeys } },
+            { binding: 2, resource: { buffer: this.blockSums } },
+            { binding: 3, resource: { buffer: currentValues } },
+            { binding: 4, resource: { buffer: nextValues } },
+            { binding: 5, resource: { buffer: this.sortUniform } },
+          ],
+        },
+      );
       {
         const passEnc = encoder.beginComputePass({
           label: `spark-radix-reorder-${pass}`,
@@ -603,6 +612,30 @@ export class WebGPURadixSort {
     return this.sortedIndices;
   }
 
+  /**
+   * Cached bind group. Entries depend only on the pass/slot, the caller's
+   * key buffer and the allocation (bufferEpoch clears the cache).
+   */
+  private bindGroup(
+    slot: string,
+    keys: GPUBuffer | null,
+    descriptor: GPUBindGroupDescriptor,
+  ): GPUBindGroup {
+    let keyId = keys ? this.keyIds.get(keys) : -1;
+    if (keyId === undefined) {
+      keyId = this.nextKeyId++;
+      if (keys) this.keyIds.set(keys, keyId);
+    }
+    const key = `${slot}:${keyId}`;
+    let bindGroup = this.bindGroups.get(key);
+    if (!bindGroup) {
+      if (this.bindGroups.size > 256) this.bindGroups.clear();
+      bindGroup = this.device.createBindGroup(descriptor);
+      this.bindGroups.set(key, bindGroup);
+    }
+    return bindGroup;
+  }
+
   private encodePrefixSum(encoder: GPUCommandEncoder): void {
     if (!this.prefixLayout || !this.prefixScanPipe || !this.prefixAddPipe) {
       return;
@@ -610,7 +643,7 @@ export class WebGPURadixSort {
     for (let i = 0; i < this.activePrefixLevels; i++) {
       const level = this.prefixLevels[i];
       const uniform = this.prefixUniforms[i];
-      const bg = this.device.createBindGroup({
+      const bg = this.bindGroup(`p${i}`, null, {
         layout: this.prefixLayout,
         entries: [
           { binding: 0, resource: { buffer: level.items } },
@@ -627,7 +660,7 @@ export class WebGPURadixSort {
     for (let i = this.activePrefixLevels - 2; i >= 0; i--) {
       const level = this.prefixLevels[i];
       const uniform = this.prefixUniforms[i];
-      const bg = this.device.createBindGroup({
+      const bg = this.bindGroup(`p${i}`, null, {
         layout: this.prefixLayout,
         entries: [
           { binding: 0, resource: { buffer: level.items } },

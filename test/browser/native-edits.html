@@ -111,7 +111,7 @@ async function runEditCase(config){
    rows.push({raw:generated.map(a=>Array.from(a.slice(i*4,i*4+4)).join(',')).join('|'),
     v:[...s.center.toArray(),s.opacity,s.color.r,s.color.g,s.color.b]});
   }
-  return {rows,pixels};
+  return {rows,pixels,keyBits:native?spark.webgpuBackend?.gpuSortKeyBits:null};
  };
  try{
   const before=await capture();
@@ -126,6 +126,8 @@ async function runEditCase(config){
 }
 
 const pixelDiff=(a,b)=>{let sum=0,max=0;for(let i=0;i<a.length;i++){const d=Math.abs(a[i]-b[i]);sum+=d;if(d>max)max=d;}return {mean:sum/a.length,max};};
+// 16-bit OneSweep keys quantize depth: near-ties may swap blending order.
+const sortMatches=(a,b)=>{const d=pixelDiff(a.pixels,b.pixels);return {ok:d.max===0||(b.keyBits===16&&d.mean<0.05),...d,keyBits:b.keyBits};};
 try{
  const stats=[];
  for(const config of [{outputExt:true},{outputExt:false}]){
@@ -138,7 +140,7 @@ try{
    const exact=a.rows.filter((row,i)=>row.raw===b.rows[i]?.raw).length;
    check(`${label}: generated splats match WebGL`,mismatch<0&&a.rows.length===b.rows.length&&radix[step].rows.every((row,i)=>row.raw===b.rows[i].raw),
     {mismatch,exact,lengths:[a.rows.length,b.rows.length],webgl:a.rows[mismatch],native:b.rows[mismatch]});
-   check(`${label}: native orderings render identically`,pixelDiff(b.pixels,radix[step].pixels).max===0);
+   {const m=sortMatches(b,radix[step]);check(`${label}: native orderings render identically`,m.ok,m);}
    const diff=pixelDiff(a.pixels,b.pixels);
    stats.push({label,splats:a.rows.length,bitExact:exact/a.rows.length,diff});
    check(`${label}: WebGPU renders like WebGL`,diff.mean<1,{diff});

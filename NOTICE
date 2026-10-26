@@ -12,8 +12,15 @@ Copyright © 2011-2026 PlayCanvas Ltd, MIT License, at revision
 That PlayCanvas implementation follows WebGPU-Radix-Sort
 (https://github.com/kishimisu/WebGPU-Radix-Sort), MIT License.
 
-The TypeScript dispatcher (src/WebGPURadixSort.ts) is original code for this
-contribution and uses the host Three.js GPUDevice.
+OneSweep radix-sort WGSL in src/shaders/onesweepGlobalHist.wgsl,
+src/shaders/onesweepScan.wgsl, and src/shaders/onesweepBinning.wgsl is adapted
+from PlayCanvas Engine at revision 209ce5752527ab5050ec9632ca6dc1272542b70d
+(same directory), itself ported from GPUSorting
+(https://github.com/b0nes164/GPUSorting), Copyright © Thomas Smith, MIT License.
+
+The TypeScript dispatchers (src/WebGPURadixSort.ts,
+src/WebGPUOneSweepSort.ts) are original code for this contribution and use
+the host Three.js GPUDevice.
 
 PlayCanvas Engine — MIT license
 Copyright (c) 2011-2026 PlayCanvas Ltd.
