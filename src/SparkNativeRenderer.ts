@@ -316,14 +316,13 @@ export class SparkNativeRenderer {
           this.renderer,
           scene,
           snapshot,
-          ({ color, depth }) => {
+          ({ color, depth, srgb }) => {
             if (!this.renderVisible) return;
             this.backend.premultipliedAlpha = this.owner.premultipliedAlpha;
-            // sRGB blending draws through a non-sRGB alias of the target.
-            const srgb =
-              this.srgbBlendActive() && color.format.endsWith("-srgb");
+            // "bytes": blend through a non-sRGB alias of the sRGB target.
+            const bytes = srgb === "bytes" && color.format.endsWith("-srgb");
             this.backend.ensurePipeline(
-              srgb
+              bytes
                 ? (color.format.slice(0, -5) as GPUTextureFormat)
                 : color.format,
             );
@@ -342,11 +341,12 @@ export class SparkNativeRenderer {
               color,
               this.owner.activeSplats,
               true,
-              srgb,
+              bytes,
             );
           },
           this.owner.renderOrder,
           target,
+          this.srgbBlendActive(),
         );
       });
     this.queue = task;
@@ -402,10 +402,11 @@ export class SparkNativeRenderer {
     return task;
   }
 
-  /** Same condition as WebGPUComposite's 8-bit sRGB target (no tone mapping). */
+  /** sRGB splat blending (WebGPUComposite srgbBlend): needs an sRGB output. */
   private srgbBlendActive(): boolean {
     return (
-      this.owner.srgbBlend && this.renderer.toneMapping === THREE.NoToneMapping
+      this.owner.srgbBlend &&
+      this.renderer.outputColorSpace === THREE.SRGBColorSpace
     );
   }
 

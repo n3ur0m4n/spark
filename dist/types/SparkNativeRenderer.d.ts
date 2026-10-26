@@ -65,7 +65,7 @@ export declare class SparkNativeRenderer {
         farBig: number;
         solid: boolean;
     }): Promise<WebGPUPickPixels>;
-    /** Same condition as WebGPUComposite's 8-bit sRGB target (no tone mapping). */
+    /** sRGB splat blending (WebGPUComposite srgbBlend): needs an sRGB output. */
     private srgbBlendActive;
     private updateUniforms;
     /** Runs ordinary mesh callbacks, then snapshots and commits one complete generation. */

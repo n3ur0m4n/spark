@@ -1,7 +1,17 @@
 import * as THREE from "three";
 import type { QuadMesh, WebGPURenderer } from "three/webgpu";
 
-export type CompositeAttachments = { color: GPUTexture; depth: GPUTexture };
+/**
+ * srgb: how the splat pass must blend into `color` (null = linear, as is).
+ * "bytes": blend on the raw bytes of an sRGB-format color target.
+ * "layer": `color` is a cleared 8-bit layer of sRGB-encoded premultiplied
+ * splats, composited over the tone-mapped scene by the output quad.
+ */
+export type CompositeAttachments = {
+  color: GPUTexture;
+  depth: GPUTexture;
+  srgb: "bytes" | "layer" | null;
+};
 
 type RenderObjectArgs = Parameters<
   NonNullable<ReturnType<WebGPURenderer["getRenderObjectFunction"]>>
@@ -14,18 +24,22 @@ export class WebGPUComposite {
 
   private constructor(
     private readonly target: THREE.RenderTarget,
+    // srgb "layer" mode: splats alone, and transparent objects drawn after them
+    private readonly splatTarget: THREE.RenderTarget,
+    private readonly lateTarget: THREE.RenderTarget,
     private readonly quad: QuadMesh,
     private readonly copyQuad: QuadMesh,
     private readonly configureOutput: (
       toneMapping: THREE.ToneMapping,
       colorSpace: string,
+      layered: boolean,
     ) => void,
   ) {}
 
   static async create(): Promise<WebGPUComposite> {
     const [
       { MeshBasicNodeMaterial, QuadMesh },
-      { texture, vec4, renderOutput },
+      { texture, vec4, renderOutput, sRGBTransferEOTF },
     ] = await Promise.all([import("three/webgpu"), import("three/tsl")]);
     const target = new THREE.RenderTarget(1, 1, {
       type: THREE.HalfFloatType,
@@ -34,7 +48,24 @@ export class WebGPUComposite {
       samples: 0,
     });
     target.depthTexture = new THREE.DepthTexture(1, 1, THREE.UnsignedIntType);
+    // rgba8unorm: raw sRGB-encoded bytes, like an sRGB canvas in WebGL.
+    const splatTarget = new THREE.RenderTarget(1, 1, {
+      type: THREE.UnsignedByteType,
+      depthBuffer: false,
+      stencilBuffer: false,
+      samples: 0,
+    });
+    const lateTarget = new THREE.RenderTarget(1, 1, {
+      type: THREE.HalfFloatType,
+      depthBuffer: true,
+      stencilBuffer: false,
+      samples: 0,
+    });
+    // Late objects are occluded by the scene depth of pass A.
+    lateTarget.depthTexture = target.depthTexture;
     const sample = texture(target.texture);
+    const splats = texture(splatTarget.texture);
+    const late = texture(lateTarget.texture);
     const material = new MeshBasicNodeMaterial({
       transparent: true,
       blending: THREE.NoBlending,
@@ -49,11 +80,50 @@ export class WebGPUComposite {
       depthTest: false,
       depthWrite: false,
     });
+    type Node = ReturnType<typeof vec4> | typeof sample;
+    const premultiplied = (
+      source: typeof sample,
+      toneMapping: THREE.ToneMapping,
+      colorSpace: string,
+    ) => {
+      const straight = vec4(source.rgb.div(source.a.max(1e-6)), 1);
+      const converted = renderOutput(straight, toneMapping, colorSpace);
+      return vec4(converted.rgb.mul(source.a), source.a);
+    };
+    const over = (top: Node, bottom: Node) =>
+      vec4(
+        top.rgb.add(bottom.rgb.mul(top.a.oneMinus())),
+        top.a.add(bottom.a.mul(top.a.oneMinus())),
+      );
     return new WebGPUComposite(
       target,
+      splatTarget,
+      lateTarget,
       new QuadMesh(material),
       new QuadMesh(copyMaterial),
-      (toneMapping, colorSpace) => {
+      (toneMapping, colorSpace, layered) => {
+        if (layered) {
+          // Like WebGL: the scene is tone-mapped and encoded, then the splats
+          // blend over it in sRGB space without tone mapping, then the late
+          // transparent objects (tone-mapped on their own) go on top.
+          const srgb = over(
+            premultiplied(late, toneMapping, THREE.SRGBColorSpace),
+            over(
+              splats,
+              premultiplied(sample, toneMapping, THREE.SRGBColorSpace),
+            ),
+          );
+          material.fragmentNode = srgb;
+          material.needsUpdate = true;
+          copyMaterial.fragmentNode = vec4(
+            sRGBTransferEOTF(vec4(srgb.rgb.div(srgb.a.max(1e-6)), 1)).rgb.mul(
+              srgb.a,
+            ),
+            srgb.a,
+          );
+          copyMaterial.needsUpdate = true;
+          return;
+        }
         // The shared target stores premultiplied linear color. Nonlinear color
         // conversion and tone mapping must operate on the straight color, then
         // premultiply for the host canvas (WebGPU alphaMode: "premultiplied").
@@ -82,6 +152,7 @@ export class WebGPUComposite {
     composite: (attachments: CompositeAttachments) => void,
     splitOrder = Number.POSITIVE_INFINITY,
     output: THREE.RenderTarget | null = null,
+    srgbBlend = false,
   ): void {
     const previous = renderer.getRenderTarget();
     if (previous || renderer.xr.isPresenting) {
@@ -94,6 +165,8 @@ export class WebGPUComposite {
     // pass is fill-rate bound: this is its main cost. Three.js blends linearly
     // in it; splats blend on its sRGB bytes unless srgbBlend is off.
     const hdr = renderer.toneMapping !== THREE.NoToneMapping;
+    // srgbBlend needs an sRGB output: splat colors are sRGB-encoded.
+    const srgb = !srgbBlend ? null : hdr ? "layer" : "bytes";
     if (hdr !== this.hdr) {
       this.hdr = hdr;
       const texture = this.target.texture;
@@ -105,6 +178,10 @@ export class WebGPUComposite {
       ? new THREE.Vector2(output.width, output.height)
       : renderer.getDrawingBufferSize(new THREE.Vector2());
     this.target.setSize(size.x, size.y);
+    if (srgb === "layer") {
+      this.splatTarget.setSize(size.x, size.y);
+      this.lateTarget.setSize(size.x, size.y);
+    }
     // Like the WebGL transparent list, transparent objects with renderOrder at
     // or above the SparkRenderer's draw after the splats: pass A skips them,
     // pass B (no clear, same color/depth) draws only them.
@@ -114,7 +191,20 @@ export class WebGPUComposite {
     const late = (object: THREE.Object3D, material: THREE.Material) =>
       material.transparent && object.renderOrder >= splitOrder;
     let deferred = false;
+    type Color4 = Parameters<WebGPURenderer["getClearColor"]>[0];
+    const clearColor = renderer.getClearColor(new THREE.Color() as Color4);
+    const clearAlpha = renderer.getClearAlpha();
     try {
+      if (srgb === "layer") {
+        // Transparent clears. The late target first: a resize recreates the
+        // shared depth texture on its first use, before pass A fills it.
+        renderer.setClearColor(0x000000, 0);
+        for (const layer of [this.lateTarget, this.splatTarget]) {
+          renderer.setRenderTarget(layer);
+          renderer.clear(true, false, false);
+        }
+        renderer.setClearColor(clearColor, clearAlpha);
+      }
       renderer.setRenderTarget(this.target);
       renderer.setRenderObjectFunction(((...args: RenderObjectArgs) => {
         if (late(args[0], args[4])) deferred = true;
@@ -142,13 +232,19 @@ export class WebGPUComposite {
         }
         return data.texture;
       };
-      const color = getTexture(this.target.texture);
+      const color = getTexture(
+        srgb === "layer" ? this.splatTarget.texture : this.target.texture,
+      );
       if (!this.target.depthTexture)
         throw new Error("Spark: composite depth texture is unavailable.");
       const depth = getTexture(this.target.depthTexture);
-      composite({ color, depth });
-      if (deferred) this.renderLate(renderer, scene, camera, late, draw);
+      composite({ color, depth, srgb });
+      if (deferred) {
+        if (srgb === "layer") renderer.setRenderTarget(this.lateTarget);
+        this.renderLate(renderer, scene, camera, late, draw);
+      }
     } finally {
+      renderer.setClearColor(clearColor, clearAlpha);
       renderer.setRenderObjectFunction(
         hostFunction as Parameters<
           WebGPURenderer["setRenderObjectFunction"]
@@ -158,9 +254,10 @@ export class WebGPUComposite {
     }
     const toneMapping = renderer.toneMapping;
     const colorSpace = renderer.outputColorSpace;
-    const outputKey = `${toneMapping}:${colorSpace}`;
+    const layered = srgb === "layer";
+    const outputKey = `${toneMapping}:${colorSpace}:${layered}`;
     if (outputKey !== this.outputKey) {
-      this.configureOutput(toneMapping, colorSpace);
+      this.configureOutput(toneMapping, colorSpace, layered);
       this.outputKey = outputKey;
     }
     if (output) {
@@ -225,6 +322,8 @@ export class WebGPUComposite {
 
   dispose(): void {
     this.target.dispose();
+    this.splatTarget.dispose();
+    this.lateTarget.dispose();
     for (const quad of [this.quad, this.copyQuad]) {
       const materials = Array.isArray(quad.material)
         ? quad.material

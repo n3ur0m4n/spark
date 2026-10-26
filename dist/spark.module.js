@@ -13019,8 +13019,10 @@ var SplatAccumulator = class SplatAccumulator {
 //#region src/WebGPUComposite.ts
 /** Owns the linear color/depth target shared by Three.js and the splat pass. */
 var WebGPUComposite = class WebGPUComposite {
-	constructor(target, quad, copyQuad, configureOutput) {
+	constructor(target, splatTarget, lateTarget, quad, copyQuad, configureOutput) {
 		this.target = target;
+		this.splatTarget = splatTarget;
+		this.lateTarget = lateTarget;
 		this.quad = quad;
 		this.copyQuad = copyQuad;
 		this.configureOutput = configureOutput;
@@ -13028,7 +13030,7 @@ var WebGPUComposite = class WebGPUComposite {
 		this.hdr = true;
 	}
 	static async create() {
-		const [{ MeshBasicNodeMaterial, QuadMesh }, { texture, vec4, renderOutput }] = await Promise.all([import("three/webgpu"), import("three/tsl")]);
+		const [{ MeshBasicNodeMaterial, QuadMesh }, { texture, vec4, renderOutput, sRGBTransferEOTF }] = await Promise.all([import("three/webgpu"), import("three/tsl")]);
 		const target = new THREE.RenderTarget(1, 1, {
 			type: THREE.HalfFloatType,
 			depthBuffer: true,
@@ -13036,7 +13038,22 @@ var WebGPUComposite = class WebGPUComposite {
 			samples: 0
 		});
 		target.depthTexture = new THREE.DepthTexture(1, 1, THREE.UnsignedIntType);
+		const splatTarget = new THREE.RenderTarget(1, 1, {
+			type: THREE.UnsignedByteType,
+			depthBuffer: false,
+			stencilBuffer: false,
+			samples: 0
+		});
+		const lateTarget = new THREE.RenderTarget(1, 1, {
+			type: THREE.HalfFloatType,
+			depthBuffer: true,
+			stencilBuffer: false,
+			samples: 0
+		});
+		lateTarget.depthTexture = target.depthTexture;
 		const sample = texture(target.texture);
+		const splats = texture(splatTarget.texture);
+		const late = texture(lateTarget.texture);
 		const material = new MeshBasicNodeMaterial({
 			transparent: true,
 			blending: THREE.NoBlending,
@@ -13049,7 +13066,21 @@ var WebGPUComposite = class WebGPUComposite {
 			depthTest: false,
 			depthWrite: false
 		});
-		return new WebGPUComposite(target, new QuadMesh(material), new QuadMesh(copyMaterial), (toneMapping, colorSpace) => {
+		const premultiplied = (source, toneMapping, colorSpace) => {
+			const straight = vec4(source.rgb.div(source.a.max(1e-6)), 1);
+			const converted = renderOutput(straight, toneMapping, colorSpace);
+			return vec4(converted.rgb.mul(source.a), source.a);
+		};
+		const over = (top, bottom) => vec4(top.rgb.add(bottom.rgb.mul(top.a.oneMinus())), top.a.add(bottom.a.mul(top.a.oneMinus())));
+		return new WebGPUComposite(target, splatTarget, lateTarget, new QuadMesh(material), new QuadMesh(copyMaterial), (toneMapping, colorSpace, layered) => {
+			if (layered) {
+				const srgb = over(premultiplied(late, toneMapping, THREE.SRGBColorSpace), over(splats, premultiplied(sample, toneMapping, THREE.SRGBColorSpace)));
+				material.fragmentNode = srgb;
+				material.needsUpdate = true;
+				copyMaterial.fragmentNode = vec4(sRGBTransferEOTF(vec4(srgb.rgb.div(srgb.a.max(1e-6)), 1)).rgb.mul(srgb.a), srgb.a);
+				copyMaterial.needsUpdate = true;
+				return;
+			}
 			const straight = vec4(sample.rgb.div(sample.a.max(1e-6)), 1);
 			const converted = renderOutput(straight, toneMapping, colorSpace);
 			material.fragmentNode = vec4(converted.rgb.mul(sample.a), sample.a);
@@ -13059,10 +13090,11 @@ var WebGPUComposite = class WebGPUComposite {
 			copyMaterial.needsUpdate = true;
 		});
 	}
-	render(renderer, scene, camera, composite, splitOrder = Number.POSITIVE_INFINITY, output = null) {
+	render(renderer, scene, camera, composite, splitOrder = Number.POSITIVE_INFINITY, output = null, srgbBlend = false) {
 		const previous = renderer.getRenderTarget();
 		if (previous || renderer.xr.isPresenting) throw new Error("Spark: native composition currently requires the canvas target outside XR; use WebGL for this scene.");
 		const hdr = renderer.toneMapping !== THREE.NoToneMapping;
+		const srgb = !srgbBlend ? null : hdr ? "layer" : "bytes";
 		if (hdr !== this.hdr) {
 			this.hdr = hdr;
 			const texture = this.target.texture;
@@ -13072,11 +13104,25 @@ var WebGPUComposite = class WebGPUComposite {
 		}
 		const size = output ? new THREE.Vector2(output.width, output.height) : renderer.getDrawingBufferSize(new THREE.Vector2());
 		this.target.setSize(size.x, size.y);
+		if (srgb === "layer") {
+			this.splatTarget.setSize(size.x, size.y);
+			this.lateTarget.setSize(size.x, size.y);
+		}
 		const hostFunction = renderer.getRenderObjectFunction();
 		const draw = (...args) => hostFunction ? hostFunction(...args) : renderer.renderObject(...args);
 		const late = (object, material) => material.transparent && object.renderOrder >= splitOrder;
 		let deferred = false;
+		const clearColor = renderer.getClearColor(new THREE.Color());
+		const clearAlpha = renderer.getClearAlpha();
 		try {
+			if (srgb === "layer") {
+				renderer.setClearColor(0, 0);
+				for (const layer of [this.lateTarget, this.splatTarget]) {
+					renderer.setRenderTarget(layer);
+					renderer.clear(true, false, false);
+				}
+				renderer.setClearColor(clearColor, clearAlpha);
+			}
 			renderer.setRenderTarget(this.target);
 			renderer.setRenderObjectFunction(((...args) => {
 				if (late(args[0], args[4])) deferred = true;
@@ -13091,22 +13137,28 @@ var WebGPUComposite = class WebGPUComposite {
 				if (!data || typeof data !== "object" || !("texture" in data) || !(data.texture instanceof GPUTexture)) throw new Error("Spark: Three.js did not expose a composite attachment.");
 				return data.texture;
 			};
-			const color = getTexture(this.target.texture);
+			const color = getTexture(srgb === "layer" ? this.splatTarget.texture : this.target.texture);
 			if (!this.target.depthTexture) throw new Error("Spark: composite depth texture is unavailable.");
 			composite({
 				color,
-				depth: getTexture(this.target.depthTexture)
+				depth: getTexture(this.target.depthTexture),
+				srgb
 			});
-			if (deferred) this.renderLate(renderer, scene, camera, late, draw);
+			if (deferred) {
+				if (srgb === "layer") renderer.setRenderTarget(this.lateTarget);
+				this.renderLate(renderer, scene, camera, late, draw);
+			}
 		} finally {
+			renderer.setClearColor(clearColor, clearAlpha);
 			renderer.setRenderObjectFunction(hostFunction);
 			renderer.setRenderTarget(previous);
 		}
 		const toneMapping = renderer.toneMapping;
 		const colorSpace = renderer.outputColorSpace;
-		const outputKey = `${toneMapping}:${colorSpace}`;
+		const layered = srgb === "layer";
+		const outputKey = `${toneMapping}:${colorSpace}:${layered}`;
 		if (outputKey !== this.outputKey) {
-			this.configureOutput(toneMapping, colorSpace);
+			this.configureOutput(toneMapping, colorSpace, layered);
 			this.outputKey = outputKey;
 		}
 		if (output) {
@@ -13158,6 +13210,8 @@ var WebGPUComposite = class WebGPUComposite {
 	}
 	dispose() {
 		this.target.dispose();
+		this.splatTarget.dispose();
+		this.lateTarget.dispose();
 		for (const quad of [this.quad, this.copyQuad]) {
 			const materials = Array.isArray(quad.material) ? quad.material : [quad.material];
 			for (const material of materials) material.dispose();
@@ -16349,14 +16403,14 @@ var SparkNativeRenderer = class {
 			this.owner.updateStochastic(snapshot);
 			this.backend.stochastic = this.owner.stochasticActive;
 			this.updateUniforms(snapshot);
-			composite.render(this.renderer, scene, snapshot, ({ color, depth }) => {
+			composite.render(this.renderer, scene, snapshot, ({ color, depth, srgb }) => {
 				if (!this.renderVisible) return;
 				this.backend.premultipliedAlpha = this.owner.premultipliedAlpha;
-				const srgb = this.srgbBlendActive() && color.format.endsWith("-srgb");
-				this.backend.ensurePipeline(srgb ? color.format.slice(0, -5) : color.format);
+				const bytes = srgb === "bytes" && color.format.endsWith("-srgb");
+				this.backend.ensurePipeline(bytes ? color.format.slice(0, -5) : color.format);
 				if (!this.backend.setExternalDepthTexture(depth, color.width, color.height)) throw new Error("Spark: incompatible native composite depth attachment");
-				this.backend.renderSeparatePass(color, this.owner.activeSplats, true, srgb);
-			}, this.owner.renderOrder, target);
+				this.backend.renderSeparatePass(color, this.owner.activeSplats, true, bytes);
+			}, this.owner.renderOrder, target, this.srgbBlendActive());
 		});
 		this.queue = task;
 		return task;
@@ -16389,9 +16443,9 @@ var SparkNativeRenderer = class {
 		this.queue = task.then(() => {});
 		return task;
 	}
-	/** Same condition as WebGPUComposite's 8-bit sRGB target (no tone mapping). */
+	/** sRGB splat blending (WebGPUComposite srgbBlend): needs an sRGB output. */
 	srgbBlendActive() {
-		return this.owner.srgbBlend && this.renderer.toneMapping === THREE.NoToneMapping;
+		return this.owner.srgbBlend && this.renderer.outputColorSpace === THREE.SRGBColorSpace;
 	}
 	updateUniforms(camera, pick) {
 		const owner = this.owner;
