@@ -111,7 +111,7 @@ try {
         "three/webgpu": "/node_modules/three/build/three.webgpu.js",
         "three/tsl": "/node_modules/three/build/three.tsl.js",
         "three/addons/": "/node_modules/three/examples/jsm/",
-        "/src/index.ts": `/node_modules/@sparkjsdev/spark/dist/${bundle}`,
+        "/src/index.ts": `/node_modules/spark-next/dist/${bundle}`,
       };
       const importMap = `<script type="importmap">${JSON.stringify({ imports })}</script>`;
       for (const name of [

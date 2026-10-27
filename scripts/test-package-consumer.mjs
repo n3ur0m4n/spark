@@ -51,7 +51,7 @@ Module._load = function(specifier, ...args) {
   assert(!specifier.startsWith('three/'), 'Classic entry eagerly requires an ESM-only Three.js submodule: ' + specifier);
   return originalLoad.call(this, specifier, ...args);
 };
-const { SparkRenderer, utils } = require('@sparkjsdev/spark');
+const { SparkRenderer, utils } = require('spark-next');
 assert.equal(typeof SparkRenderer, 'function');
 assert.equal(utils.toHalf(1), 15360);
 `,
@@ -59,7 +59,7 @@ assert.equal(utils.toHalf(1), 15360);
   writeFileSync(
     join(directory, "consumer.mjs"),
     `import assert from 'node:assert/strict';
-import { SparkRenderer, utils } from '@sparkjsdev/spark';
+import { SparkRenderer, utils } from 'spark-next';
 assert.equal(typeof SparkRenderer, 'function');
 assert.equal(utils.toHalf(1), 15360);
 `,

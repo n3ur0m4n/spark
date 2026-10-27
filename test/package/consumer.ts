@@ -4,7 +4,7 @@ import {
   type SparkRendererOptions,
   type SplatMesh,
   getSparkRendererCapabilities,
-} from "@sparkjsdev/spark";
+} from "spark-next";
 import type * as THREE from "three";
 import type { WebGPURenderer } from "three/webgpu";
 

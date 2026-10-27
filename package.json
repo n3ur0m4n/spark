@@ -1,5 +1,5 @@
 {
-  "name": "@sparkjsdev/spark",
+  "name": "spark-next",
   "version": "2.4.0",
   "description": "An advanced 3D Gaussian Splatting renderer for THREE.js",
   "homepage": "https://sparkjs.dev/",
