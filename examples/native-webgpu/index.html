@@ -18,7 +18,7 @@
       "three/webgpu": "../js/vendor/three/build/three.webgpu.js",
       "three/tsl": "../js/vendor/three/build/three.tsl.js",
       "three/addons/": "../js/vendor/three/examples/jsm/",
-      "@sparkjsdev/spark": "../../dist/spark.module.js"
+      "spark-next": "../../dist/spark.module.js"
     } }
   </script>
 </head>
@@ -33,7 +33,7 @@
   <script type="module">
     import * as THREE from "three";
     import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-    import { SparkRenderer, SplatMesh, createRenderer } from "@sparkjsdev/spark";
+    import { SparkRenderer, SplatMesh, createRenderer } from "spark-next";
 
     const status = document.querySelector("#status");
     const params = new URLSearchParams(location.search);

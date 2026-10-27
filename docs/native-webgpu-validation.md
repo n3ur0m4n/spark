@@ -10,7 +10,7 @@ quad trimming, projectors and approximate traversal are excluded.
 
 ```ts
 import { WebGPURenderer } from "three/webgpu";
-import { SparkRenderer } from "@sparkjsdev/spark";
+import { SparkRenderer } from "spark-next";
 
 const renderer = new WebGPURenderer({ antialias: false });
 await renderer.init();

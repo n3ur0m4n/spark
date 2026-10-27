@@ -1,4 +1,4 @@
-import { SplatMesh } from "@sparkjsdev/spark";
+import { SplatMesh } from "spark-next";
 import { getAssetFileURL } from "../js/get-asset-url.js";
 
 // Add loading icon in the center of the screen

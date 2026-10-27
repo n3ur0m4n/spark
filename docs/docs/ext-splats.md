@@ -82,7 +82,7 @@ Each `ExtSplat` occupies 8 × `uint32` total = 32 bytes.
 ## Encoding / decoding helpers
 
 ```typescript
-import { utils } from "@sparkjsdev/spark";
+import { utils } from "spark-next";
 
 utils.encodeExtSplat(extSplats.extArrays, index, x, y, z, sx, sy, sz, qx, qy, qz, qw, opacity, r, g, b);
 const { center, scales, quaternion, color, opacity } = utils.decodeExtSplat(extSplats.extArrays, index);

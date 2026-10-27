@@ -32,7 +32,7 @@
       "imports": {
         "three": "../js/vendor/three/build/three.module.js",
         "three/addons/": "../js/vendor/three/examples/jsm/",
-        "@sparkjsdev/spark": "../../dist/spark.module.js",
+        "spark-next": "../../dist/spark.module.js",
         "lil-gui": "../js/vendor/lil-gui/dist/lil-gui.esm.js"
       }
     }
@@ -44,7 +44,7 @@
   <canvas id="canvas" tabindex="0" style="outline: none;"></canvas>
   <script type="module">
     import * as THREE from "three";
-    import { SparkRenderer, SplatMesh, SparkControls, isMobile } from "@sparkjsdev/spark";
+    import { SparkRenderer, SplatMesh, SparkControls, isMobile } from "spark-next";
     import GUI from "lil-gui";
 
     const initialWorld = "Coit Tower, SF";

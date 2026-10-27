@@ -1,5 +1,5 @@
-import { SparkRenderer } from "@sparkjsdev/spark";
 import { GUI } from "lil-gui";
+import { SparkRenderer } from "spark-next";
 import * as THREE from "three";
 
 // Central renderer/scene/camera shared by effects

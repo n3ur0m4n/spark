@@ -34,13 +34,13 @@
       "imports": {
         "three": "../js/vendor/three/build/three.module.js",
         "three/addons/": "../js/vendor/three/examples/jsm/",
-        "@sparkjsdev/spark": "../../dist/spark.module.js"
+        "spark-next": "../../dist/spark.module.js"
       }
     }
   </script>
   <script type="module">
     import * as THREE from "three";
-    import { SplatMesh, SparkRenderer, PackedSplats } from "@sparkjsdev/spark";
+    import { SplatMesh, SparkRenderer, PackedSplats } from "spark-next";
     import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
     import { getAssetFileURL } from "../js/get-asset-url.js";
 

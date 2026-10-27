@@ -1,4 +1,4 @@
-import { SparkControls, SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
+import { SparkControls, SparkRenderer, SplatMesh } from "spark-next";
 import * as THREE from "three";
 import { getAssetFileURL } from "/examples/js/get-asset-url.js";
 

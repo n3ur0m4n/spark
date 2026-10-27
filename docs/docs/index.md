@@ -11,13 +11,13 @@ Copy and paste code below in an `index.html` file or remix in the [Web Playgroun
     "imports": {
       "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
       "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/",
-      "@sparkjsdev/spark": "https://sparkjs.dev/releases/spark/2.4.0/spark.module.js"
+      "spark-next": "https://sparkjs.dev/releases/spark/2.4.0/spark.module.js"
     }
   }
 </script>
 <script type="module">
   import * as THREE from "three";
-  import { SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
+  import { SparkRenderer, SplatMesh } from "spark-next";
 
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.01, 1000);
@@ -44,7 +44,7 @@ Copy and paste code below in an `index.html` file or remix in the [Web Playgroun
 ## Install with NPM
 
 ```shell
-npm install @sparkjsdev/spark
+npm install github:n3ur0m4n/spark-next#feat/webgpu
 ```
 ## Develop and contribute to Spark
 

@@ -1,5 +1,5 @@
-import { SparkRenderer, SplatMesh, dyno } from "@sparkjsdev/spark";
 import { GUI } from "lil-gui";
+import { SparkRenderer, SplatMesh, dyno } from "spark-next";
 import * as THREE from "three";
 import { getAssetFileURL } from "/examples/js/get-asset-url.js";
 

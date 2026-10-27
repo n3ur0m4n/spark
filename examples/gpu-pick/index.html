@@ -61,13 +61,13 @@
       "imports": {
         "three": "../js/vendor/three/build/three.module.js",
         "three/addons/": "../js/vendor/three/examples/jsm/",
-        "@sparkjsdev/spark": "../../dist/spark.module.js"
+        "spark-next": "../../dist/spark.module.js"
       }
     }
   </script>
   <script type="module">
     import * as THREE from "three";
-    import { SparkRenderer, SplatMesh, SparkControls } from "@sparkjsdev/spark";
+    import { SparkRenderer, SplatMesh, SparkControls } from "spark-next";
 
     const LOG_PREFIX = "[gpu-pick]";
 

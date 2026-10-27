@@ -32,7 +32,7 @@
       "imports": {
         "three": "../js/vendor/three/build/three.module.js",
         "three/addons/": "../js/vendor/three/examples/jsm/",
-        "@sparkjsdev/spark": "../../dist/spark.module.js",
+        "spark-next": "../../dist/spark.module.js",
         "lil-gui": "../js/vendor/lil-gui/dist/lil-gui.esm.js"
       }
     }
@@ -43,7 +43,7 @@
   <script type="module">
     import * as THREE from "three";
     import GUI from "lil-gui";
-    import { SparkRenderer, PackedSplats, SplatMesh, SparkControls, SparkXr, JOINT_IDS, JOINT_TIPS, dyno, generators, isMobile, utils } from "@sparkjsdev/spark";
+    import { SparkRenderer, PackedSplats, SplatMesh, SparkControls, SparkXr, JOINT_IDS, JOINT_TIPS, dyno, generators, isMobile, utils } from "spark-next";
     import { WORLDS, getWorldUrl, WORLD_RUSTLE, WORLD_EFFECT } from "./worlds.js";
     import { AUDIOS, getAudioUrl } from "./audio.js";
     import { shuffleArray } from "./util.js";

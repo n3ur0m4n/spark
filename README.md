@@ -1,3 +1,6 @@
+> **spark-next** — WebGPU-first fork of [Spark](https://github.com/sparkjsdev/spark).
+> Distributed via GitHub only (no npm).
+
 <p align="center">
 
   ![Spark logo](https://github.com/user-attachments/assets/5287631a-083c-4c86-80f6-4dca24aa263f#gh-light-mode-only)
@@ -56,13 +59,13 @@ Copy the following code into an `index.html` file.
     "imports": {
       "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
       "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/",
-      "@sparkjsdev/spark": "https://sparkjs.dev/releases/spark/2.4.0/spark.module.js"
+      "spark-next": "https://sparkjs.dev/releases/spark/2.4.0/spark.module.js"
     }
   }
 </script>
 <script type="module">
   import * as THREE from "three";
-  import { SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
+  import { SparkRenderer, SplatMesh } from "spark-next";
 
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.01, 1000);
@@ -94,7 +97,7 @@ Copy the following code into an `index.html` file.
     "imports": {
       "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
       "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/",
-      "@sparkjsdev/spark": "https://sparkjs.dev/releases/spark/2.4.0/spark.module.js"
+      "spark-next": "https://sparkjs.dev/releases/spark/2.4.0/spark.module.js"
      }
   }
 </script>
@@ -103,7 +106,7 @@ Copy the following code into an `index.html` file.
 ### NPM
 
 ```shell
-npm install @sparkjsdev/spark
+npm install github:n3ur0m4n/spark-next#feat/webgpu
 ```
 
 ## Run Examples locally

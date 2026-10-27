@@ -69,7 +69,7 @@ Utility functions are provided in Javascript to pack/unpack these encodings:
 packedSplats.setSplat(index, center, scales, quaternion, opacity, color);
 
 // Set underlying Uint32 array directly
-import { utils } from "@sparkjsdev/spark";
+import { utils } from "spark-next";
 utils.setPackedSplat(packedSplats.packedArray, index, x, y, z, scaleX, scaleY, ...);
 
 // Set rotation components of underlying Uint32 array directly

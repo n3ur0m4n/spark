@@ -21,13 +21,13 @@
       "imports": {
         "three": "../js/vendor/three/build/three.module.js",
         "three/addons/": "../js/vendor/three/examples/jsm/",
-        "@sparkjsdev/spark": "../../dist/spark.module.js"
+        "spark-next": "../../dist/spark.module.js"
       }
     }
   </script>
   <script type="module">
     import * as THREE from "three";
-    import { SparkRenderer, SparkControls, SplatMesh, dyno } from "@sparkjsdev/spark";
+    import { SparkRenderer, SparkControls, SplatMesh, dyno } from "spark-next";
     import { getAssetFileURL } from "../js/get-asset-url.js";
 
     const scene = new THREE.Scene();

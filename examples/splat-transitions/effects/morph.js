@@ -1,4 +1,4 @@
-import { SplatMesh, dyno } from "@sparkjsdev/spark";
+import { SplatMesh, dyno } from "spark-next";
 import * as THREE from "three";
 import { getAssetFileURL } from "../../js/get-asset-url.js";
 

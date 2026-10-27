@@ -55,7 +55,7 @@ scene.add(mesh);
 ## Grid
 
 ```javascript
-import { constructGrid } from "@sparkjsdev/spark";
+import { constructGrid } from "spark-next";
 
 const grid = new SplatMesh({
   constructSplats: (splats) => constructGrid({
@@ -90,7 +90,7 @@ scene.add(grid);
 ## XYZ axis
 
 ```javascript
-import { constructAxes } from "@sparkjsdev/spark";
+import { constructAxes } from "spark-next";
 
 const axes = new SplatMesh({
   constructSplats: (splats) => constructAxes({ splats }),
@@ -118,7 +118,7 @@ scene.add(axes);
 ## Splat sphere
 
 ```javascript
-import { constructSpherePoints } from "@sparkjsdev/spark";
+import { constructSpherePoints } from "spark-next";
 
 const sphere = new SplatMesh({
   constructSplats: (splats) => constructSpherePoints({

@@ -1,4 +1,4 @@
-import { SparkControls, SplatMesh, dyno, textSplats } from "@sparkjsdev/spark";
+import { SparkControls, SplatMesh, dyno, textSplats } from "spark-next";
 import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { getAssetFileURL } from "../../js/get-asset-url.js";

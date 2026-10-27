@@ -34,7 +34,7 @@
       "imports": {
         "three": "../js/vendor/three/build/three.module.js",
         "three/addons/": "../js/vendor/three/examples/jsm/",
-        "@sparkjsdev/spark": "../../dist/spark.module.js",
+        "spark-next": "../../dist/spark.module.js",
         "lil-gui": "../js/vendor/lil-gui/dist/lil-gui.esm.js"
       }
     }
@@ -52,7 +52,7 @@
   <script type="module">
     import * as THREE from "three";
     import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-    import { SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
+    import { SparkRenderer, SplatMesh } from "spark-next";
     import GUI from "lil-gui";
 
     const stats = document.getElementById("stats");

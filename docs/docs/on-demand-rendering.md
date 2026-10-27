@@ -64,7 +64,7 @@ The same pattern maps directly onto React Three Fiber's on-demand mode: set `fra
 ```jsx
 import { Canvas, extend, useThree } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
-import { SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
+import { SparkRenderer, SplatMesh } from "spark-next";
 import { useEffect, useMemo } from "react";
 
 extend({ SparkRenderer, SplatMesh });

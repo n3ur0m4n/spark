@@ -179,13 +179,13 @@
       "imports": {
         "three": "../js/vendor/three/build/three.module.js",
         "three/addons/": "../js/vendor/three/examples/jsm/",
-        "@sparkjsdev/spark": "../../dist/spark.module.js"
+        "spark-next": "../../dist/spark.module.js"
       }
     }
   </script>
   <script type="module">
     import * as THREE from "three";
-    import { SparkRenderer, SplatMesh, transcodeSpz, SparkControls } from "@sparkjsdev/spark";
+    import { SparkRenderer, SplatMesh, transcodeSpz, SparkControls } from "spark-next";
     import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 
     const sparkCanvasEl = document.querySelector(".spark-canvas");
